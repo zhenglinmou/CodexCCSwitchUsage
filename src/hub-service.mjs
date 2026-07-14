@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { loginConfiguration } from './hub-provider-adapters.mjs';
+import { loginConfiguration, providerAliases } from './hub-provider-adapters.mjs';
 
 function safeMessage(error) {
   const message = error instanceof Error ? error.message : String(error || '未知错误');
@@ -53,6 +53,37 @@ function readCache(cachePath) {
   }
 }
 
+export function hubItemToUsagePayload(provider, item) {
+  const usage = item?.usage;
+  if (usage) {
+    const queryError = item.status === 'ok' ? '' : String(item.message || '最近一次 Hub 查询未成功');
+    return {
+      status: 'ok',
+      providerId: provider.id,
+      providerName: usage.providerName || provider.name,
+      websiteUrl: provider.websiteUrl,
+      extra: usage.extra,
+      periodLabel: usage.periodLabel,
+      hideTotal: usage.hideTotal,
+      refreshIntervalMinutes: usage.refreshIntervalMinutes,
+      used: usage.used,
+      remaining: usage.remaining,
+      total: usage.total,
+      unit: usage.unit,
+      updatedAt: usage.updatedAt,
+      ...(queryError ? { queryError } : {}),
+    };
+  }
+  return {
+    status: item?.status === 'idle' || item?.status === 'loading' ? 'loading' : 'error',
+    providerId: provider.id,
+    providerName: provider.name,
+    websiteUrl: provider.websiteUrl,
+    message: String(item?.message || 'Balance Hub 尚未返回额度'),
+    updatedAt: item?.updatedAt || new Date().toISOString(),
+  };
+}
+
 export class HubService {
   constructor(repository, queryEngine, options = {}) {
     this.repository = repository;
@@ -76,14 +107,15 @@ export class HubService {
       activeIds.add(provider.id);
       this.providers.set(provider.id, provider);
       const previous = this.items.get(provider.id) || this.cachedItems[provider.id] || {};
+      const obsoleteSource = ['legacy_bridge', 'usage_script', 'ccswitch_cookie'].includes(String(previous.source || ''));
       this.items.set(provider.id, {
         id: provider.id,
         name: provider.name,
         websiteUrl: safeWebsiteUrl(provider.websiteUrl),
         current: provider.isCurrent,
-        status: previous.status === 'loading' ? 'idle' : (previous.status || 'idle'),
-        message: String(previous.message || ''),
-        source: String(previous.source || ''),
+        status: previous.status === 'loading' || obsoleteSource ? 'idle' : (previous.status || 'idle'),
+        message: obsoleteSource ? '等待 v2 独立余额中心重新查询' : String(previous.message || ''),
+        source: obsoleteSource ? 'cached_previous' : String(previous.source || ''),
         loginSupported: Boolean(loginConfiguration(provider)),
         usage: previous.usage || null,
         updatedAt: String(previous.updatedAt || ''),
@@ -110,29 +142,30 @@ export class HubService {
     };
   }
 
-  recordCurrent(provider, payload) {
-    if (!provider?.id || !this.items.has(provider.id)) return false;
-    const item = this.items.get(provider.id);
-    const usage = safeUsage(payload);
-    this.items.set(provider.id, {
-      ...item,
-      current: true,
-      status: usage ? 'ok' : String(payload?.status || 'error'),
-      message: usage ? '' : safeMessage(payload?.message || payload?.queryError || '查询失败'),
-      source: usage ? 'usage_script' : item.source,
-      usage: usage || item.usage,
-      updatedAt: String(payload?.updatedAt || new Date().toISOString()),
-    });
-    this.revision += 1;
-    this.#writeCache();
-    return true;
+  findProvider(selector) {
+    const key = String(selector || '').trim().toLowerCase();
+    if (!key) return null;
+    if (this.providers.has(key)) return this.providers.get(key);
+    return [...this.providers.values()].find(provider => providerAliases(provider).includes(key)) || null;
   }
 
-  refreshProvider(providerId) {
-    const id = String(providerId || '');
-    if (!this.providers.has(id)) return Promise.reject(new Error('CCSwitch 中不存在这个 Codex 供应商'));
+  listPublicProviders() {
+    return [...this.providers.values()].map(provider => ({
+      id: provider.id,
+      name: provider.name,
+      aliases: providerAliases(provider),
+      current: provider.isCurrent,
+      loginSupported: Boolean(loginConfiguration(provider)),
+      balanceUrl: `/v1/balance/${encodeURIComponent(providerAliases(provider).at(-1) || provider.id)}`,
+    }));
+  }
+
+  refreshProvider(providerSelector) {
+    const resolved = this.findProvider(providerSelector);
+    if (!resolved) return Promise.reject(new Error('CCSwitch 中不存在这个 Codex 供应商'));
+    const id = resolved.id;
     if (this.refreshes.has(id)) return this.refreshes.get(id);
-    const provider = this.providers.get(id);
+    const provider = resolved;
     const previous = this.items.get(id);
     this.items.set(id, { ...previous, status: previous.usage ? previous.status : 'loading', message: '' });
     this.revision += 1;
@@ -151,10 +184,12 @@ export class HubService {
         this.items.set(id, next);
         return next;
       } catch (error) {
+        const previous = this.items.get(id);
+        const message = safeMessage(error);
         const next = {
-          ...this.items.get(id),
-          status: 'error',
-          message: safeMessage(error),
+          ...previous,
+          status: previous.usage ? 'degraded' : 'error',
+          message: previous.usage ? `最近查询失败：${message}` : message,
           updatedAt: new Date().toISOString(),
         };
         this.items.set(id, next);
@@ -191,20 +226,64 @@ export class HubService {
     return this.refreshAllPromise;
   }
 
-  async openLogin(providerId) {
-    const id = String(providerId || '');
-    const provider = this.providers.get(id);
+  async queryBalance(providerSelector) {
+    const provider = this.findProvider(providerSelector);
+    if (!provider) return { success: false, message: `Unknown provider: ${String(providerSelector || '')}` };
+    const item = await this.refreshProvider(provider.id);
+    return this.#balanceResponse(item);
+  }
+
+  async queryAllBalances() {
+    await this.refreshAll();
+    return {
+      success: [...this.items.values()].every(item => ['ok', 'degraded'].includes(item.status)),
+      data: Object.fromEntries([...this.items.values()].map(item => [item.id, this.#balanceResponse(item)])),
+    };
+  }
+
+  async openLogin(providerSelector) {
+    const provider = this.findProvider(providerSelector);
     if (!provider) throw new Error('CCSwitch 中不存在这个 Codex 供应商');
+    const id = provider.id;
     if (!loginConfiguration(provider)) throw new Error('该供应商不支持网页登录修复');
     await this.queryEngine.openLogin(provider);
     const item = this.items.get(id);
     this.items.set(id, {
       ...item,
       status: item.usage ? item.status : 'login-required',
-      message: '已打开专用 Edge 登录页；登录完成后回到 Hub 点击重新查询',
+      message: '已在现有浏览器中打开登录页；登录完成后回到 Hub 手动点击刷新',
     });
     this.revision += 1;
     return this.items.get(id);
+  }
+
+  #balanceResponse(item) {
+    const queryable = ['ok', 'degraded'].includes(item.status) && item.usage;
+    if (!queryable) {
+      return {
+        success: false,
+        provider: item.id,
+        message: item.message || '余额查询失败',
+        login_required: item.status === 'login-required',
+      };
+    }
+    return {
+      success: true,
+      provider: item.id,
+      data: {
+        isValid: true,
+        planName: item.usage.providerName || item.name,
+        remaining: item.usage.remaining,
+        used: item.usage.used,
+        total: item.usage.total,
+        unit: item.usage.unit,
+        extra: item.usage.extra,
+        periodLabel: item.usage.periodLabel,
+        hideTotal: item.usage.hideTotal,
+        updatedAt: item.usage.updatedAt,
+        source: item.source,
+      },
+    };
   }
 
   #writeCache() {

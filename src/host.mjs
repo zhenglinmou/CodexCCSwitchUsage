@@ -1,13 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { ProviderRepository } from './provider-repository.mjs';
-import { queryUsage } from './usage-client.mjs';
 import { CdpClient, getBrowserWebSocketUrl, isCodexAuxiliaryTarget, isCodexTargetCandidate, listCodexTargets } from './cdp-client.mjs';
 import { CdpDisconnectGuard } from './cdp-disconnect-guard.mjs';
-import { EdgeSession } from './edge-session.mjs';
+import { BrowserCallbackBroker } from './browser-callback-broker.mjs';
 import { HubServer } from './hub-server.mjs';
 import { ProviderQueryEngine } from './hub-provider-adapters.mjs';
-import { HubService } from './hub-service.mjs';
+import { hubItemToUsagePayload, HubService } from './hub-service.mjs';
 import { buildInjectorScript, HUB_BINDING, INJECTOR_VERSION, REFRESH_BINDING, UPDATE_GLOBAL } from './injector-script.mjs';
 import { TargetDiscovery } from './target-discovery.mjs';
 import { disposeTargetInjector, settleTargetOperations, TargetSession } from './target-session.mjs';
@@ -35,10 +34,13 @@ const statusPath = path.join(args.runtimeDir, 'status.json');
 const pidPath = path.join(args.runtimeDir, 'host.pid');
 const cachePath = path.join(args.runtimeDir, 'usage-cache.json');
 const repository = new ProviderRepository(args.database);
-const edgeSession = new EdgeSession(path.join(args.runtimeDir, 'hub-edge-profile'));
-const hubQueryEngine = new ProviderQueryEngine(repository, edgeSession);
+const browserBroker = new BrowserCallbackBroker();
+const hubQueryEngine = new ProviderQueryEngine(repository, browserBroker);
 const hubService = new HubService(repository, hubQueryEngine, { cachePath: path.join(args.runtimeDir, 'hub-cache.json') });
-const hubServer = new HubServer(hubService, { tokenPath: path.join(args.runtimeDir, 'hub-token') });
+const hubServer = new HubServer(hubService, {
+  tokenPath: path.join(args.runtimeDir, 'hub-token'),
+  browserBroker,
+});
 const sessions = new Map();
 const cleanedAuxiliaryTargetIds = new Set();
 const injectorScript = buildInjectorScript();
@@ -103,6 +105,7 @@ function writeStatus(extra = {}) {
     hubRunning: Boolean(hubServer.boundPort),
     hubPort: hubServer.boundPort || null,
     hubProviders: hubService.getState().providers.length,
+    browserCompanion: browserBroker.getStatus().connected,
     hubError: lastHubError,
     updatedAt: new Date().toISOString(),
     stopReason,
@@ -180,25 +183,16 @@ async function refreshUsage(force = false) {
   }
 
   lastProviderId = provider.id;
-  if (!provider.usage?.enabled || !String(provider.usage.code || '').trim()) {
-    lastQueryAt = Date.now();
-    lastPayload = { status: 'unsupported', providerId: provider.id, providerName: provider.name, websiteUrl: provider.websiteUrl, message: '未配置用量' };
-    hubService.recordCurrent(provider, lastPayload);
-    writeStatus();
-    scheduleUsageRefresh(intervalMs);
-    return;
-  }
-
   try {
-    lastPayload = await queryUsage(provider);
-    hubService.recordCurrent(provider, lastPayload);
-    writeUsageCache(lastPayload);
+    if (!hubService.findProvider(provider.id)) hubService.syncProviders();
+    const item = await hubService.refreshProvider(provider.id);
+    lastPayload = hubItemToUsagePayload(provider, item);
+    if (lastPayload.status === 'ok') writeUsageCache(lastPayload);
     lastQueryAt = Date.now();
-    writeStatus({ error: null });
-    scheduleUsageRefresh(intervalMs);
+    const failed = ['error', 'login-required'].includes(item.status);
+    writeStatus({ error: failed ? item.message : null });
+    scheduleUsageRefresh(failed ? 30_000 : intervalMs);
   } catch (error) {
-    // Retry transient quota endpoint failures after 30 seconds rather than
-    // waiting for the provider's full auto-query interval.
     lastQueryAt = Date.now() - intervalMinutes * 60_000 + 30_000;
     const message = safeMessage(error);
     if (lastPayload.status === 'ok' && lastPayload.providerId === provider.id) {
@@ -213,7 +207,6 @@ async function refreshUsage(force = false) {
         updatedAt: new Date().toISOString(),
       };
     }
-    hubService.recordCurrent(provider, lastPayload);
     writeStatus({ error: message });
     scheduleUsageRefresh(30_000);
   }
@@ -468,8 +461,8 @@ function shutdown(reason = null) {
   controlWatcher?.close();
   const auxiliaryShutdown = Promise.allSettled([
     hubServer.close(),
-    edgeSession.closeIfHeadless(),
   ]);
+  browserBroker.close();
   if (databaseWatchTimer) clearTimeout(databaseWatchTimer);
   if (usageRefreshTimer) clearTimeout(usageRefreshTimer);
   for (const session of sessions.values()) session.close();

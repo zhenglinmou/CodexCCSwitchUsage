@@ -4,7 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { buildHubPage } from './hub-page.mjs';
-import { isLoopbackRequest } from './edge-session.mjs';
+
+function isLoopbackRequest(request) {
+  const value = request?.socket?.remoteAddress || '';
+  return value === '127.0.0.1' || value === '::1' || value === '::ffff:127.0.0.1';
+}
 
 function readBody(request, maximumBytes = 16_384) {
   return new Promise((resolve, reject) => {
@@ -53,7 +57,8 @@ export function getOrCreateHubToken(tokenPath) {
 export class HubServer {
   constructor(service, options = {}) {
     this.service = service;
-    this.port = Number.isFinite(Number(options.port)) ? Number(options.port) : 17893;
+    this.browserBroker = options.browserBroker || null;
+    this.port = Number.isFinite(Number(options.port)) ? Number(options.port) : 17891;
     this.token = options.token || getOrCreateHubToken(options.tokenPath);
     this.openUrl = options.openUrl || (url => {
       const child = spawn('explorer.exe', [url], { detached: true, stdio: 'ignore', windowsHide: true });
@@ -80,10 +85,7 @@ export class HubServer {
     this.server = http.createServer((request, response) => {
       this.#handle(request, response).catch(error => jsonResponse(response, 500, { success: false, message: error.message }));
     });
-    await this.#listen(this.port).catch(async error => {
-      if (error?.code !== 'EADDRINUSE' || this.port === 0) throw error;
-      await this.#listen(0);
-    });
+    await this.#listen(this.port);
     this.boundPort = this.server.address().port;
     return this.url;
   }
@@ -104,6 +106,36 @@ export class HubServer {
       return;
     }
     const url = new URL(request.url || '/', `http://127.0.0.1:${this.boundPort || 80}`);
+    const crossSite = String(request.headers['sec-fetch-site'] || '').toLowerCase() === 'cross-site';
+    if (crossSite && (url.pathname.startsWith('/v1/') || url.pathname.startsWith('/usage/'))) {
+      jsonResponse(response, 403, { success: false, message: 'Cross-site browser requests are not allowed' });
+      return;
+    }
+    if (request.method === 'GET' && ['/', '/health', '/v1/health'].includes(url.pathname)) {
+      const state = this.service.getState();
+      jsonResponse(response, 200, {
+        success: true,
+        service: 'codex-ccswitch-balance-hub',
+        version: 2,
+        providers: state.providers.length,
+        refreshing: state.refreshing,
+      });
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === '/v1/providers') {
+      jsonResponse(response, 200, { success: true, providers: this.service.listPublicProviders() });
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === '/v1/balances') {
+      jsonResponse(response, 200, await this.service.queryAllBalances());
+      return;
+    }
+    const balanceMatch = url.pathname.match(/^\/(?:v1\/balance|usage)\/([^/]+)$/);
+    if (request.method === 'GET' && balanceMatch) {
+      const selector = decodeURIComponent(balanceMatch[1]);
+      jsonResponse(response, 200, await this.service.queryBalance(selector));
+      return;
+    }
     if (request.method === 'GET' && url.pathname === this.pagePath) {
       const nonce = crypto.randomBytes(16).toString('base64url');
       const body = Buffer.from(buildHubPage({ apiBase: this.apiPath, nonce }));
@@ -117,11 +149,49 @@ export class HubServer {
         'referrer-policy': 'no-referrer',
       });
       response.end(body);
-      this.service.refreshAll().catch(() => {});
       return;
     }
     if (request.method === 'GET' && url.pathname === `${this.apiPath}/state`) {
-      jsonResponse(response, 200, this.service.getState());
+      jsonResponse(response, 200, {
+        ...this.service.getState(),
+        companion: this.browserBroker?.getStatus?.() || { connected: false, clients: [], queuedJobs: 0, pendingJobs: 0 },
+      });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === `${this.apiPath}/companion/heartbeat`) {
+      if (!this.browserBroker) throw new Error('浏览器伴侣回调未启用');
+      const body = await readBody(request);
+      jsonResponse(response, 200, { success: true, companion: this.browserBroker.heartbeat(body) });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === `${this.apiPath}/companion/session`) {
+      if (!this.browserBroker) throw new Error('浏览器伴侣回调未启用');
+      const body = await readBody(request);
+      const accepted = this.browserBroker.noteSession(body.clientId, body.origin);
+      jsonResponse(response, accepted ? 200 : 400, { success: accepted });
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === `${this.apiPath}/companion/job`) {
+      if (!this.browserBroker) throw new Error('浏览器伴侣回调未启用');
+      const job = await this.browserBroker.nextJob({
+        clientId: url.searchParams.get('clientId'),
+        browser: url.searchParams.get('browser'),
+        version: url.searchParams.get('version'),
+      });
+      if (!job) {
+        response.writeHead(204, { 'cache-control': 'no-store' });
+        response.end();
+      } else {
+        jsonResponse(response, 200, { success: true, job });
+      }
+      return;
+    }
+    const companionResultMatch = url.pathname.match(new RegExp(`^${this.apiPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/companion/result/([^/]+)$`));
+    if (request.method === 'POST' && companionResultMatch) {
+      if (!this.browserBroker) throw new Error('浏览器伴侣回调未启用');
+      const body = await readBody(request, 2_100_000);
+      const accepted = this.browserBroker.complete(decodeURIComponent(companionResultMatch[1]), body);
+      jsonResponse(response, accepted ? 200 : 404, { success: accepted });
       return;
     }
     if (request.method === 'POST' && url.pathname === `${this.apiPath}/refresh`) {
@@ -143,7 +213,6 @@ export class HubServer {
   open() {
     if (!this.url) throw new Error('Balance Hub 尚未启动');
     this.openUrl(this.url);
-    this.service.refreshAll().catch(() => {});
     return this.url;
   }
 

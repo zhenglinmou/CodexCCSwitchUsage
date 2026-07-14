@@ -1,15 +1,33 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { normalizeUsage, queryUsage } from './usage-client.mjs';
-import { parseBrowserJson } from './edge-session.mjs';
+import { normalizeUsage } from './usage-client.mjs';
 
 const WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage';
 const QUOTA_PER_USD = 500_000;
 
+export function parseBrowserJson(text) {
+  const source = String(text || '').trim();
+  if (!source || source.length > 2_000_000) return null;
+  try {
+    return JSON.parse(source);
+  } catch {
+    const firstBrace = source.indexOf('{');
+    const lastBrace = source.lastIndexOf('}');
+    if (firstBrace < 0 || lastBrace <= firstBrace) return null;
+    try { return JSON.parse(source.slice(firstBrace, lastBrace + 1)); } catch {}
+    return null;
+  }
+}
+
 function finiteOrNull(value) {
+  if (value == null || value === '') return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
+}
+
+function providerApiBase(provider) {
+  return String(provider?.apiBaseUrl || provider?.baseUrl || '').replace(/\/+$/, '');
 }
 
 function usageResult(provider, values) {
@@ -35,13 +53,25 @@ async function readJsonResponse(response) {
 }
 
 async function fetchJson(fetchImpl, url, headers, timeoutMs = 40_000) {
-  const response = await fetchImpl(url, {
-    method: 'GET',
-    headers,
-    redirect: 'follow',
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  return readJsonResponse(response);
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await fetchImpl(url, {
+        method: 'GET',
+        headers,
+        redirect: 'follow',
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      const result = await readJsonResponse(response);
+      const retryable = [429, 500, 502, 503, 504].includes(result.status);
+      if (!retryable || attempt > 0) return result;
+    } catch (error) {
+      lastError = error;
+      if (attempt > 0) throw error;
+    }
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  throw lastError || new Error('余额接口请求失败');
 }
 
 function decodeJwtPayload(token) {
@@ -139,50 +169,27 @@ export function loginConfiguration(provider) {
   }
 }
 
-export function solveAnyRouterChallenge(arg1) {
-  const permutation = [15, 35, 29, 24, 33, 16, 1, 38, 10, 9, 19, 31, 40, 27, 22, 23, 25, 13, 6, 11, 39, 18, 20, 8, 14, 21, 32, 26, 2, 30, 7, 4, 17, 5, 3, 28, 34, 37, 12, 36];
-  const xorKey = '3000176000856006061501533003690027800375';
-  const reordered = Array(40).fill('');
-  for (let index = 0; index < String(arg1).length; index += 1) {
-    const destination = permutation.findIndex(source => source === index + 1);
-    if (destination >= 0) reordered[destination] = String(arg1)[index];
-  }
-  const value = reordered.join('');
-  if (!/^[0-9a-f]{40}$/i.test(value)) throw new Error('AnyRouter WAF 挑战格式无效');
-  let result = '';
-  for (let index = 0; index < 40; index += 2) {
-    result += (Number.parseInt(value.slice(index, index + 2), 16) ^ Number.parseInt(xorKey.slice(index, index + 2), 16)).toString(16).padStart(2, '0');
-  }
-  return result;
-}
-
-function bridgeProviderId(provider) {
+export function providerAliases(provider) {
   const kind = providerKind(provider);
   const name = String(provider.name || '').toLowerCase();
-  if (kind === 'anyrouter') return name.includes('国内') ? 'anyrouter_cn' : 'anyrouter';
-  if (kind === 'agentrouter') return 'agentrouter';
-  if (kind === 'openai') return name.includes('我自己的') ? 'openai_personal' : 'openai_official';
-  if (kind === 'packy') return 'packycode';
-  if (kind === 'deepseek') return 'deepseek';
-  if (kind === 'paid') return name.includes('copy') ? 'paid_sharedchat' : 'paid_rawchat';
-  if (kind === 'cpa') return 'cpa';
-  if (kind === 'health') return 'chy';
-  return '';
-}
-
-function isLegacyBridgeUsage(provider) {
-  const code = String(provider?.usage?.code || '');
-  return /127\.0\.0\.1:17891|\/v1\/balance\/(?:agentrouter|anyrouter)/i.test(code)
-    || /^http:\/\/(?:127\.0\.0\.1|localhost):17891$/i.test(String(provider?.baseUrl || ''));
+  const aliases = [provider.id, provider.name];
+  if (kind === 'anyrouter') aliases.push(name.includes('国内') ? 'anyrouter_cn' : 'anyrouter');
+  if (kind === 'agentrouter') aliases.push('agentrouter');
+  if (kind === 'openai') aliases.push(name.includes('我自己的') ? 'openai_personal' : 'openai_official');
+  if (kind === 'packy') aliases.push('packycode');
+  if (kind === 'deepseek') aliases.push('deepseek');
+  if (kind === 'paid') aliases.push(name.includes('copy') ? 'paid_sharedchat' : 'paid_rawchat');
+  if (kind === 'cpa') aliases.push('cpa');
+  if (kind === 'health') aliases.push('chy');
+  return [...new Set(aliases.map(value => String(value || '').trim().toLowerCase()).filter(Boolean))];
 }
 
 export class ProviderQueryEngine {
-  constructor(repository, edgeSession, options = {}) {
+  constructor(repository, browserBroker, options = {}) {
     this.repository = repository;
-    this.edgeSession = edgeSession;
+    this.browserBroker = browserBroker;
     this.fetchImpl = options.fetchImpl || fetch;
     this.homeDir = options.homeDir || process.env.USERPROFILE || process.env.HOME || '';
-    this.bridgeBaseUrl = options.bridgeBaseUrl || 'http://127.0.0.1:17891';
     this.inFlightQueries = new Map();
     this.recentQueries = new Map();
   }
@@ -212,8 +219,8 @@ export class ProviderQueryEngine {
   #sharedQueryKey(provider) {
     const kind = providerKind(provider);
     if (['anyrouter', 'agentrouter', 'openai', 'cpa'].includes(kind)) return '';
-    const baseIdentity = kind === 'paid' ? '' : provider.baseUrl;
-    const material = [kind, baseIdentity, provider.apiKey, provider.usage?.code || ''].join('\0');
+    const baseIdentity = kind === 'paid' ? '' : providerApiBase(provider);
+    const material = [kind, baseIdentity, provider.apiKey].join('\0');
     return crypto.createHash('sha256').update(material).digest('base64url');
   }
 
@@ -230,73 +237,55 @@ export class ProviderQueryEngine {
   }
 
   async #queryUncached(provider) {
-    let result;
-    let failure;
-    try {
-      const kind = providerKind(provider);
-      if (kind === 'anyrouter' || kind === 'agentrouter') return this.#queryWebProvider(provider);
-      if (kind === 'openai') result = await this.#queryOpenAi(provider);
-      else if (kind === 'cpa') result = await this.#queryCpa(provider);
-      else if (kind === 'deepseek') result = await this.#queryDeepSeek(provider);
-      else if (kind === 'health' && !provider.usage?.code) result = await this.#queryHealth(provider);
-      else if (provider.usage?.enabled && String(provider.usage?.code || '').trim() && !isLegacyBridgeUsage(provider)) {
-        result = { usage: await queryUsage(provider, { fetchImpl: this.fetchImpl }), source: 'usage_script', loginRequired: false };
-      } else if (kind === 'packy') result = await this.#queryPacky(provider);
-      else if (kind === 'paid') result = await this.#queryPaid(provider);
-      else if (provider.apiKey && provider.baseUrl) result = await this.#queryHealth(provider);
-      else throw new Error('该供应商没有可用的余额查询配置');
-    } catch (error) {
-      failure = error;
-    }
-    if (failure || (result?.loginRequired && !result.usage)) {
-      const bridge = await this.#queryLegacyBridge(provider).catch(() => null);
-      if (bridge) return bridge;
-    }
-    if (failure) throw failure;
-    return result;
+    const kind = providerKind(provider);
+    if (kind === 'anyrouter' || kind === 'agentrouter') return this.#queryWebProvider(provider);
+    if (kind === 'openai') return this.#queryOpenAi(provider);
+    if (kind === 'cpa') return this.#queryCpa(provider);
+    if (kind === 'deepseek') return this.#queryDeepSeek(provider);
+    if (kind === 'packy') return this.#queryPacky(provider);
+    if (kind === 'paid') return this.#queryPaid(provider);
+    if (provider.apiKey && providerApiBase(provider)) return this.#queryHealth(provider);
+    throw new Error('该供应商没有可用的 API Key、Base URL 或内置余额适配器');
   }
 
   async openLogin(provider) {
     const config = loginConfiguration(provider);
     if (!config) throw new Error('该供应商不支持网页登录修复');
-    await this.edgeSession.openLogin(config.loginUrl);
+    if (!this.browserBroker.isConnected()) throw new Error('请先连接现有 Edge/Chrome 的余额伴侣扩展');
+    await this.browserBroker.openLogin(config);
     return { success: true, loginUrl: config.loginUrl };
   }
 
   async #queryWebProvider(provider) {
-    const kind = providerKind(provider);
     const config = loginConfiguration(provider);
-    const hasBrowserState = this.edgeSession.hasLoginState?.(config.baseUrl) === true;
-    let browserResult = null;
+    const hasBrowserState = this.browserBroker.hasSession(config.baseUrl);
     if (hasBrowserState) {
-      browserResult = await this.#queryBrowserNewApi(provider).catch(error => ({
+      return this.#queryBrowserNewApi(provider).catch(error => ({
         source: 'browser_session', loginRequired: true, message: error instanceof Error ? error.message : String(error),
       }));
-      if (browserResult?.usage) return browserResult;
     }
-    const bridge = await this.#queryLegacyBridge(provider).catch(() => null);
-    if (bridge?.usage) return bridge;
-    if (kind === 'anyrouter') {
-      const direct = await this.#queryAnyRouterCookie(provider).catch(() => null);
-      if (direct) return direct;
-    }
-    if (browserResult) return browserResult;
-    if (bridge) return bridge;
-    return this.#queryBrowserNewApi(provider);
+    const probe = await this.#probeApiKey(provider);
+    return {
+      source: 'api_key_probe',
+      loginRequired: true,
+      message: !this.browserBroker.isConnected()
+        ? `${probe.message}；请先连接现有 Edge/Chrome 的余额伴侣扩展`
+        : probe.valid
+          ? '模型 API Key 可用，但该站余额需要网页登录；请在 Hub 中主动打开登录页，登录后再刷新'
+          : `${probe.message}；余额需要在 Hub 中主动登录后查询`,
+    };
   }
 
   async #queryBrowserNewApi(provider) {
     const kind = providerKind(provider);
     const config = loginConfiguration(provider);
-    const accessToken = String(provider.usage?.accessToken || '');
-    const userId = String(provider.usage?.userId || '');
-    if (!this.edgeSession.hasPersistentState() && !accessToken && !userId) {
-      return { source: 'browser_session', loginRequired: true, message: '需要先网页登录，登录状态会保存在 v2 的专用 Edge 会话中' };
+    if (!this.browserBroker.isConnected()) {
+      return { source: 'browser_session', loginRequired: true, message: '现有 Edge/Chrome 的余额伴侣扩展未连接' };
     }
-    const headers = {};
-    if (accessToken && !accessToken.includes('=')) headers.Authorization = `Bearer ${accessToken}`;
-    if (userId) headers[config.userHeader] = userId;
-    const raw = await this.edgeSession.queryJson({ ...config, headers, waitMs: kind === 'agentrouter' ? 55_000 : 40_000 });
+    const raw = await this.browserBroker.queryJson({ ...config, headers: {}, waitMs: kind === 'agentrouter' ? 55_000 : 40_000 });
+    if (raw?.loginRequired) {
+      return { source: 'browser_session', loginRequired: true, message: String(raw.message || '现有浏览器尚未登录该网站') };
+    }
     const payload = parseBrowserJson(raw?.text);
     if (!payload?.success || !payload?.data) {
       return { source: 'browser_session', loginRequired: true, message: String(payload?.message || '网页登录已失效或 WAF 验证尚未完成') };
@@ -318,68 +307,28 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryLegacyBridge(provider) {
-    const bridgeId = bridgeProviderId(provider);
-    if (!bridgeId) return null;
-    const kind = providerKind(provider);
-    const timeoutMs = kind === 'agentrouter' ? 95_000 : kind === 'anyrouter' ? 65_000 : ['openai', 'cpa'].includes(kind) ? 50_000 : 15_000;
-    const { status, payload } = await fetchJson(this.fetchImpl, `${this.bridgeBaseUrl}/v1/balance/${bridgeId}`, { Accept: 'application/json', 'Cache-Control': 'no-store' }, timeoutMs);
-    if (status !== 200) return null;
-    if (!payload?.success || !payload?.data) {
-      if (payload?.login_required || payload?.loginRequired) {
-        return { source: 'legacy_bridge', loginRequired: true, message: String(payload.message || '登录状态已失效') };
-      }
-      return null;
-    }
-    const data = payload.data;
-    if (data.isValid === false) {
-      return {
-        source: 'legacy_bridge',
-        loginRequired: Boolean(data.loginRequired || data.login_required),
-        message: String(data.invalidMessage || payload.message || '登录状态已失效'),
-      };
-    }
-    return {
-      usage: usageResult(provider, data),
-      source: 'legacy_bridge',
-      loginRequired: Boolean(data.loginRequired),
-    };
-  }
-
-  async #queryAnyRouterCookie(provider) {
-    const cookie = String(provider.usage?.accessToken || '');
-    const userId = String(provider.usage?.userId || '');
-    if (!cookie.includes('=') || !userId) return null;
-    let cookieHeader = cookie;
-    let responsePayload = null;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const { status, payload, text } = await fetchJson(this.fetchImpl, 'https://anyrouter.top/api/user/self', {
+  async #probeApiKey(provider) {
+    const baseUrl = providerApiBase(provider);
+    if (!provider.apiKey || !baseUrl) return { valid: false, message: '该站没有可用的模型 API Key 或 Base URL' };
+    try {
+      const { status, payload } = await fetchJson(this.fetchImpl, `${baseUrl}/models`, {
+        Authorization: `Bearer ${provider.apiKey}`,
         Accept: 'application/json',
-        'New-Api-User': userId,
-        Cookie: cookieHeader,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136 Safari/537.36',
-      }, 45_000);
-      if (status === 200 && payload?.success && payload?.data) {
-        responsePayload = payload;
-        break;
-      }
-      const challenge = text.match(/var\s+arg1=['"]([0-9a-f]{40})['"]/i)?.[1];
-      if (!challenge) break;
-      cookieHeader = `${cookieHeader}; acw_sc__v2=${solveAnyRouterChallenge(challenge)}`;
+      }, 20_000);
+      const valid = status === 200 && payload && Array.isArray(payload.data);
+      const message = valid
+        ? '模型 API Key 可用'
+        : String(payload?.error?.message || payload?.message || (status === 200
+          ? '模型接口返回非标准数据，无法确认 API Key'
+          : `模型 API Key 检查返回 HTTP ${status}`));
+      return { valid, message };
+    } catch (error) {
+      return { valid: false, message: error instanceof Error ? error.message : String(error) };
     }
-    if (!responsePayload?.data) return null;
-    const data = responsePayload.data;
-    const remaining = (Number(data.quota) || 0) / QUOTA_PER_USD;
-    const used = (Number(data.used_quota) || 0) / QUOTA_PER_USD;
-    return {
-      usage: usageResult(provider, { planName: data.group || provider.name, remaining, used, total: remaining + used, unit: 'USD' }),
-      source: 'ccswitch_cookie',
-      loginRequired: false,
-    };
   }
 
   async #queryDeepSeek(provider) {
-    const baseUrl = provider.baseUrl || 'https://api.deepseek.com';
+    const baseUrl = providerApiBase(provider) || 'https://api.deepseek.com';
     const { status, payload } = await fetchJson(this.fetchImpl, `${baseUrl}/user/balance`, {
       Authorization: `Bearer ${provider.apiKey}`,
       Accept: 'application/json',
@@ -419,8 +368,41 @@ export class ProviderQueryEngine {
   }
 
   async #queryPaid(provider) {
-    if (provider.usage?.code) return { usage: await queryUsage(provider, { fetchImpl: this.fetchImpl }), source: 'usage_script', loginRequired: false };
-    throw new Error('付费站没有配置余额脚本');
+    const baseUrl = providerApiBase(provider);
+    if (!provider.apiKey || !baseUrl) throw new Error('付费站没有可用的 API Key 或 Base URL');
+    const { status, payload } = await fetchJson(this.fetchImpl, `${baseUrl}/user/balance`, {
+      Authorization: `Bearer ${provider.apiKey}`,
+      Accept: 'application/json',
+      'User-Agent': 'codex-ccswitch-usage/2',
+    });
+    if (status !== 200 || !payload || typeof payload !== 'object') throw new Error(`付费站余额接口返回 HTTP ${status}`);
+    const active = payload.status == null ? payload.is_active !== false : payload.status === 'ok';
+    const quota3h = payload.quota?.['3h'] || { total: payload.limit_3h, used: payload.used_3h, remaining: payload.balance_3h };
+    const daily = payload.quota?.daily || { total: payload.limit_1d, used: payload.used_1d, remaining: payload.balance_1d };
+    const used = finiteOrNull(daily.used);
+    const remaining = finiteOrNull(daily.remaining);
+    const total = finiteOrNull(daily.total);
+    if (!active || used == null || remaining == null || total == null || total <= 0) {
+      throw new Error(String(payload.message || payload.reason || '付费站额度数据不完整'));
+    }
+    const short = value => {
+      const number = finiteOrNull(value);
+      return number == null ? '--' : (Math.trunc(number * 100) / 100).toFixed(2);
+    };
+    return {
+      usage: usageResult(provider, {
+        planName: provider.name,
+        extra: `3H剩:${short(quota3h.remaining)}`,
+        periodLabel: '1D',
+        hideTotal: true,
+        used,
+        remaining,
+        total,
+        unit: String(payload.unit || ''),
+      }),
+      source: 'provider_api',
+      loginRequired: false,
+    };
   }
 
   async #queryWham(accessToken, accountId) {
@@ -441,7 +423,7 @@ export class ProviderQueryEngine {
     try {
       const browserHeaders = { ...headers };
       delete browserHeaders['User-Agent'];
-      const raw = await this.edgeSession.queryJson({
+      const raw = await this.browserBroker.queryJson({
         baseUrl: 'https://chatgpt.com',
         requestPath: '/backend-api/wham/usage',
         headers: browserHeaders,
@@ -471,9 +453,9 @@ export class ProviderQueryEngine {
   }
 
   async #queryOpenAiBrowser(provider) {
-    if (this.edgeSession.hasLoginState?.('https://chatgpt.com') !== true) return null;
+    if (!this.browserBroker.hasSession('https://chatgpt.com')) return null;
     const config = loginConfiguration(provider);
-    const raw = await this.edgeSession.queryJson(config);
+    const raw = await this.browserBroker.queryJson(config);
     const session = parseBrowserJson(raw?.text);
     const accessToken = String(session?.accessToken || session?.access_token || '');
     const accountId = accountIdFromSession(session, accessToken);
@@ -555,8 +537,9 @@ export class ProviderQueryEngine {
   }
 
   async #queryHealth(provider) {
-    if (!provider.apiKey || !provider.baseUrl) throw new Error('该站没有可用于健康检查的 API Key 或 Base URL');
-    const { status, payload } = await fetchJson(this.fetchImpl, `${provider.baseUrl}/models`, {
+    const baseUrl = providerApiBase(provider);
+    if (!provider.apiKey || !baseUrl) throw new Error('该站没有可用于健康检查的 API Key 或 Base URL');
+    const { status, payload } = await fetchJson(this.fetchImpl, `${baseUrl}/models`, {
       Authorization: `Bearer ${provider.apiKey}`,
       Accept: 'application/json',
     });

@@ -91,6 +91,7 @@ test('provider repository lists every Codex provider without exposing database w
     { id: 'provider-1', current: true },
   ]);
   assert.equal(first[0].auth.OPENAI_API_KEY, 'key');
+  assert.equal(first[0].apiBaseUrl, 'https://api.example.com');
 });
 
 test('provider repository change token includes sqlite sidecar files', () => {

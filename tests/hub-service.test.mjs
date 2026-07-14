@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { HubService } from '../src/hub-service.mjs';
+import { hubItemToUsagePayload, HubService } from '../src/hub-service.mjs';
 
 function provider(id, name, current = false) {
-  return { id, name, websiteUrl: 'https://example.com', isCurrent: current, usage: null, auth: {}, apiKey: '', baseUrl: '' };
+  return { id, name, websiteUrl: 'https://example.com', isCurrent: current, usage: null, auth: {}, apiKey: '', apiBaseUrl: '', baseUrl: '' };
 }
 
 test('Hub state exposes safe provider fields and refreshes with bounded concurrency', async () => {
@@ -61,8 +61,46 @@ test('Hub errors redact bearer tokens and preserve the last successful usage', a
   await service.refreshProvider(item.id);
   const state = service.getState().providers[0];
 
-  assert.equal(state.status, 'error');
+  assert.equal(state.status, 'degraded');
   assert.equal(state.usage.remaining, 8);
   assert.doesNotMatch(state.message, /secret-value/);
   assert.match(state.message, /\[redacted\]/);
+});
+
+test('Hub resolves stable aliases and exposes normalized balance responses', async () => {
+  const item = provider('provider-one', 'agentrouter', true);
+  const service = new HubService({ getAll: () => [item] }, {
+    async query() {
+      return {
+        source: 'browser_session',
+        usage: {
+          status: 'ok', providerId: item.id, providerName: 'AgentRouter', used: 1, remaining: 9, total: 10,
+          unit: 'USD', extra: '', updatedAt: '2026-07-15T00:00:00.000Z', refreshIntervalMinutes: 5,
+        },
+      };
+    },
+  });
+
+  assert.equal(service.findProvider('agentrouter').id, item.id);
+  assert.ok(service.listPublicProviders()[0].balanceUrl.endsWith('/agentrouter'));
+  const response = await service.queryBalance('agentrouter');
+  assert.equal(response.success, true);
+  assert.equal(response.data.remaining, 9);
+  assert.equal(response.data.source, 'browser_session');
+});
+
+test('Codex footer payload is derived from Hub state and preserves cached usage on login errors', () => {
+  const current = provider('one', 'AgentRouter', true);
+  const payload = hubItemToUsagePayload(current, {
+    status: 'login-required',
+    message: '需要网页登录',
+    usage: {
+      providerName: 'AgentRouter', used: 2, remaining: 8, total: 10, unit: 'USD', extra: '',
+      periodLabel: '', hideTotal: false, refreshIntervalMinutes: 5, updatedAt: '2026-07-15T00:00:00.000Z',
+    },
+  });
+
+  assert.equal(payload.status, 'ok');
+  assert.equal(payload.remaining, 8);
+  assert.equal(payload.queryError, '需要网页登录');
 });

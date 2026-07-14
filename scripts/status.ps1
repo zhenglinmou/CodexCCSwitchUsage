@@ -22,6 +22,7 @@ $hostProcess = Get-CimInstance Win32_Process | Where-Object {
     hubRunning = $status.hubRunning
     hubPort = $status.hubPort
     hubProviders = $status.hubProviders
+    browserCompanion = $status.browserCompanion
     connectedPages = $status.connectedPages
     updatedAt = $status.updatedAt
     error = if ($status.error) { $status.error } elseif ($status.connectionError) { $status.connectionError } elseif ($status.hubError) { $status.hubError } else { $null }

@@ -13,6 +13,18 @@ test('host connects targets before starting the initial usage refresh', () => {
   assert.doesNotMatch(loop, /await requestUsageRefresh\(false, false\)/, 'quota I/O must not block target injection');
 });
 
+test('v2 current-provider quota is sourced only from Balance Hub', () => {
+  const source = fs.readFileSync(new URL('../src/host.mjs', import.meta.url), 'utf8');
+  const refresh = source.slice(source.indexOf('async function refreshUsage('), source.indexOf('async function syncTargets()'));
+
+  assert.match(refresh, /hubService\.refreshProvider\(provider\.id\)/);
+  assert.match(refresh, /hubItemToUsagePayload\(provider, item\)/);
+  assert.match(source, /new BrowserCallbackBroker\(\)/);
+  assert.doesNotMatch(source, /import \{ queryUsage \}/);
+  assert.doesNotMatch(source, /EdgeSession|hub-edge-profile/);
+  assert.doesNotMatch(refresh, /provider\.usage\?\.enabled/);
+});
+
 test('every status write preserves page connectivity fields', () => {
   const source = fs.readFileSync(new URL('../src/host.mjs', import.meta.url), 'utf8');
   const writeStatus = source.slice(source.indexOf('function writeStatus('), source.indexOf('function safeMessage('));

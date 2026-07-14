@@ -21,6 +21,7 @@ export function parseProviderRow(row) {
   const meta = parseJson(row.meta, {});
   const usage = meta?.usage_script;
   const auth = settings?.auth && typeof settings.auth === 'object' ? settings.auth : {};
+  const apiBaseUrl = findBaseUrl(settings?.config || '');
 
   return {
     id: String(row.id),
@@ -31,7 +32,8 @@ export function parseProviderRow(row) {
     usage: usage && typeof usage === 'object' ? usage : null,
     auth,
     apiKey: String(auth.OPENAI_API_KEY || auth.openai_api_key || ''),
-    baseUrl: String(usage?.baseUrl || findBaseUrl(settings?.config || '')).replace(/\/+$/, ''),
+    apiBaseUrl,
+    baseUrl: String(usage?.baseUrl || apiBaseUrl).replace(/\/+$/, ''),
   };
 }
 

@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { loginConfiguration, ProviderQueryEngine, providerKind, solveAnyRouterChallenge, summarizeWham } from '../src/hub-provider-adapters.mjs';
+import { loginConfiguration, parseBrowserJson, ProviderQueryEngine, providerAliases, providerKind, summarizeWham } from '../src/hub-provider-adapters.mjs';
+
+test('browser callback JSON parsing rejects WAF HTML and oversized responses', () => {
+  assert.deepEqual(parseBrowserJson('{"success":true}'), { success: true });
+  assert.deepEqual(parseBrowserJson('response\n{"data":{"quota":1}}\n'), { data: { quota: 1 } });
+  assert.equal(parseBrowserJson('<html>WAF challenge</html>'), null);
+  assert.equal(parseBrowserJson('x'.repeat(2_000_001)), null);
+});
 
 test('Hub provider routing recognizes the current CCSwitch Codex provider families', () => {
   assert.equal(providerKind({ name: 'any的国外我自己的' }), 'anyrouter');
@@ -13,10 +20,10 @@ test('Hub provider routing recognizes the current CCSwitch Codex provider famili
   assert.equal(loginConfiguration({ name: 'agentrouter' }).loginUrl, 'https://agentrouter.org/login');
 });
 
-test('AnyRouter challenge solver is deterministic and returns a 20-byte cookie value', () => {
-  const solved = solveAnyRouterChallenge('0123456789abcdef0123456789abcdef01234567');
-  assert.match(solved, /^[0-9a-f]{40}$/);
-  assert.equal(solved, solveAnyRouterChallenge('0123456789abcdef0123456789abcdef01234567'));
+test('provider aliases preserve the stable local gateway paths', () => {
+  assert.ok(providerAliases({ id: 'one', name: 'any的国内镜像' }).includes('anyrouter_cn'));
+  assert.ok(providerAliases({ id: 'two', name: 'OpenAI Official-我自己的' }).includes('openai_personal'));
+  assert.ok(providerAliases({ id: 'three', name: '付费站 copy' }).includes('paid_sharedchat'));
 });
 
 test('OpenAI wham payload is normalized into primary and secondary quota windows', () => {
@@ -38,28 +45,51 @@ test('OpenAI wham payload is normalized into primary and secondary quota windows
   assert.equal(summary.creditBalance, 7.5);
 });
 
-test('legacy bridge login failures remain actionable instead of becoming generic errors', async () => {
-  const engine = new ProviderQueryEngine({}, { hasPersistentState: () => false }, {
+test('browser-only providers probe the model API before requesting a website login', async () => {
+  const calls = [];
+  const engine = new ProviderQueryEngine({}, { hasSession: () => false, isConnected: () => false }, {
     fetchImpl: async url => {
-      assert.match(String(url), /\/v1\/balance\/openai_official$/);
-      return new Response(JSON.stringify({
-        success: true,
-        data: { isValid: false, loginRequired: true, invalidMessage: '登录已过期' },
-      }), { status: 200, headers: { 'content-type': 'application/json' } });
+      calls.push(String(url));
+      return new Response(JSON.stringify({ data: [{ id: 'gpt-5' }] }), { status: 200 });
     },
   });
 
   const result = await engine.query({
-    id: 'openai', name: 'OpenAI Official', websiteUrl: 'https://chatgpt.com/codex',
-    usage: null, auth: {}, apiKey: '', baseUrl: '',
+    id: 'agent', name: 'agentrouter', websiteUrl: '', usage: { code: 'old bridge code' }, auth: {},
+    apiKey: 'model-key', apiBaseUrl: 'https://api.agent.example', baseUrl: 'http://127.0.0.1:17891',
   });
 
   assert.equal(result.loginRequired, true);
-  assert.equal(result.source, 'legacy_bridge');
-  assert.equal(result.message, '登录已过期');
+  assert.equal(result.source, 'api_key_probe');
+  assert.match(result.message, /API Key 可用/);
+  assert.deepEqual(calls, ['https://api.agent.example/models']);
+  assert.doesNotMatch(calls.join(' '), /17891/);
 });
 
-test('OpenAI token queries fall back to the dedicated Edge transport without exposing the token', async () => {
+test('WAF balance queries use the connected existing-browser callback and never auto-open login', async () => {
+  let loginCalls = 0;
+  let queryCalls = 0;
+  const broker = {
+    hasSession: () => true,
+    isConnected: () => true,
+    async queryJson() {
+      queryCalls += 1;
+      return { status: 200, text: '{"success":true,"data":{"quota":5000000,"used_quota":500000,"group":"vip"}}' };
+    },
+    async openLogin() { loginCalls += 1; },
+  };
+  const engine = new ProviderQueryEngine({}, broker, { fetchImpl: async () => { throw new Error('model API must not run after a browser session is known'); } });
+  const provider = { id: 'agent', name: 'agentrouter', websiteUrl: '', usage: null, auth: {}, apiKey: 'key', apiBaseUrl: 'https://agentrouter.org' };
+
+  const result = await engine.query(provider);
+
+  assert.equal(result.source, 'browser_session');
+  assert.equal(result.usage.remaining, 10);
+  assert.equal(queryCalls, 1);
+  assert.equal(loginCalls, 0);
+});
+
+test('OpenAI token queries fall back to the paired existing-browser callback without exposing the token', async () => {
   const edgeCalls = [];
   const engine = new ProviderQueryEngine({}, {
     hasLoginState: () => false,
@@ -80,7 +110,7 @@ test('OpenAI token queries fall back to the dedicated Edge transport without exp
 
   const result = await engine.query({
     id: 'openai', name: 'OpenAI Official', websiteUrl: 'https://chatgpt.com/codex', usage: null,
-    auth: { tokens: { account_id: 'account-one', access_token: 'private-token' } }, apiKey: '', baseUrl: '',
+    auth: { tokens: { account_id: 'account-one', access_token: 'private-token' } }, apiKey: '', apiBaseUrl: '', baseUrl: '',
   });
 
   assert.equal(result.source, 'openai_wham_browser');
@@ -101,7 +131,7 @@ test('duplicate provider copies reuse one recent balance request to avoid rate l
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     },
   });
-  const base = { name: 'DeepSeek', websiteUrl: 'https://platform.deepseek.com', usage: null, auth: {}, apiKey: 'same-key', baseUrl: 'https://api.deepseek.com' };
+  const base = { name: 'DeepSeek', websiteUrl: 'https://platform.deepseek.com', usage: null, auth: {}, apiKey: 'same-key', apiBaseUrl: 'https://api.deepseek.com', baseUrl: 'https://api.deepseek.com' };
 
   const first = await engine.query({ ...base, id: 'first' });
   const second = await engine.query({ ...base, id: 'copy' });
@@ -115,19 +145,18 @@ test('duplicate provider copies reuse one recent balance request to avoid rate l
 test('paid-site copies sharing one API key reuse the result across mirror domains', async () => {
   let requests = 0;
   const engine = new ProviderQueryEngine({}, {}, {
-    fetchImpl: async () => {
+    fetchImpl: async url => {
       requests += 1;
-      return new Response('{"remaining":9,"used":1,"total":10}', { status: 200 });
+      assert.doesNotMatch(String(url), /17891/);
+      return new Response('{"status":"ok","balance_3h":4,"used_3h":1,"limit_3h":5,"balance_1d":9,"used_1d":1,"limit_1d":10}', { status: 200 });
     },
   });
-  const code = `({
-    request: { url: "{{baseUrl}}/user/balance", headers: { Authorization: "Bearer {{apiKey}}" } },
-    extractor: response => ({ planName: "付费站", remaining: response.remaining, used: response.used, total: response.total })
-  })`;
-  const base = { websiteUrl: '', usage: { enabled: true, code, timeout: 10 }, auth: {}, apiKey: 'shared-key' };
+  const base = { websiteUrl: '', usage: { enabled: true, code: 'old usage_script must not run' }, auth: {}, apiKey: 'shared-key' };
 
-  await engine.query({ ...base, id: 'raw', name: '付费站', baseUrl: 'https://raw.example' });
-  await engine.query({ ...base, id: 'copy', name: '付费站 copy', baseUrl: 'https://mirror.example' });
+  const first = await engine.query({ ...base, id: 'raw', name: '付费站', apiBaseUrl: 'https://raw.example', baseUrl: 'https://old-bridge.invalid' });
+  const second = await engine.query({ ...base, id: 'copy', name: '付费站 copy', apiBaseUrl: 'https://mirror.example', baseUrl: 'https://old-bridge.invalid' });
 
   assert.equal(requests, 1);
+  assert.equal(first.usage.remaining, 9);
+  assert.equal(second.usage.providerId, 'copy');
 });

@@ -39,11 +39,12 @@ The installer preserves the stable `runtime` directory during an upgrade. A real
 | `src\host.mjs` | Long-running host, quota refresh scheduling, database and target watchers |
 | `src\injector-script.mjs` | Composer footer DOM, styles, responsive layout, tooltips, refresh UI |
 | `src\provider-repository.mjs` | Read-only CCSwitch SQLite access |
-| `src\usage-client.mjs` | Provider quota HTTP request and normalized usage result |
+| `src\usage-client.mjs` | Legacy `usage_script` compatibility utilities; not used by the v2 Hub runtime |
 | `src\hub-provider-adapters.mjs` | v2 provider routing and built-in balance adapters |
 | `src\hub-service.mjs` | Safe multi-provider Hub state, cache, refresh concurrency, and login actions |
 | `src\hub-server.mjs` / `src\hub-page.mjs` | Loopback-only Balance Hub API and page |
-| `src\edge-session.mjs` | Dedicated persistent Edge session for WAF and login repair |
+| `src\browser-callback-broker.mjs` | Same-port job queue and callbacks for the user's existing browser profile |
+| `browser-companion\` | MV3 companion loaded into the user's normal Edge/Chrome profile |
 | `src\evaluator.mjs` | Worker lifecycle and timeout handling for provider scripts |
 | `src\evaluator-worker.mjs` | Sandboxed `node:vm` execution of `usage_script` |
 | `src\cdp-client.mjs` | CDP HTTP/WebSocket client |
@@ -54,6 +55,16 @@ The installer preserves the stable `runtime` directory during an upgrade. A real
 | `packaging\launcher\Program.cs` | Hidden Windows EXE wrapper that launches the existing PowerShell flow |
 | `packaging\setup.iss` | Inno Setup installer definition |
 | `scripts\build-exe.ps1` | Repeatable launcher/installer build |
+
+### v2 single balance center
+
+The v2 host is the only balance-query center. The Codex footer, Hub page, and loopback balance API all call `HubService`; none executes the CCSwitch `usage_script` or calls the retired Python bridge.
+
+The stable gateway listens on `127.0.0.1:17891` and exposes `/v1/balance/{provider}`, `/v1/balances`, `/v1/providers`, `/v1/health`, plus the legacy-compatible `/usage/{provider}` path. CCSwitch remains read-only and its existing scripts are not rewritten during v2 development.
+
+Provider adapters first use the CCSwitch API Key and configured Base URL when the third-party site supports a balance endpoint. Sites whose model API keys cannot access dashboard balances use the MV3 browser companion after one-time pairing with the Hub token. The companion runs requests inside the user's existing Edge/Chrome profile, keeps Cookie values in that browser, and returns only request results through the same port. Hub opening never triggers refresh, and query failures never open provider pages; login navigation requires an explicit user action.
+
+The old standalone Python bridge must not run alongside v2 because both use port `17891`.
 
 ## 3. Enter development mode
 
