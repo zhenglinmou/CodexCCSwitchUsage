@@ -10,6 +10,7 @@ import {
   findMutationObserverTarget,
   findUsageTooltipTarget,
   getUsageFreshness,
+  HUB_BINDING,
   INJECTOR_VERSION,
   isNativeFlowCacheValid,
   isUsageTooltipBoundaryCrossing,
@@ -86,6 +87,13 @@ test('hot replacement clears a pending tooltip delay', () => {
 
 test('refresh button notifies the host through the exported CDP binding', () => {
   assert.match(buildInjectorScript(), new RegExp(REFRESH_BINDING));
+});
+
+test('balance content and icon popover expose the v2 Balance Hub binding', () => {
+  const script = buildInjectorScript();
+  assert.match(script, new RegExp(HUB_BINDING));
+  assert.match(script, /action: 'open-hub'/);
+  assert.match(script, /id="open-hub"/);
 });
 
 test('hot payload rendering does not replace usage or popover innerHTML', () => {

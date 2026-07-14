@@ -7,6 +7,8 @@ function providerRow(overrides = {}) {
     id: 'provider-1',
     name: 'Provider One',
     website_url: 'https://example.com',
+    is_current: 1,
+    sort_index: 2,
     settings_config: JSON.stringify({ auth: { OPENAI_API_KEY: 'key' }, config: 'base_url="https://api.example.com"' }),
     meta: JSON.stringify({ usage_script: { enabled: true, code: '({})' } }),
     ...overrides,
@@ -55,6 +57,40 @@ test('provider repository reuses its database, prepared statements and parsed ro
   assert.equal(databases[0].closed, true);
   repository.close();
   assert.equal(databases[1].closed, true);
+});
+
+test('provider repository lists every Codex provider without exposing database writes', () => {
+  const rows = [
+    providerRow({ id: 'provider-2', name: 'Second', is_current: 0, sort_index: 2 }),
+    providerRow({ id: 'provider-1', name: 'First', is_current: 1, sort_index: 1 }),
+  ];
+  let allCalls = 0;
+  const repository = new ProviderRepository('fake.db', {
+    databaseFactory: () => ({
+      prepare(source) {
+        assert.match(source, /WHERE app_type = 'codex'/);
+        return {
+          all() {
+            allCalls += 1;
+            return rows;
+          },
+        };
+      },
+      close() {},
+    }),
+    statSync: () => ({ dev: 1, ino: 1, birthtimeMs: 1 }),
+  });
+
+  const first = repository.getAll();
+  const second = repository.getAll();
+
+  assert.equal(first, second);
+  assert.equal(allCalls, 2, 'read-only rows are rechecked so WAL updates are visible');
+  assert.deepEqual(first.map(provider => ({ id: provider.id, current: provider.isCurrent })), [
+    { id: 'provider-2', current: false },
+    { id: 'provider-1', current: true },
+  ]);
+  assert.equal(first[0].auth.OPENAI_API_KEY, 'key');
 });
 
 test('provider repository change token includes sqlite sidecar files', () => {

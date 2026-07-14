@@ -60,6 +60,9 @@ test('repeatable EXE build embeds the current Node runtime and emits a versioned
   assert.equal(packageJson.scripts['build:exe'].includes('scripts/build-exe.ps1'), true);
   assert.match(build, /runtime-bin\\node\.exe/);
   assert.match(build, /'src\\cdp-disconnect-guard\.mjs'/);
+  for (const file of ['edge-session', 'hub-provider-adapters', 'hub-service', 'hub-page', 'hub-server']) {
+    assert.match(build, new RegExp(`'src\\\\${file}\\.mjs'`));
+  }
   assert.match(build, /nodeProbe\.arch -ne 'x64'/);
   assert.match(build, /nodeProbe\.major -lt 22/);
   assert.match(build, /Framework64\\v4\.0\.30319\\csc\.exe/);

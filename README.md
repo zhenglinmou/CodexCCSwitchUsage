@@ -1,16 +1,27 @@
 # Codex CCSwitch Usage
 
-一个轻量的本地扩展：读取 CCSwitch 的当前 Codex 供应商及 `usage_script`，把用量信息嵌入 Codex 输入栏底部的空白区域。
+一个 Windows 本地扩展：把 CCSwitch 当前 Codex 供应商的用量嵌入 Codex 输入栏，并提供一个统一管理全部 Codex / GPT 供应商的 Balance Hub。
 
-## v1.0.0 范围
+## v2.0.0 分支
 
-首个源码版本只包含当前稳定功能：跟随 CCSwitch 当前 Codex 供应商，执行该供应商已有的 `usage_script`，并在 Codex 输入栏底部显示额度。多供应商 All API Hub 页面、内置 WAF 查询与网页登录修复不属于 v1.0.0。
+`v2` 在保留原有余额条的基础上增加：
+
+- 自动读取 CCSwitch 中全部 `app_type=codex` 供应商，不维护第二份账号清单。
+- 点击余额文字打开本机 Balance Hub；窄窗口时可从额度弹层进入。
+- 并发查询全部供应商，统一展示已用、剩余、总额、来源和异常状态。
+- 内置 OpenAI / CLIProxyAPI、DeepSeek、PackyCode、窗口额度站和 API 健康检查适配。
+- AnyRouter / AgentRouter 支持旧桥接迁移兜底，并提供 v2 专用持久化 Edge 网页会话。
+- Cookie 或登录状态过期时，可在 Hub 中点击“网页登录”，登录后重新查询。
+
+`v1` 分支继续维护不含 Balance Hub、内置 WAF 和网页登录修复的轻量版本；`main` 冻结，不作为开发分支。
 
 本项目仅支持 Windows。开发与运行需要 Node.js 22 或更高版本；使用项目启动脚本时，Codex 会通过本地 CDP 调试端口与插件宿主连接。
 
 - 不修改 `app.asar`、MSIX 或 Codex 配置。
 - CCSwitch 数据库只读。
-- 密钥只在本机内存中用于请求供应商自己的额度接口，不写日志。
+- Hub 只监听 `127.0.0.1`，页面和 API 使用每次启动随机生成的路径令牌。
+- API Key、Cookie 与 Token 只在本机宿主内存中用于请求，不发送到 Hub 页面，也不写日志。
+- 网页登录使用 `runtime\hub-edge-profile` 独立 Edge profile，不接管日常浏览器 profile。
 - 不运行额外的 Codex 实例守护进程。
 - 支持 `extra` 自由文本，以及 `used / remaining / total / unit` 结构。
 - 随 CCSwitch 切换供应商自动更新；窗口变窄或缩放后按优先级折叠字段。

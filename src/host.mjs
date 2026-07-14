@@ -4,7 +4,11 @@ import { ProviderRepository } from './provider-repository.mjs';
 import { queryUsage } from './usage-client.mjs';
 import { CdpClient, getBrowserWebSocketUrl, isCodexAuxiliaryTarget, isCodexTargetCandidate, listCodexTargets } from './cdp-client.mjs';
 import { CdpDisconnectGuard } from './cdp-disconnect-guard.mjs';
-import { buildInjectorScript, INJECTOR_VERSION, REFRESH_BINDING, UPDATE_GLOBAL } from './injector-script.mjs';
+import { EdgeSession } from './edge-session.mjs';
+import { HubServer } from './hub-server.mjs';
+import { ProviderQueryEngine } from './hub-provider-adapters.mjs';
+import { HubService } from './hub-service.mjs';
+import { buildInjectorScript, HUB_BINDING, INJECTOR_VERSION, REFRESH_BINDING, UPDATE_GLOBAL } from './injector-script.mjs';
 import { TargetDiscovery } from './target-discovery.mjs';
 import { disposeTargetInjector, settleTargetOperations, TargetSession } from './target-session.mjs';
 
@@ -31,6 +35,10 @@ const statusPath = path.join(args.runtimeDir, 'status.json');
 const pidPath = path.join(args.runtimeDir, 'host.pid');
 const cachePath = path.join(args.runtimeDir, 'usage-cache.json');
 const repository = new ProviderRepository(args.database);
+const edgeSession = new EdgeSession(path.join(args.runtimeDir, 'hub-edge-profile'));
+const hubQueryEngine = new ProviderQueryEngine(repository, edgeSession);
+const hubService = new HubService(repository, hubQueryEngine, { cachePath: path.join(args.runtimeDir, 'hub-cache.json') });
+const hubServer = new HubServer(hubService, { tokenPath: path.join(args.runtimeDir, 'hub-token') });
 const sessions = new Map();
 const cleanedAuxiliaryTargetIds = new Set();
 const injectorScript = buildInjectorScript();
@@ -56,6 +64,7 @@ let stopped = false;
 let stopReason = null;
 let lastStatusWriteAt = 0;
 let lastConnectionError = null;
+let lastHubError = null;
 let targetDiscovery = null;
 let databaseWatcher = null;
 let databaseWatchTimer = null;
@@ -91,6 +100,10 @@ function writeStatus(extra = {}) {
     fallbackPollMs: getFallbackPollMs(),
     connectedPages: sessions.size,
     connectionError: lastConnectionError,
+    hubRunning: Boolean(hubServer.boundPort),
+    hubPort: hubServer.boundPort || null,
+    hubProviders: hubService.getState().providers.length,
+    hubError: lastHubError,
     updatedAt: new Date().toISOString(),
     stopReason,
     ...extra,
@@ -170,6 +183,7 @@ async function refreshUsage(force = false) {
   if (!provider.usage?.enabled || !String(provider.usage.code || '').trim()) {
     lastQueryAt = Date.now();
     lastPayload = { status: 'unsupported', providerId: provider.id, providerName: provider.name, websiteUrl: provider.websiteUrl, message: '未配置用量' };
+    hubService.recordCurrent(provider, lastPayload);
     writeStatus();
     scheduleUsageRefresh(intervalMs);
     return;
@@ -177,6 +191,7 @@ async function refreshUsage(force = false) {
 
   try {
     lastPayload = await queryUsage(provider);
+    hubService.recordCurrent(provider, lastPayload);
     writeUsageCache(lastPayload);
     lastQueryAt = Date.now();
     writeStatus({ error: null });
@@ -198,6 +213,7 @@ async function refreshUsage(force = false) {
         updatedAt: new Date().toISOString(),
       };
     }
+    hubService.recordCurrent(provider, lastPayload);
     writeStatus({ error: message });
     scheduleUsageRefresh(30_000);
   }
@@ -230,6 +246,17 @@ async function syncTargets() {
           injectorScript,
           refreshBindingName: REFRESH_BINDING,
           onRefresh: () => requestUsageRefresh(true, true),
+          actionBindingName: HUB_BINDING,
+          onAction: payload => {
+            if (payload?.action !== 'open-hub') return;
+            try {
+              hubServer.open();
+              lastHubError = null;
+            } catch (error) {
+              lastHubError = safeMessage(error);
+              writeStatus({ hubError: lastHubError });
+            }
+          },
           onContextReset: () => requestTargetSync(),
         });
         sessions.set(target.id, session);
@@ -361,6 +388,7 @@ function startDatabaseWatcher() {
       databaseWatchTimer = setTimeout(() => {
         databaseWatchTimer = null;
         databaseChangeToken = repository.getChangeToken();
+        try { hubService.syncProviders(); } catch {}
         requestUsageRefresh(false, true);
       }, DATABASE_WATCH_DEBOUNCE_MS);
     });
@@ -398,6 +426,12 @@ function startControlWatcher() {
 }
 
 async function loop() {
+  try {
+    await hubServer.start();
+    lastHubError = null;
+  } catch (error) {
+    lastHubError = safeMessage(error);
+  }
   await requestTargetSync();
   await startTargetDiscovery();
   startDatabaseWatcher();
@@ -432,13 +466,20 @@ function shutdown(reason = null) {
   targetDiscovery?.close();
   databaseWatcher?.close();
   controlWatcher?.close();
+  const auxiliaryShutdown = Promise.allSettled([
+    hubServer.close(),
+    edgeSession.closeIfHeadless(),
+  ]);
   if (databaseWatchTimer) clearTimeout(databaseWatchTimer);
   if (usageRefreshTimer) clearTimeout(usageRefreshTimer);
   for (const session of sessions.values()) session.close();
   repository.close();
   try { fs.rmSync(pidPath, { force: true }); } catch {}
   try { writeStatus({ running: false, connectedPages: 0 }); } catch {}
-  setTimeout(() => process.exit(0), 50);
+  Promise.race([
+    auxiliaryShutdown,
+    new Promise(resolve => setTimeout(resolve, 750)),
+  ]).finally(() => process.exit(0));
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'));

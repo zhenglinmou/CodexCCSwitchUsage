@@ -40,6 +40,10 @@ The installer preserves the stable `runtime` directory during an upgrade. A real
 | `src\injector-script.mjs` | Composer footer DOM, styles, responsive layout, tooltips, refresh UI |
 | `src\provider-repository.mjs` | Read-only CCSwitch SQLite access |
 | `src\usage-client.mjs` | Provider quota HTTP request and normalized usage result |
+| `src\hub-provider-adapters.mjs` | v2 provider routing and built-in balance adapters |
+| `src\hub-service.mjs` | Safe multi-provider Hub state, cache, refresh concurrency, and login actions |
+| `src\hub-server.mjs` / `src\hub-page.mjs` | Loopback-only Balance Hub API and page |
+| `src\edge-session.mjs` | Dedicated persistent Edge session for WAF and login repair |
 | `src\evaluator.mjs` | Worker lifecycle and timeout handling for provider scripts |
 | `src\evaluator-worker.mjs` | Sandboxed `node:vm` execution of `usage_script` |
 | `src\cdp-client.mjs` | CDP HTTP/WebSocket client |
@@ -119,7 +123,7 @@ Do not reintroduce a fixed root `max-width` or an icon-mode `flex: 0 0 28px` roo
 
 ### Codex App interaction layout performance baseline
 
-The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current verified environment is Codex `26.707.9564.0` with injector version `57`.
+The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current verified environment is Codex `26.707.9564.0` with injector version `58`.
 
 | Codex interaction | Expected injector geometry work |
 |---|---|

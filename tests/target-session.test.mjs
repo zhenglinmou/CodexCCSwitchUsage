@@ -177,3 +177,26 @@ test('target session receives refresh clicks through a Runtime binding', async (
   assert.deepEqual(refreshes, [{ token: 4 }]);
   assert.equal(contextResets, 1);
 });
+
+test('target session receives Balance Hub actions through a separate Runtime binding', async () => {
+  const client = new FakeCdpClient(31);
+  const actions = [];
+  const session = new TargetSession(client, {
+    globalName: '__TEST_USAGE__',
+    injectorVersion: 31,
+    injectorScript: 'FULL_INJECTOR',
+    refreshBindingName: '__TEST_REFRESH__',
+    actionBindingName: '__TEST_ACTION__',
+    onAction: payload => actions.push(payload),
+  });
+
+  await session.initialize();
+  client.emit('Runtime.bindingCalled', { name: '__TEST_ACTION__', payload: '{"action":"open-hub"}' });
+
+  assert.deepEqual(actions, [{ action: 'open-hub' }]);
+  assert.deepEqual(client.calls, [
+    { method: 'Runtime.enable', params: {} },
+    { method: 'Runtime.addBinding', params: { name: '__TEST_REFRESH__' } },
+    { method: 'Runtime.addBinding', params: { name: '__TEST_ACTION__' } },
+  ]);
+});

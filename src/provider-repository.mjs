@@ -26,7 +26,10 @@ export function parseProviderRow(row) {
     id: String(row.id),
     name: String(row.name || '当前供应商'),
     websiteUrl: row.website_url || '',
+    isCurrent: Boolean(row.is_current),
+    sortIndex: row.sort_index != null && Number.isFinite(Number(row.sort_index)) ? Number(row.sort_index) : null,
     usage: usage && typeof usage === 'object' ? usage : null,
+    auth,
     apiKey: String(auth.OPENAI_API_KEY || auth.openai_api_key || ''),
     baseUrl: String(usage?.baseUrl || findBaseUrl(settings?.config || '')).replace(/\/+$/, ''),
   };
@@ -38,6 +41,8 @@ function providerRowSignature(row) {
     row.id,
     row.name,
     row.website_url,
+    row.is_current,
+    row.sort_index,
     row.settings_config,
     row.meta,
   ]);
@@ -65,15 +70,20 @@ export class ProviderRepository {
     this.databaseIdentity = null;
     this.currentStatement = null;
     this.byNameStatement = null;
+    this.byIdStatement = null;
+    this.allStatement = null;
+    this.localUsageStatement = null;
     this.currentCache = null;
     this.byNameCache = new Map();
+    this.byIdCache = new Map();
+    this.allCache = null;
   }
 
   getCurrent() {
     const db = this.ensureDatabase();
     if (!this.currentStatement) {
       this.currentStatement = db.prepare(`
-        SELECT id, name, website_url, settings_config, meta
+        SELECT id, name, website_url, is_current, sort_index, settings_config, meta
         FROM providers
         WHERE app_type = 'codex' AND is_current = 1
         ORDER BY sort_index, name
@@ -92,7 +102,7 @@ export class ProviderRepository {
     const db = this.ensureDatabase();
     if (!this.byNameStatement) {
       this.byNameStatement = db.prepare(`
-        SELECT id, name, website_url, settings_config, meta
+        SELECT id, name, website_url, is_current, sort_index, settings_config, meta
         FROM providers
         WHERE app_type = 'codex' AND name = ?
         LIMIT 1
@@ -105,6 +115,61 @@ export class ProviderRepository {
     const value = parseProviderRow(row);
     this.byNameCache.set(name, { signature, value });
     return value;
+  }
+
+  getById(id) {
+    const db = this.ensureDatabase();
+    if (!this.byIdStatement) {
+      this.byIdStatement = db.prepare(`
+        SELECT id, name, website_url, is_current, sort_index, settings_config, meta
+        FROM providers
+        WHERE app_type = 'codex' AND id = ?
+        LIMIT 1
+      `);
+    }
+    const key = String(id);
+    const row = this.byIdStatement.get(key);
+    const signature = providerRowSignature(row);
+    const cached = this.byIdCache.get(key);
+    if (cached?.signature === signature) return cached.value;
+    const value = parseProviderRow(row);
+    this.byIdCache.set(key, { signature, value });
+    return value;
+  }
+
+  getAll() {
+    const db = this.ensureDatabase();
+    if (!this.allStatement) {
+      this.allStatement = db.prepare(`
+        SELECT id, name, website_url, is_current, sort_index, settings_config, meta
+        FROM providers
+        WHERE app_type = 'codex'
+        ORDER BY COALESCE(sort_index, 2147483647), name
+      `);
+    }
+    const rows = this.allStatement.all();
+    const signature = JSON.stringify(rows.map(providerRowSignature));
+    if (this.allCache?.signature === signature) return this.allCache.value;
+    const value = rows.map(parseProviderRow).filter(Boolean);
+    this.allCache = { signature, value };
+    return value;
+  }
+
+  getLocalUsage(providerId) {
+    const db = this.ensureDatabase();
+    if (!this.localUsageStatement) {
+      this.localUsageStatement = db.prepare(`
+        SELECT COUNT(*) AS request_count,
+               COALESCE(SUM(CAST(total_cost_usd AS REAL)), 0) AS total_cost
+        FROM proxy_request_logs
+        WHERE provider_id = ? AND app_type = 'codex'
+      `);
+    }
+    const row = this.localUsageStatement.get(String(providerId)) || {};
+    return {
+      requestCount: Math.max(0, Number(row.request_count) || 0),
+      totalCost: Math.max(0, Number(row.total_cost) || 0),
+    };
   }
 
   getChangeToken() {
@@ -133,7 +198,12 @@ export class ProviderRepository {
     this.databaseIdentity = null;
     this.currentStatement = null;
     this.byNameStatement = null;
+    this.byIdStatement = null;
+    this.allStatement = null;
+    this.localUsageStatement = null;
     this.currentCache = null;
     this.byNameCache.clear();
+    this.byIdCache.clear();
+    this.allCache = null;
   }
 }

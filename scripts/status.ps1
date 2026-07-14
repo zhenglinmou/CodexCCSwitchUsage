@@ -19,7 +19,10 @@ $hostProcess = Get-CimInstance Win32_Process | Where-Object {
     instanceGuardProcessId = $null
     provider = $status.provider
     usageStatus = $status.usageStatus
+    hubRunning = $status.hubRunning
+    hubPort = $status.hubPort
+    hubProviders = $status.hubProviders
     connectedPages = $status.connectedPages
     updatedAt = $status.updatedAt
-    error = if ($status.error) { $status.error } elseif ($status.connectionError) { $status.connectionError } else { $null }
+    error = if ($status.error) { $status.error } elseif ($status.connectionError) { $status.connectionError } elseif ($status.hubError) { $status.hubError } else { $null }
 } | ConvertTo-Json -Compress

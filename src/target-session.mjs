@@ -33,6 +33,8 @@ export class TargetSession {
     injectorScript,
     refreshBindingName = '',
     onRefresh,
+    actionBindingName = '',
+    onAction,
     onContextReset,
   }) {
     this.client = client;
@@ -42,13 +44,15 @@ export class TargetSession {
     this.payloadSignature = null;
     this.refreshBindingName = refreshBindingName;
     this.onRefresh = onRefresh;
+    this.actionBindingName = actionBindingName;
+    this.onAction = onAction;
     this.onContextReset = onContextReset;
     this.initialized = false;
     this.handleBindingCalled = params => {
-      if (params.name !== this.refreshBindingName) return;
       let payload = {};
       try { payload = JSON.parse(params.payload || '{}'); } catch {}
-      this.onRefresh?.(payload);
+      if (params.name === this.refreshBindingName) this.onRefresh?.(payload);
+      if (params.name === this.actionBindingName) this.onAction?.(payload);
     };
     this.handleContextsCleared = () => {
       this.payloadSignature = null;
@@ -71,6 +75,9 @@ export class TargetSession {
     await this.client.call('Runtime.enable', {});
     if (this.refreshBindingName) {
       await this.client.call('Runtime.addBinding', { name: this.refreshBindingName });
+    }
+    if (this.actionBindingName && this.actionBindingName !== this.refreshBindingName) {
+      await this.client.call('Runtime.addBinding', { name: this.actionBindingName });
     }
     this.initialized = true;
   }
