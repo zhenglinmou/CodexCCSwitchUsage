@@ -1,0 +1,11 @@
+{
+  "name": "codex-ccswitch-usage",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Inject the active CCSwitch provider quota into the Codex composer footer.",
+  "scripts": {
+    "test": "node --no-warnings --experimental-sqlite --test tests/*.test.mjs",
+    "build:exe": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-exe.ps1"
+  }
+}

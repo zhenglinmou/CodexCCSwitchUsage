@@ -1,0 +1,9 @@
+runtime/
+codex-profile/
+build/
+dist/
+backups/
+node_modules/
+.firecrawl/
+*.orig
+*.log

@@ -1,0 +1,139 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+
+function parseJson(text, fallback) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+
+export function findBaseUrl(configText = '') {
+  const matches = [...String(configText).matchAll(/^\s*base_url\s*=\s*["']([^"']+)["']/gmi)];
+  return matches.at(-1)?.[1]?.replace(/\/+$/, '') ?? '';
+}
+
+export function parseProviderRow(row) {
+  if (!row) return null;
+  const settings = parseJson(row.settings_config, {});
+  const meta = parseJson(row.meta, {});
+  const usage = meta?.usage_script;
+  const auth = settings?.auth && typeof settings.auth === 'object' ? settings.auth : {};
+
+  return {
+    id: String(row.id),
+    name: String(row.name || '当前供应商'),
+    websiteUrl: row.website_url || '',
+    usage: usage && typeof usage === 'object' ? usage : null,
+    apiKey: String(auth.OPENAI_API_KEY || auth.openai_api_key || ''),
+    baseUrl: String(usage?.baseUrl || findBaseUrl(settings?.config || '')).replace(/\/+$/, ''),
+  };
+}
+
+function providerRowSignature(row) {
+  if (!row) return 'null';
+  return JSON.stringify([
+    row.id,
+    row.name,
+    row.website_url,
+    row.settings_config,
+    row.meta,
+  ]);
+}
+
+function fileIdentity(stats) {
+  return `${stats.dev || 0}:${stats.ino || 0}:${stats.birthtimeMs || 0}`;
+}
+
+function fileChangeIdentity(filename, statSync) {
+  try {
+    const stats = statSync(filename);
+    return `${stats.dev || 0}:${stats.ino || 0}:${stats.size || 0}:${stats.mtimeMs || 0}`;
+  } catch {
+    return 'missing';
+  }
+}
+
+export class ProviderRepository {
+  constructor(databasePath = path.join(process.env.USERPROFILE, '.cc-switch', 'cc-switch.db'), options = {}) {
+    this.databasePath = databasePath;
+    this.databaseFactory = options.databaseFactory || (filename => new DatabaseSync(filename, { readOnly: true }));
+    this.statSync = options.statSync || fs.statSync;
+    this.database = null;
+    this.databaseIdentity = null;
+    this.currentStatement = null;
+    this.byNameStatement = null;
+    this.currentCache = null;
+    this.byNameCache = new Map();
+  }
+
+  getCurrent() {
+    const db = this.ensureDatabase();
+    if (!this.currentStatement) {
+      this.currentStatement = db.prepare(`
+        SELECT id, name, website_url, settings_config, meta
+        FROM providers
+        WHERE app_type = 'codex' AND is_current = 1
+        ORDER BY sort_index, name
+        LIMIT 1
+      `);
+    }
+    const row = this.currentStatement.get();
+    const signature = providerRowSignature(row);
+    if (this.currentCache?.signature === signature) return this.currentCache.value;
+    const value = parseProviderRow(row);
+    this.currentCache = { signature, value };
+    return value;
+  }
+
+  getByName(name) {
+    const db = this.ensureDatabase();
+    if (!this.byNameStatement) {
+      this.byNameStatement = db.prepare(`
+        SELECT id, name, website_url, settings_config, meta
+        FROM providers
+        WHERE app_type = 'codex' AND name = ?
+        LIMIT 1
+      `);
+    }
+    const row = this.byNameStatement.get(name);
+    const signature = providerRowSignature(row);
+    const cached = this.byNameCache.get(name);
+    if (cached?.signature === signature) return cached.value;
+    const value = parseProviderRow(row);
+    this.byNameCache.set(name, { signature, value });
+    return value;
+  }
+
+  getChangeToken() {
+    return [this.databasePath, `${this.databasePath}-wal`, `${this.databasePath}-shm`]
+      .map(filename => fileChangeIdentity(filename, this.statSync))
+      .join('|');
+  }
+
+  ensureDatabase() {
+    let identity = this.databaseIdentity;
+    try {
+      identity = fileIdentity(this.statSync(this.databasePath));
+    } catch {
+      if (!this.database) throw new Error(`CCSwitch 数据库不存在: ${this.databasePath}`);
+    }
+    if (this.database && identity === this.databaseIdentity) return this.database;
+    this.close();
+    this.database = this.databaseFactory(this.databasePath);
+    this.databaseIdentity = identity;
+    return this.database;
+  }
+
+  close() {
+    try { this.database?.close(); } catch {}
+    this.database = null;
+    this.databaseIdentity = null;
+    this.currentStatement = null;
+    this.byNameStatement = null;
+    this.currentCache = null;
+    this.byNameCache.clear();
+  }
+}
