@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { loginConfiguration, parseBrowserJson, ProviderQueryEngine, providerAliases, providerKind, summarizeWham } from '../src/hub-provider-adapters.mjs';
+import { describeProviderQuery, loginConfiguration, parseBrowserJson, ProviderQueryEngine, providerAliases, providerKind, summarizeWham } from '../src/hub-provider-adapters.mjs';
 
 test('browser callback JSON parsing rejects WAF HTML and oversized responses', () => {
   assert.deepEqual(parseBrowserJson('{"success":true}'), { success: true });
@@ -26,6 +26,33 @@ test('provider aliases preserve the stable local gateway paths', () => {
   assert.ok(providerAliases({ id: 'three', name: '付费站 copy' }).includes('paid_sharedchat'));
 });
 
+test('provider query descriptions expose the real request shape without credentials', () => {
+  const browserMethod = describeProviderQuery({
+    name: 'agentrouter',
+    apiBaseUrl: 'https://user:password@api.agent.example/v1/?access_token=private',
+    apiKey: 'sk-private-key',
+  });
+  assert.equal(browserMethod.requestUrl, 'https://agentrouter.org/api/user/self');
+  assert.equal(browserMethod.method, 'GET');
+  assert.equal(browserMethod.requiresBrowser, true);
+  assert.equal(browserMethod.waf, true);
+  assert.match(browserMethod.authentication, /Cookie/);
+  assert.match(browserMethod.authentication, /扩展本地保存的数字用户 ID.*New-Api-User/);
+  assert.doesNotMatch(browserMethod.authentication, /localStorage/);
+  assert.match(browserMethod.notes[0], /https:\/\/api\.agent\.example\/v1\/models/);
+  assert.doesNotMatch(JSON.stringify(browserMethod), /password|access_token|private-key/);
+
+  const apiMethod = describeProviderQuery({
+    name: '付费站',
+    apiBaseUrl: 'https://balance.example/v1',
+    apiKey: 'another-private-key',
+  });
+  assert.equal(apiMethod.requestUrl, 'https://balance.example/v1/user/balance');
+  assert.equal(apiMethod.authentication, 'Bearer API Key');
+  assert.equal(apiMethod.requiresBrowser, false);
+  assert.doesNotMatch(JSON.stringify(apiMethod), /another-private-key/);
+});
+
 test('OpenAI wham payload is normalized into primary and secondary quota windows', () => {
   const summary = summarizeWham({
     plan_type: 'plus',
@@ -45,7 +72,7 @@ test('OpenAI wham payload is normalized into primary and secondary quota windows
   assert.equal(summary.creditBalance, 7.5);
 });
 
-test('browser-only providers probe the model API before requesting a website login', async () => {
+test('browser-only providers report a disconnected companion as transport state, not lost login', async () => {
   const calls = [];
   const engine = new ProviderQueryEngine({}, { hasSession: () => false, isConnected: () => false }, {
     fetchImpl: async url => {
@@ -59,18 +86,92 @@ test('browser-only providers probe the model API before requesting a website log
     apiKey: 'model-key', apiBaseUrl: 'https://api.agent.example', baseUrl: 'http://127.0.0.1:17891',
   });
 
-  assert.equal(result.loginRequired, true);
+  assert.equal(result.loginRequired, false);
   assert.equal(result.source, 'api_key_probe');
   assert.match(result.message, /API Key 可用/);
   assert.deepEqual(calls, ['https://api.agent.example/models']);
   assert.doesNotMatch(calls.join(' '), /17891/);
 });
 
-test('WAF balance queries use the connected existing-browser callback and never auto-open login', async () => {
+test('transient browser callback failures are not converted into login-required state', async () => {
+  const provider = { id: 'any', name: 'any的国内镜像', websiteUrl: '', usage: null, auth: {}, apiKey: 'key', apiBaseUrl: 'https://anyrouter.top' };
+  const timeoutEngine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    async queryJson() { throw new Error('第三方网站余额查询超时'); },
+  });
+  await assert.rejects(timeoutEngine.query(provider), /查询超时/);
+
+  const upstreamEngine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    async queryJson() {
+      return { status: 200, text: '{"success":false,"message":"temporary upstream error"}' };
+    },
+  });
+  await assert.rejects(upstreamEngine.query(provider), /temporary upstream error/);
+
+  const wafEngine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    async queryJson() {
+      return { status: 403, text: '<html>Cloudflare challenge</html>' };
+    },
+  });
+  await assert.rejects(wafEngine.query(provider), /无法解析/);
+});
+
+test('browser callback marks only explicit authentication failures as login-required', async () => {
+  const engine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    async queryJson() {
+      return { status: 200, text: '{"success":false,"message":"not logged in"}' };
+    },
+  });
+  const result = await engine.query({
+    id: 'any', name: 'any的国内镜像', websiteUrl: '', usage: null, auth: {}, apiKey: 'key', apiBaseUrl: 'https://anyrouter.top',
+  });
+
+  assert.equal(result.loginRequired, true);
+  assert.equal(result.source, 'browser_session');
+});
+
+test('missing persisted New API identity requests one-time session sync instead of claiming logout', async () => {
+  const engine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    async queryJson() {
+      return { status: 401, text: '{"success":false,"message":"unauthorized"}', identityMissing: true };
+    },
+  });
+
+  const result = await engine.query({
+    id: 'any', name: 'any的国外我自己的', websiteUrl: '', usage: null, auth: {}, apiKey: 'key', apiBaseUrl: 'https://anyrouter.top',
+  });
+
+  assert.equal(result.loginRequired, true);
+  assert.equal(result.sessionSyncRequired, true);
+  assert.match(result.message, /同步现有会话/);
+});
+
+test('New API session repair preserves the companion one-time sync result', async () => {
+  let received = null;
+  const engine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    async openLogin(request) {
+      received = request;
+      return { synced: true, opened: false, origin: 'https://anyrouter.top' };
+    },
+  });
+
+  const result = await engine.openLogin({ id: 'any', name: 'any的国外我自己的' });
+
+  assert.equal(received.userHeader, 'New-Api-User');
+  assert.equal(result.synced, true);
+  assert.equal(result.opened, false);
+});
+
+test('WAF balance queries use a connected companion after host restart even before a session hint is restored', async () => {
   let loginCalls = 0;
   let queryCalls = 0;
   const broker = {
-    hasSession: () => true,
+    hasSession: () => false,
     isConnected: () => true,
     async queryJson() {
       queryCalls += 1;
@@ -78,7 +179,7 @@ test('WAF balance queries use the connected existing-browser callback and never 
     },
     async openLogin() { loginCalls += 1; },
   };
-  const engine = new ProviderQueryEngine({}, broker, { fetchImpl: async () => { throw new Error('model API must not run after a browser session is known'); } });
+  const engine = new ProviderQueryEngine({}, broker, { fetchImpl: async () => { throw new Error('model API must not run while the browser callback is connected'); } });
   const provider = { id: 'agent', name: 'agentrouter', websiteUrl: '', usage: null, auth: {}, apiKey: 'key', apiBaseUrl: 'https://agentrouter.org' };
 
   const result = await engine.query(provider);
@@ -87,6 +188,27 @@ test('WAF balance queries use the connected existing-browser callback and never 
   assert.equal(result.usage.remaining, 10);
   assert.equal(queryCalls, 1);
   assert.equal(loginCalls, 0);
+});
+
+test('AnyRouter provider copies share one browser callback in the same Edge profile', async () => {
+  let queryCalls = 0;
+  const engine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    async queryJson() {
+      queryCalls += 1;
+      return { status: 200, text: '{"success":true,"data":{"quota":5000000,"used_quota":500000}}' };
+    },
+  });
+  const base = { websiteUrl: '', usage: null, auth: {}, apiKey: 'key', apiBaseUrl: 'https://anyrouter.top' };
+
+  const [domestic, foreign] = await Promise.all([
+    engine.query({ ...base, id: 'domestic', name: 'any的国内镜像' }),
+    engine.query({ ...base, id: 'foreign', name: 'any的国外我自己的' }),
+  ]);
+
+  assert.equal(queryCalls, 1);
+  assert.equal(domestic.usage.providerId, 'domestic');
+  assert.equal(foreign.usage.providerId, 'foreign');
 });
 
 test('OpenAI token queries fall back to the paired existing-browser callback without exposing the token', async () => {

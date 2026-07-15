@@ -26,6 +26,13 @@ function finiteOrNull(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function authenticationFailure(status, payload, raw = {}) {
+  if (raw?.loginRequired === true) return true;
+  if ([401, 403].includes(Number(status)) && payload && typeof payload === 'object') return true;
+  const message = String(payload?.message || payload?.error || raw?.message || '');
+  return /(?:未登录|请.{0,8}登录|登录.{0,8}(?:失效|过期)|not\s+(?:logged|signed)\s+in|unauthori[sz]ed|authentication\s+required|login\s+required|invalid\s+session)/i.test(message);
+}
+
 function providerApiBase(provider) {
   return String(provider?.apiBaseUrl || provider?.baseUrl || '').replace(/\/+$/, '');
 }
@@ -169,6 +176,117 @@ export function loginConfiguration(provider) {
   }
 }
 
+function safeRequestUrl(baseUrl, requestPath) {
+  try {
+    const base = new URL(String(baseUrl || ''));
+    if (!['https:', 'http:'].includes(base.protocol)) return '';
+    base.username = '';
+    base.password = '';
+    base.search = '';
+    base.hash = '';
+    const suffix = String(requestPath || '').trim();
+    const url = suffix
+      ? new URL(`${base.href.replace(/\/+$/, '')}/${suffix.replace(/^\/+/, '')}`)
+      : base;
+    if (!['https:', 'http:'].includes(url.protocol)) return '';
+    url.username = '';
+    url.password = '';
+    url.search = '';
+    url.hash = '';
+    return url.href;
+  } catch {
+    return '';
+  }
+}
+
+export function describeProviderQuery(provider) {
+  const kind = providerKind(provider);
+  const apiBaseUrl = providerApiBase(provider);
+  const common = { method: 'GET', waf: false, requiresBrowser: false, notes: [] };
+  if (kind === 'anyrouter' || kind === 'agentrouter') {
+    const config = loginConfiguration(provider);
+    return {
+      ...common,
+      type: 'browser-cookie',
+      label: '现有浏览器 Cookie / WAF 查询',
+      requestUrl: safeRequestUrl(config.baseUrl, config.requestPath),
+      authentication: `当前浏览器 Cookie${config.userHeader ? ` + 扩展本地保存的数字用户 ID（${config.userHeader}）` : ''}`,
+      executor: 'Edge/Chrome 余额伴侣，同源页面请求',
+      waf: true,
+      requiresBrowser: true,
+      notes: [
+        apiBaseUrl ? `模型 API Key 先通过 ${safeRequestUrl(apiBaseUrl, '/models')} 做能力检查` : '未找到模型 API Base URL',
+        'Cookie 原文保留在当前浏览器，不回传到 Balance Hub',
+        '失败不会自动打开登录页，登录必须手动触发',
+      ],
+    };
+  }
+  if (kind === 'openai') {
+    return {
+      ...common,
+      type: 'openai-account',
+      label: 'OpenAI 账户额度查询',
+      requestUrl: WHAM_URL,
+      authentication: '本机 OpenAI 账户 Token + ChatGPT-Account-Id',
+      executor: 'Node 官方接口；网络/WAF 失败时使用已配对的现有浏览器',
+      waf: true,
+      notes: ['Token 只在本机内存和已配对浏览器任务中使用，不进入 Hub 页面'],
+    };
+  }
+  if (kind === 'cpa') {
+    return {
+      ...common,
+      type: 'local-accounts',
+      label: 'CLIProxyAPI 本地账号汇总',
+      requestUrl: WHAM_URL,
+      authentication: '读取 ~/.cli-proxy-api 中的 Codex 账号 Token',
+      executor: '逐账号查询 OpenAI 用量并汇总',
+      waf: true,
+      notes: ['账号文件只读；失败时可使用已配对的现有浏览器执行同源请求'],
+    };
+  }
+  if (kind === 'deepseek') {
+    return {
+      ...common,
+      type: 'api-key',
+      label: 'DeepSeek 官方余额 API',
+      requestUrl: safeRequestUrl(apiBaseUrl || 'https://api.deepseek.com', '/user/balance'),
+      authentication: 'Bearer API Key',
+      executor: 'Balance Hub 直接请求第三方官网',
+    };
+  }
+  if (kind === 'packy') {
+    return {
+      ...common,
+      type: 'api-key',
+      label: 'PackyCode 官方用量 API',
+      requestUrl: 'https://www.packyapi.com/api/usage/token/',
+      authentication: 'Bearer API Key',
+      executor: 'Balance Hub 直接请求第三方官网',
+    };
+  }
+  if (kind === 'paid') {
+    return {
+      ...common,
+      type: 'api-key',
+      label: '第三方窗口额度 API',
+      requestUrl: safeRequestUrl(apiBaseUrl, '/user/balance'),
+      authentication: 'Bearer API Key',
+      executor: 'Balance Hub 直接请求第三方官网',
+      notes: ['读取 3 小时与 1 天窗口；相同 API Key 的镜像站复用一次查询结果'],
+    };
+  }
+  return {
+    ...common,
+    type: 'api-health',
+    label: 'API Key 能力检查与本地统计',
+    requestUrl: safeRequestUrl(apiBaseUrl, '/models'),
+    authentication: 'Bearer API Key',
+    executor: 'Balance Hub 检查模型 API；余额不可用时显示 CCSwitch 本地费用',
+    notes: ['该站没有已知的模型 Key 余额接口'],
+  };
+}
+
 export function providerAliases(provider) {
   const kind = providerKind(provider);
   const name = String(provider.name || '').toLowerCase();
@@ -218,7 +336,8 @@ export class ProviderQueryEngine {
 
   #sharedQueryKey(provider) {
     const kind = providerKind(provider);
-    if (['anyrouter', 'agentrouter', 'openai', 'cpa'].includes(kind)) return '';
+    if (['openai', 'cpa'].includes(kind)) return '';
+    if (kind === 'anyrouter' || kind === 'agentrouter') return `browser:${kind}`;
     const baseIdentity = kind === 'paid' ? '' : providerApiBase(provider);
     const material = [kind, baseIdentity, provider.apiKey].join('\0');
     return crypto.createHash('sha256').update(material).digest('base64url');
@@ -252,22 +371,25 @@ export class ProviderQueryEngine {
     const config = loginConfiguration(provider);
     if (!config) throw new Error('该供应商不支持网页登录修复');
     if (!this.browserBroker.isConnected()) throw new Error('请先连接现有 Edge/Chrome 的余额伴侣扩展');
-    await this.browserBroker.openLogin(config);
-    return { success: true, loginUrl: config.loginUrl };
+    const result = await this.browserBroker.openLogin(config);
+    return {
+      success: true,
+      loginUrl: config.loginUrl,
+      synced: result?.synced === true,
+      opened: result?.opened === true,
+      loginRequired: result?.loginRequired === true,
+      message: String(result?.message || ''),
+    };
   }
 
   async #queryWebProvider(provider) {
-    const config = loginConfiguration(provider);
-    const hasBrowserState = this.browserBroker.hasSession(config.baseUrl);
-    if (hasBrowserState) {
-      return this.#queryBrowserNewApi(provider).catch(error => ({
-        source: 'browser_session', loginRequired: true, message: error instanceof Error ? error.message : String(error),
-      }));
+    if (this.browserBroker.isConnected()) {
+      return this.#queryBrowserNewApi(provider);
     }
     const probe = await this.#probeApiKey(provider);
     return {
       source: 'api_key_probe',
-      loginRequired: true,
+      loginRequired: false,
       message: !this.browserBroker.isConnected()
         ? `${probe.message}；请先连接现有 Edge/Chrome 的余额伴侣扩展`
         : probe.valid
@@ -280,15 +402,26 @@ export class ProviderQueryEngine {
     const kind = providerKind(provider);
     const config = loginConfiguration(provider);
     if (!this.browserBroker.isConnected()) {
-      return { source: 'browser_session', loginRequired: true, message: '现有 Edge/Chrome 的余额伴侣扩展未连接' };
+      return { source: 'browser_session', loginRequired: false, message: '现有 Edge/Chrome 的余额伴侣扩展未连接' };
     }
     const raw = await this.browserBroker.queryJson({ ...config, headers: {}, waitMs: kind === 'agentrouter' ? 55_000 : 40_000 });
-    if (raw?.loginRequired) {
+    const payload = parseBrowserJson(raw?.text);
+    if (raw?.identityMissing === true) {
+      return {
+        source: 'browser_session',
+        loginRequired: true,
+        sessionSyncRequired: true,
+        message: '尚未保存该站的数字用户 ID，请点击“同步现有会话”一次',
+      };
+    }
+    if (authenticationFailure(raw?.status, payload, raw)) {
       return { source: 'browser_session', loginRequired: true, message: String(raw.message || '现有浏览器尚未登录该网站') };
     }
-    const payload = parseBrowserJson(raw?.text);
+    if (!payload) {
+      throw new Error(String(raw?.error || (raw?.status ? `第三方网站返回无法解析的数据（HTTP ${raw.status}）` : '第三方网站请求没有返回有效数据')));
+    }
     if (!payload?.success || !payload?.data) {
-      return { source: 'browser_session', loginRequired: true, message: String(payload?.message || '网页登录已失效或 WAF 验证尚未完成') };
+      throw new Error(String(payload?.message || `第三方网站余额接口返回 HTTP ${Number(raw?.status) || 0}`));
     }
     const data = payload.data;
     const remaining = (Number(data.quota) || 0) / QUOTA_PER_USD;

@@ -36,7 +36,7 @@ The installer preserves the stable `runtime` directory during an upgrade. A real
 
 | File | Responsibility |
 |---|---|
-| `src\host.mjs` | Long-running host, quota refresh scheduling, database and target watchers |
+| `src\host.mjs` | Long-running host, quota refresh scheduling, database watcher, and HTTP-only target audits |
 | `src\injector-script.mjs` | Composer footer DOM, styles, responsive layout, tooltips, refresh UI |
 | `src\provider-repository.mjs` | Read-only CCSwitch SQLite access |
 | `src\usage-client.mjs` | Legacy `usage_script` compatibility utilities; not used by the v2 Hub runtime |
@@ -47,8 +47,9 @@ The installer preserves the stable `runtime` directory during an upgrade. A real
 | `browser-companion\` | MV3 companion loaded into the user's normal Edge/Chrome profile |
 | `src\evaluator.mjs` | Worker lifecycle and timeout handling for provider scripts |
 | `src\evaluator-worker.mjs` | Sandboxed `node:vm` execution of `usage_script` |
-| `src\cdp-client.mjs` | CDP HTTP/WebSocket client |
-| `src\target-session.mjs` | Injector installation, hot replacement, payload delivery |
+| `src\cdp-client.mjs` | Short-lived CDP HTTP/WebSocket client and strict target filtering |
+| `src\target-session.mjs` | One-shot injector installation, hot replacement, and payload delivery |
+| `src\page-action-channel.mjs` | Invisible, bounded page-title action markers for refresh and Hub clicks |
 | `scripts\launch.ps1` | Finds/starts Codex with CDP, starts the host, activates the window |
 | `scripts\stop-host.ps1` | Stops plugin hosts without stopping Codex |
 | `scripts\stop.ps1` | Stops plugin hosts and the Codex process tree; not for normal development reloads |
@@ -62,7 +63,9 @@ The v2 host is the only balance-query center. The Codex footer, Hub page, and lo
 
 The stable gateway listens on `127.0.0.1:17891` and exposes `/v1/balance/{provider}`, `/v1/balances`, `/v1/providers`, `/v1/health`, plus the legacy-compatible `/usage/{provider}` path. CCSwitch remains read-only and its existing scripts are not rewritten during v2 development.
 
-Provider adapters first use the CCSwitch API Key and configured Base URL when the third-party site supports a balance endpoint. Sites whose model API keys cannot access dashboard balances use the MV3 browser companion after one-time pairing with the Hub token. The companion runs requests inside the user's existing Edge/Chrome profile, keeps Cookie values in that browser, and returns only request results through the same port. Hub opening never triggers refresh, and query failures never open provider pages; login navigation requires an explicit user action.
+Provider adapters first use the CCSwitch API Key and configured Base URL when the third-party site supports a balance endpoint. Sites whose model API keys cannot access dashboard balances use the MV3 browser companion after one-time pairing with the Hub token. The companion runs requests inside the user's existing Edge/Chrome profile, keeps Cookie values in that browser, and returns only request results through the same port. Hub opening never triggers refresh. A balance query may use an inactive same-origin tab and close it immediately, while activating a login page still requires an explicit user action.
+
+The companion stores its pairing token, stable client id, and only the allowlisted origins of previously validated browser sessions in `chrome.storage.local`; it never stores Cookie values or localStorage user ids. Its startup/alarm poll begins with a session heartbeat, and every long-poll request carries the persisted validated hints plus live Cookie origins for sites where Cookie presence is sufficient. New API sites such as AnyRouter and AgentRouter are never restored from arbitrary Cookie presence alone. The provider response is authoritative: successful responses retain the hint, while `401/403` or an explicit login-required response removes it; ordinary provider or WAF failures preserve the last validated hint. A connected companion is allowed to attempt the real same-origin query even before a hint is restored, so a host restart cannot be misclassified as logout. Each Hub provider card exposes a safe “查看” dialog for the actual request URL, method, authentication category, executor, browser/WAF dependency, and current normalized source; credentials are never included.
 
 The old standalone Python bridge must not run alongside v2 because both use port `17891`.
 
@@ -105,7 +108,7 @@ Expected fields include:
 ```json
 {
   "running": true,
-  "eventDrivenTargets": true,
+  "eventDrivenTargets": false,
   "databaseWatch": true,
   "connectedPages": 1,
   "connectionError": null
@@ -114,9 +117,11 @@ Expected fields include:
 
 ### Host background performance baseline
 
-When target discovery, the CCSwitch database watcher, and the runtime control watcher are all healthy, the host uses a 300,000 ms fallback audit and status heartbeat. If any watcher is unavailable, the fallback audit returns to 30,000 ms, and watcher error events wake the audit immediately so recovery does not wait for the healthy interval.
+The host reads `/json/list` through short-lived HTTP requests every 1,000 ms so refresh and Hub click markers are noticed without a browser-level WebSocket. A full injector audit runs at most every 300,000 ms, while database and explicit remount events request an immediate one-shot update. Each HTTP request uses `Connection: close`.
 
-The fixed `initialRoute=/avatar-overlay` helper page is not retained as a target session. During a hot upgrade, the host connects to that auxiliary page once to remove an injector left by an older version, then closes the CDP connection. Initializing `about:blank` child windows remain eligible until their final route is known.
+CDP target isolation is fail-closed. The host connects only to a `page` target whose URL is exactly the canonical Codex main document, `app://-/index.html`, with no query or fragment. Every eligible target WebSocket exists only for the inspection/injection/update call and is closed in `finally`. The host never calls browser-wide `Target.setDiscoverTargets`, never keeps a target session, and never calls `Runtime.enable` or `Runtime.addBinding`. Empty URLs, `about:blank`, external pages, Browser Use WebViews, MCP App guests, and auxiliary `initialRoute` windows are never connected. If any auxiliary `page`, `webview`, or `iframe` target is active, all injector connections are deferred until it disappears.
+
+The injected refresh and Hub buttons append a bounded zero-width marker to `document.title`. `/json/list` exposes that marker without a WebSocket; the host consumes the action, performs the requested work, updates the main page through one short-lived connection, and restores the visible title. This channel carries only an action name, counter, and timestamp.
 
 ### Balance positioning invariant
 
@@ -134,7 +139,7 @@ Do not reintroduce a fixed root `max-width` or an icon-mode `flex: 0 0 28px` roo
 
 ### Codex App interaction layout performance baseline
 
-The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current verified environment is Codex `26.707.9564.0` with injector version `58`.
+The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current injector version is `59`; update the verified Codex build here only after completing the corresponding live regression.
 
 | Codex interaction | Expected injector geometry work |
 |---|---|

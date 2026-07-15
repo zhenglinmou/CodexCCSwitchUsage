@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { CdpClient, isCodexAuxiliaryTarget, isCodexTargetCandidate } from '../src/cdp-client.mjs';
+import { CdpClient, hasAuxiliaryPageTargets, isCodexTargetCandidate } from '../src/cdp-client.mjs';
 
 class FakeSocket {
   constructor() {
@@ -52,13 +52,29 @@ test('CDP client notifies close subscribers once', () => {
   assert.equal(client.closed, true);
 });
 
-test('Codex target candidates include initializing child windows', () => {
+test('Codex target candidates accept only the confirmed primary app document', () => {
   assert.equal(isCodexTargetCandidate({ type: 'page', url: 'app://-/index.html' }), true);
-  assert.equal(isCodexTargetCandidate({ type: 'page', url: 'about:blank' }), true);
-  assert.equal(isCodexTargetCandidate({ type: 'page', url: '' }), true);
+  assert.equal(isCodexTargetCandidate({ type: 'page', url: 'about:blank' }), false);
+  assert.equal(isCodexTargetCandidate({ type: 'page', url: '' }), false);
+  assert.equal(isCodexTargetCandidate({ type: 'page', url: 'app://codex' }), false);
+  assert.equal(isCodexTargetCandidate({ type: 'page', url: 'app://-/index.html#plugin' }), false);
+  assert.equal(isCodexTargetCandidate({ type: 'page', url: 'app://-/index.html?initialRoute=%2Fplugins' }), false);
   assert.equal(isCodexTargetCandidate({ type: 'page', url: 'app://-/index.html?initialRoute=%2Favatar-overlay' }), false);
   assert.equal(isCodexTargetCandidate({ type: 'page', url: 'https://example.com' }), false);
   assert.equal(isCodexTargetCandidate({ type: 'worker', url: 'app://-/worker.js' }), false);
-  assert.equal(isCodexAuxiliaryTarget({ type: 'page', url: 'app://-/index.html?initialRoute=%2Favatar-overlay' }), true);
-  assert.equal(isCodexAuxiliaryTarget({ type: 'page', url: 'about:blank' }), false);
+});
+
+test('auxiliary browser pages block one-shot injection while workers do not', () => {
+  assert.equal(hasAuxiliaryPageTargets([
+    { type: 'page', url: 'app://-/index.html' },
+    { type: 'worker', url: 'app://-/worker.js' },
+  ]), false);
+  assert.equal(hasAuxiliaryPageTargets([
+    { type: 'page', url: 'app://-/index.html' },
+    { type: 'page', url: 'about:blank' },
+  ]), true);
+  assert.equal(hasAuxiliaryPageTargets([
+    { type: 'page', url: 'app://-/index.html' },
+    { type: 'webview', url: 'https://example.com/' },
+  ]), true);
 });

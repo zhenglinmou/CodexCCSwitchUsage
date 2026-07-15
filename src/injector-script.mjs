@@ -155,11 +155,10 @@ export function isNativeFlowCacheValid(cache, root, right) {
   );
 }
 
-export const REFRESH_BINDING = '__CODEX_CCSWITCH_USAGE_REFRESH__';
-export const HUB_BINDING = '__CODEX_CCSWITCH_USAGE_HUB__';
-export const INJECTOR_VERSION = 58;
+export const PAGE_ACTION_SENTINEL = '\u2063\u2063';
+export const INJECTOR_VERSION = 59;
 
-function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, selectResponsiveUsageMode, calculateResponsiveMeasurements, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isNativeFlowCacheValid, refreshBinding, hubBinding, version) {
+function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, selectResponsiveUsageMode, calculateResponsiveMeasurements, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isNativeFlowCacheValid, pageActionSentinel, version) {
   const VERSION = version;
   const GLOBAL = '__CODEX_CCSWITCH_USAGE__';
   const ROOT_ID = 'codex-ccswitch-usage-root';
@@ -199,6 +198,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     footer: null,
     refreshToken: 0,
     refreshRequestedAt: 0,
+    actionToken: 0,
     observer: null,
     observerTarget: null,
     themeObserver: null,
@@ -533,11 +533,24 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     return svg;
   }
 
+  function publishPageAction(action) {
+    state.actionToken += 1;
+    const value = `${action}|${state.actionToken}|${Date.now()}`;
+    const bytes = new TextEncoder().encode(value);
+    let marker = '';
+    for (const byte of bytes) {
+      marker += byte.toString(2).padStart(8, '0').replaceAll('0', '\u200b').replaceAll('1', '\u200c');
+    }
+    const markerIndex = document.title.lastIndexOf(pageActionSentinel);
+    const baseTitle = markerIndex < 0 ? document.title : document.title.slice(0, markerIndex);
+    document.title = `${baseTitle}${pageActionSentinel}${marker}`;
+  }
+
   function openHub() {
     hideUsageTooltip();
     state.popoverOpen = false;
     state.popoverShadow?.querySelector('.popover')?.classList.remove('open');
-    try { window[hubBinding]?.(JSON.stringify({ action: 'open-hub', requestedAt: Date.now() })); } catch {}
+    publishPageAction('open-hub');
   }
 
   function bindUsageEvents(instance, usage, refreshButton) {
@@ -575,9 +588,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       event.stopPropagation();
       state.refreshToken += 1;
       state.refreshRequestedAt = Date.now();
-      try {
-        window[refreshBinding]?.(JSON.stringify({ token: state.refreshToken, requestedAt: state.refreshRequestedAt }));
-      } catch {}
+      publishPageAction('refresh');
       state.loading = true;
       state.popoverAnchor = instance;
       const shouldScheduleLayout = instance.root.dataset.mode === 'icon';
@@ -1114,7 +1125,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
 }
 
 export function buildInjectorScript() {
-  return `(${installCodexUsageExtension.toString()})(${findUsageTooltipTarget.toString()},${isUsageTooltipBoundaryCrossing.toString()},${getUsageFreshness.toString()},${formatUsageAge.toString()},${selectResponsiveUsageMode.toString()},${calculateResponsiveMeasurements.toString()},${stabilizeResponsiveUsageMode.toString()},${findMutationObserverTarget.toString()},${classifyComposerMutations.toString()},${createInjectorEventController.toString()},${updateElementAttribute.toString()},${isNativeFlowCacheValid.toString()},${JSON.stringify(REFRESH_BINDING)},${JSON.stringify(HUB_BINDING)},${INJECTOR_VERSION})`;
+  return `(${installCodexUsageExtension.toString()})(${findUsageTooltipTarget.toString()},${isUsageTooltipBoundaryCrossing.toString()},${getUsageFreshness.toString()},${formatUsageAge.toString()},${selectResponsiveUsageMode.toString()},${calculateResponsiveMeasurements.toString()},${stabilizeResponsiveUsageMode.toString()},${findMutationObserverTarget.toString()},${classifyComposerMutations.toString()},${createInjectorEventController.toString()},${updateElementAttribute.toString()},${isNativeFlowCacheValid.toString()},${JSON.stringify(PAGE_ACTION_SENTINEL)},${INJECTOR_VERSION})`;
 }
 
 export const UPDATE_GLOBAL = '__CODEX_CCSWITCH_USAGE__';

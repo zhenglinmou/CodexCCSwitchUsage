@@ -10,12 +10,11 @@ import {
   findMutationObserverTarget,
   findUsageTooltipTarget,
   getUsageFreshness,
-  HUB_BINDING,
   INJECTOR_VERSION,
   isNativeFlowCacheValid,
   isUsageTooltipBoundaryCrossing,
   mutationNeedsComposerSync,
-  REFRESH_BINDING,
+  PAGE_ACTION_SENTINEL,
   selectResponsiveUsageMode,
   stabilizeResponsiveUsageMode,
   updateElementAttribute,
@@ -85,14 +84,17 @@ test('hot replacement clears a pending tooltip delay', () => {
   assert.match(teardown, /if \(existing\.tooltipTimer\) clearTimeout\(existing\.tooltipTimer\)/);
 });
 
-test('refresh button notifies the host through the exported CDP binding', () => {
-  assert.match(buildInjectorScript(), new RegExp(REFRESH_BINDING));
+test('refresh button publishes an invisible title action without a Runtime binding', () => {
+  const script = buildInjectorScript();
+  assert.match(script, new RegExp(PAGE_ACTION_SENTINEL));
+  assert.match(script, /publishPageAction\('refresh'/);
+  assert.doesNotMatch(script, /window\[refreshBinding\]|Runtime\.addBinding/);
 });
 
-test('balance content and icon popover expose the v2 Balance Hub binding', () => {
+test('balance content and icon popover publish a v2 Balance Hub title action', () => {
   const script = buildInjectorScript();
-  assert.match(script, new RegExp(HUB_BINDING));
-  assert.match(script, /action: 'open-hub'/);
+  assert.match(script, /publishPageAction\('open-hub'/);
+  assert.doesNotMatch(script, /window\[hubBinding\]|Runtime\.addBinding/);
   assert.match(script, /id="open-hub"/);
 });
 

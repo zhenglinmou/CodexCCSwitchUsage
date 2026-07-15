@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { loginConfiguration, providerAliases } from './hub-provider-adapters.mjs';
+import { describeProviderQuery, loginConfiguration, providerAliases } from './hub-provider-adapters.mjs';
 
 function safeMessage(error) {
   const message = error instanceof Error ? error.message : String(error || '未知错误');
@@ -106,17 +106,43 @@ export class HubService {
     for (const provider of providers) {
       activeIds.add(provider.id);
       this.providers.set(provider.id, provider);
-      const previous = this.items.get(provider.id) || this.cachedItems[provider.id] || {};
+      const loginConfig = loginConfiguration(provider);
+      const livePrevious = this.items.get(provider.id);
+      const previous = livePrevious || this.cachedItems[provider.id] || {};
       const obsoleteSource = ['legacy_bridge', 'usage_script', 'ccswitch_cookie'].includes(String(previous.source || ''));
+      const staleBrowserFailure = !livePrevious
+        && previous.source === 'browser_session'
+        && previous.usage
+        && ['error', 'login-required'].includes(String(previous.status || ''));
+      const legacySessionSyncFailure = !livePrevious
+        && previous.source === 'browser_session'
+        && previous.usage
+        && previous.status === 'degraded'
+        && loginConfig?.userHeader
+        && /浏览器伴侣连接后将自动重试|现有浏览器尚未登录/.test(String(previous.message || ''));
+      const restoredBrowserFailure = staleBrowserFailure || legacySessionSyncFailure;
+      const sessionSyncRequired = Boolean(
+        previous.sessionSyncRequired
+        || (restoredBrowserFailure && loginConfig?.userHeader),
+      );
       this.items.set(provider.id, {
         id: provider.id,
         name: provider.name,
         websiteUrl: safeWebsiteUrl(provider.websiteUrl),
         current: provider.isCurrent,
-        status: previous.status === 'loading' || obsoleteSource ? 'idle' : (previous.status || 'idle'),
-        message: obsoleteSource ? '等待 v2 独立余额中心重新查询' : String(previous.message || ''),
+        status: previous.status === 'loading' || obsoleteSource ? 'idle' : (staleBrowserFailure ? 'degraded' : (previous.status || 'idle')),
+        message: obsoleteSource
+          ? '等待 v2 独立余额中心重新查询'
+          : restoredBrowserFailure
+            ? (sessionSyncRequired
+              ? '显示上次成功余额；请点击“同步现有会话”一次'
+              : '显示上次成功余额；请手动重新登录后刷新')
+            : String(previous.message || ''),
         source: obsoleteSource ? 'cached_previous' : String(previous.source || ''),
-        loginSupported: Boolean(loginConfiguration(provider)),
+        loginSupported: Boolean(loginConfig),
+        sessionSyncSupported: Boolean(loginConfig?.userHeader),
+        sessionSyncRequired,
+        queryMethod: describeProviderQuery(provider),
         usage: previous.usage || null,
         updatedAt: String(previous.updatedAt || ''),
       });
@@ -150,14 +176,19 @@ export class HubService {
   }
 
   listPublicProviders() {
-    return [...this.providers.values()].map(provider => ({
-      id: provider.id,
-      name: provider.name,
-      aliases: providerAliases(provider),
-      current: provider.isCurrent,
-      loginSupported: Boolean(loginConfiguration(provider)),
-      balanceUrl: `/v1/balance/${encodeURIComponent(providerAliases(provider).at(-1) || provider.id)}`,
-    }));
+    return [...this.providers.values()].map(provider => {
+      const loginConfig = loginConfiguration(provider);
+      return {
+        id: provider.id,
+        name: provider.name,
+        aliases: providerAliases(provider),
+        current: provider.isCurrent,
+        loginSupported: Boolean(loginConfig),
+        sessionSyncSupported: Boolean(loginConfig?.userHeader),
+        queryMethod: describeProviderQuery(provider),
+        balanceUrl: `/v1/balance/${encodeURIComponent(providerAliases(provider).at(-1) || provider.id)}`,
+      };
+    });
   }
 
   refreshProvider(providerSelector) {
@@ -178,6 +209,7 @@ export class HubService {
           status: usage ? (result.degraded ? 'degraded' : 'ok') : (result.loginRequired ? 'login-required' : 'error'),
           message: usage ? (result.degraded ? 'API 可用性检查未通过，显示本地统计' : '') : safeMessage(result.message || '没有返回可显示的额度数据'),
           source: String(result.source || ''),
+          sessionSyncRequired: result.sessionSyncRequired === true,
           usage: usage || this.items.get(id).usage,
           updatedAt: String(usage?.updatedAt || new Date().toISOString()),
         };
@@ -246,12 +278,16 @@ export class HubService {
     if (!provider) throw new Error('CCSwitch 中不存在这个 Codex 供应商');
     const id = provider.id;
     if (!loginConfiguration(provider)) throw new Error('该供应商不支持网页登录修复');
-    await this.queryEngine.openLogin(provider);
+    const action = await this.queryEngine.openLogin(provider);
+    if (action?.synced === true) return this.refreshProvider(id);
     const item = this.items.get(id);
     this.items.set(id, {
       ...item,
       status: item.usage ? item.status : 'login-required',
-      message: '已在现有浏览器中打开登录页；登录完成后回到 Hub 手动点击刷新',
+      sessionSyncRequired: Boolean(item.sessionSyncSupported && !action?.opened),
+      message: safeMessage(action?.message || (action?.opened
+        ? '已在现有浏览器中打开登录页；登录完成后回到 Hub 手动点击刷新'
+        : '未能同步现有浏览器会话，请先在官网确认登录状态')),
     });
     this.revision += 1;
     return this.items.get(id);

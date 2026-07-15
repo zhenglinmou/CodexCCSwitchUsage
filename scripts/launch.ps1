@@ -13,17 +13,59 @@ if ($packageMarker.name -ne 'codex-ccswitch-usage') { throw '扩展安装标识�
 $runtime = Join-Path $root 'runtime'
 [IO.Directory]::CreateDirectory($runtime) | Out-Null
 
-function Find-CodexExecutable {
-    $running = Get-Process ChatGPT -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -like '*OpenAI.Codex_*\app\ChatGPT.exe' } |
-        Select-Object -First 1
-    if ($running) { return $running.Path }
+function Find-CodexApplication {
     $package = Get-AppxPackage OpenAI.Codex | Sort-Object Version -Descending | Select-Object -First 1
     if ($package) {
-        $candidate = Join-Path $package.InstallLocation 'app\ChatGPT.exe'
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+        return [pscustomobject]@{
+            PackageFamilyName = $package.PackageFamilyName
+            AppUserModelId = "$($package.PackageFamilyName)!App"
+        }
     }
     throw '没有找到 Codex App。'
+}
+
+function Start-CodexApplication {
+    param([string]$AppUserModelId, [string[]]$Arguments)
+    if (-not ('CodexUsage.PackagedApplication' -as [type])) {
+        Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+namespace CodexUsage {
+    [ComImport]
+    [Guid("2E941141-7F97-4756-BA1D-9DECDE894A3D")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IApplicationActivationManager {
+        [PreserveSig]
+        int ActivateApplication(
+            [MarshalAs(UnmanagedType.LPWStr)] string appUserModelId,
+            [MarshalAs(UnmanagedType.LPWStr)] string arguments,
+            uint options,
+            out uint processId);
+    }
+
+    [ComImport]
+    [Guid("45BA127D-10A8-46EA-8AB7-56EA9078943C")]
+    internal class ApplicationActivationManager { }
+
+    public static class PackagedApplication {
+        public static uint Activate(string appUserModelId, string arguments) {
+            IApplicationActivationManager manager =
+                (IApplicationActivationManager)new ApplicationActivationManager();
+            try {
+                uint processId;
+                int result = manager.ActivateApplication(appUserModelId, arguments, 0, out processId);
+                Marshal.ThrowExceptionForHR(result);
+                return processId;
+            } finally {
+                if (Marshal.IsComObject(manager)) Marshal.FinalReleaseComObject(manager);
+            }
+        }
+    }
+}
+'@
+    }
+    $argumentLine = [string]::Join(' ', $Arguments)
+    return [CodexUsage.PackagedApplication]::Activate($AppUserModelId, $argumentLine)
 }
 
 function Show-CodexWindow {
@@ -67,7 +109,7 @@ function Show-RestartPrompt {
     return $shell.Popup($Message, 0, $Title, 4 + $Icon + 4096)
 }
 
-$codexExe = Find-CodexExecutable
+$codexApplication = Find-CodexApplication
 $roots = Get-CodexRoots
 $codexRoot = $roots | Where-Object { $_.CommandLine -match "--remote-debugging-port=$Port(?:\s|$)" } | Select-Object -First 1
 $ordinaryRoots = @($roots | Where-Object { $_.CommandLine -notmatch "--remote-debugging-port=$Port(?:\s|$)" })
@@ -101,11 +143,11 @@ if (-not $codexRoot -and $ordinaryRoots.Count -gt 0) {
 }
 
 if (-not $codexRoot) {
-    Start-Process -FilePath $codexExe -ArgumentList @(
+    [void](Start-CodexApplication -AppUserModelId $codexApplication.AppUserModelId -Arguments @(
         "--remote-debugging-port=$Port",
         "--remote-allow-origins=http://127.0.0.1:$Port",
         '--no-first-run'
-    ) | Out-Null
+    ))
 }
 
 $deadline = [DateTime]::UtcNow.AddSeconds(25)

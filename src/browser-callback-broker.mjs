@@ -14,6 +14,11 @@ function cleanClientId(value) {
   return /^[A-Za-z0-9_-]{8,128}$/.test(text) ? text : '';
 }
 
+function cleanInstanceId(value) {
+  const text = String(value || '').trim();
+  return /^[A-Za-z0-9_-]{8,128}$/.test(text) ? text : '';
+}
+
 export class BrowserCallbackBroker {
   constructor(options = {}) {
     this.now = options.now || Date.now;
@@ -24,20 +29,23 @@ export class BrowserCallbackBroker {
     this.waiters = [];
     this.pending = new Map();
     this.closed = false;
+    this.generation = 0;
   }
 
   heartbeat(payload = {}) {
     const clientId = cleanClientId(payload.clientId);
     if (!clientId) throw new Error('浏览器伴侣 clientId 无效');
     const existing = this.clients.get(clientId) || { sessions: new Set() };
-    const sessions = new Set([
-      ...existing.sessions,
-      ...(Array.isArray(payload.sessions) ? payload.sessions.map(normalizeOrigin).filter(Boolean) : []),
-    ]);
+    const instanceId = cleanInstanceId(payload.instanceId) || existing.instanceId || '';
+    if (instanceId && existing.instanceId !== instanceId) this.generation += 1;
+    const sessions = Array.isArray(payload.sessions)
+      ? new Set(payload.sessions.map(normalizeOrigin).filter(Boolean))
+      : new Set(existing.sessions);
     this.clients.set(clientId, {
       clientId,
       browser: String(payload.browser || existing.browser || 'Chromium').slice(0, 64),
       version: String(payload.version || existing.version || '').slice(0, 32),
+      instanceId,
       sessions,
       lastSeenAt: this.now(),
     });
@@ -61,6 +69,7 @@ export class BrowserCallbackBroker {
     const active = [...this.clients.values()].filter(client => client.lastSeenAt >= cutoff);
     return {
       connected: active.length > 0,
+      generation: this.generation,
       clients: active.map(client => ({
         browser: client.browser,
         version: client.version,

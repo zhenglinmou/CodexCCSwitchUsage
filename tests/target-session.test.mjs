@@ -1,49 +1,30 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import test from 'node:test';
-import { disposeTargetInjector, settleTargetOperations, TargetSession } from '../src/target-session.mjs';
+import { installTargetOnce, settleTargetOperations } from '../src/target-session.mjs';
 
 class FakeCdpClient {
-  constructor(version = 0) {
+  constructor(version = 0, mounted = version > 0) {
     this.version = version;
-    this.mounted = version > 0;
+    this.mounted = mounted;
     this.closed = false;
     this.expressions = [];
-    this.calls = [];
-    this.listeners = new Map();
-  }
-
-  async call(method, params) {
-    this.calls.push({ method, params });
-  }
-
-  on(method, listener) {
-    this.listeners.set(method, listener);
-  }
-
-  off(method) {
-    this.listeners.delete(method);
-  }
-
-  emit(method, params = {}) {
-    this.listeners.get(method)?.(params);
   }
 
   async evaluate(expression) {
     this.expressions.push(expression);
     if (expression === 'FULL_INJECTOR') {
-      this.version = 31;
+      this.version = 59;
       this.mounted = true;
       return true;
     }
     if (expression.includes('mounted:')) return { version: this.version, mounted: this.mounted };
-    if (expression.includes('?.version')) return this.version;
     if (expression.includes('?.mount')) {
       this.mounted = true;
       return true;
     }
     if (expression.includes('?.update(')) return true;
-    if (expression.includes('getRefreshRequest')) return { token: 7, requestedAt: 123 };
-    if (expression.includes('delete window')) return true;
+    if (expression.includes('document.title')) return true;
     return undefined;
   }
 
@@ -52,84 +33,70 @@ class FakeCdpClient {
   }
 }
 
-test('target session injects once and hot-updates only changed payloads', async () => {
+test('one-shot target install injects, updates, clears an acknowledged action, and closes', async () => {
   const client = new FakeCdpClient();
-  const session = new TargetSession(client, {
+  const target = { id: 'main', webSocketDebuggerUrl: 'ws://main' };
+  const connected = [];
+
+  const result = await installTargetOnce(target, {
     globalName: '__TEST_USAGE__',
-    injectorVersion: 31,
+    injectorVersion: 59,
     injectorScript: 'FULL_INJECTOR',
+    payload: { status: 'ok', used: 10 },
+    acknowledgedTitle: 'Codex\u2063\u2063marker',
+  }, async url => {
+    connected.push(url);
+    return client;
   });
-  const firstPayload = { status: 'ok', used: 10 };
 
-  assert.equal(await session.ensureInjector(), true);
-  assert.equal(await session.updatePayload(firstPayload), true);
-  assert.equal(await session.ensureInjector(), false);
-  assert.equal(await session.updatePayload({ status: 'ok', used: 10 }), false);
-
+  assert.deepEqual(connected, ['ws://main']);
+  assert.equal(result.injected, true);
+  assert.equal(result.mounted, true);
+  assert.equal(client.closed, true);
   assert.equal(client.expressions.filter(item => item === 'FULL_INJECTOR').length, 1);
   assert.equal(client.expressions.filter(item => item.includes('?.update(')).length, 1);
-
-  assert.equal(await session.updatePayload({ status: 'ok', used: 11 }), true);
-  assert.equal(client.expressions.filter(item => item.includes('?.update(')).length, 2);
+  assert.equal(client.expressions.filter(item => item.includes('if (document.title')).length, 1);
 });
 
-test('target session reinjects a changed script version and redelivers the payload', async () => {
-  const client = new FakeCdpClient(30);
-  const session = new TargetSession(client, {
+test('one-shot target install remounts a matching injector without reinjecting', async () => {
+  const client = new FakeCdpClient(59, false);
+  const result = await installTargetOnce({ webSocketDebuggerUrl: 'ws://main' }, {
     globalName: '__TEST_USAGE__',
-    injectorVersion: 31,
+    injectorVersion: 59,
     injectorScript: 'FULL_INJECTOR',
-  });
-  const payload = { status: 'ok', used: 10 };
+    payload: { status: 'loading' },
+  }, async () => client);
 
-  await session.ensureInjector();
-  await session.updatePayload(payload);
-  client.version = 30;
-
-  assert.equal(await session.ensureInjector(), true);
-  assert.equal(await session.updatePayload(payload), true);
-  assert.equal(client.expressions.filter(item => item === 'FULL_INJECTOR').length, 2);
-  assert.equal(client.expressions.filter(item => item.includes('?.update(')).length, 2);
-});
-
-test('target session remounts a matching injector whose DOM root was detached', async () => {
-  const client = new FakeCdpClient(31);
-  client.mounted = false;
-  const session = new TargetSession(client, {
-    globalName: '__TEST_USAGE__',
-    injectorVersion: 31,
-    injectorScript: 'FULL_INJECTOR',
-  });
-
-  assert.equal(await session.ensureInjector(), false);
-  assert.equal(client.mounted, true);
+  assert.equal(result.injected, false);
+  assert.equal(result.mounted, true);
+  assert.equal(client.closed, true);
   assert.equal(client.expressions.filter(item => item === 'FULL_INJECTOR').length, 0);
   assert.equal(client.expressions.filter(item => item.includes('?.mount')).length, 1);
 });
 
-test('target session reads refresh requests with a lightweight expression', async () => {
-  const client = new FakeCdpClient(31);
-  const session = new TargetSession(client, {
-    globalName: '__TEST_USAGE__',
-    injectorVersion: 31,
-    injectorScript: 'FULL_INJECTOR',
-  });
+test('one-shot target install closes the socket when evaluation fails', async () => {
+  const client = new FakeCdpClient();
+  client.evaluate = async () => { throw new Error('renderer unavailable'); };
 
-  assert.deepEqual(await session.getRefreshRequest(), { token: 7, requestedAt: 123 });
-  assert.equal(client.expressions.length, 1);
-  assert.match(client.expressions[0], /getRefreshRequest/);
+  await assert.rejects(
+    installTargetOnce({ webSocketDebuggerUrl: 'ws://main' }, {
+      globalName: '__TEST_USAGE__',
+      injectorVersion: 59,
+      injectorScript: 'FULL_INJECTOR',
+      payload: { status: 'loading' },
+    }, async () => client),
+    /renderer unavailable/,
+  );
+  assert.equal(client.closed, true);
 });
 
-test('auxiliary target cleanup removes observers, events and injected DOM', async () => {
-  const client = new FakeCdpClient(31);
+test('one-shot target code never enables Runtime events or installs bindings', () => {
+  const source = fs.readFileSync(new URL('../src/target-session.mjs', import.meta.url), 'utf8');
 
-  assert.equal(await disposeTargetInjector(client, '__TEST_USAGE__'), true);
-  assert.equal(client.expressions.length, 1);
-  assert.match(client.expressions[0], /eventController\?\.abort\(\)/);
-  assert.match(client.expressions[0], /observer\?\.disconnect\(\)/);
-  assert.match(client.expressions[0], /resizeObserver\?\.disconnect\(\)/);
-  assert.match(client.expressions[0], /state\.root\?\.remove\(\)/);
-  assert.match(client.expressions[0], /delete window\["__TEST_USAGE__"\]/);
+  assert.doesNotMatch(source, /Runtime\.enable/);
+  assert.doesNotMatch(source, /Runtime\.addBinding/);
+  assert.doesNotMatch(source, /Runtime\.bindingCalled/);
+  assert.doesNotMatch(source, /executionContextsCleared/);
 });
 
 test('target operations start concurrently and preserve isolated failures', async () => {
@@ -151,52 +118,4 @@ test('target operations start concurrently and preserve isolated failures', asyn
   assert.deepEqual(results.map(result => result.status), ['fulfilled', 'rejected', 'fulfilled']);
   assert.equal(results[0].value, 10);
   assert.equal(results[2].value, 30);
-});
-
-test('target session receives refresh clicks through a Runtime binding', async () => {
-  const client = new FakeCdpClient(31);
-  const refreshes = [];
-  let contextResets = 0;
-  const session = new TargetSession(client, {
-    globalName: '__TEST_USAGE__',
-    injectorVersion: 31,
-    injectorScript: 'FULL_INJECTOR',
-    refreshBindingName: '__TEST_REFRESH__',
-    onRefresh: payload => refreshes.push(payload),
-    onContextReset: () => { contextResets += 1; },
-  });
-
-  await session.initialize();
-  client.emit('Runtime.bindingCalled', { name: '__TEST_REFRESH__', payload: '{"token":4}' });
-  client.emit('Runtime.executionContextsCleared');
-
-  assert.deepEqual(client.calls, [
-    { method: 'Runtime.enable', params: {} },
-    { method: 'Runtime.addBinding', params: { name: '__TEST_REFRESH__' } },
-  ]);
-  assert.deepEqual(refreshes, [{ token: 4 }]);
-  assert.equal(contextResets, 1);
-});
-
-test('target session receives Balance Hub actions through a separate Runtime binding', async () => {
-  const client = new FakeCdpClient(31);
-  const actions = [];
-  const session = new TargetSession(client, {
-    globalName: '__TEST_USAGE__',
-    injectorVersion: 31,
-    injectorScript: 'FULL_INJECTOR',
-    refreshBindingName: '__TEST_REFRESH__',
-    actionBindingName: '__TEST_ACTION__',
-    onAction: payload => actions.push(payload),
-  });
-
-  await session.initialize();
-  client.emit('Runtime.bindingCalled', { name: '__TEST_ACTION__', payload: '{"action":"open-hub"}' });
-
-  assert.deepEqual(actions, [{ action: 'open-hub' }]);
-  assert.deepEqual(client.calls, [
-    { method: 'Runtime.enable', params: {} },
-    { method: 'Runtime.addBinding', params: { name: '__TEST_REFRESH__' } },
-    { method: 'Runtime.addBinding', params: { name: '__TEST_ACTION__' } },
-  ]);
 });

@@ -43,6 +43,15 @@ test('Hub server protects its local page and API with an unguessable path token'
   assert.equal(page.status, 200);
   assert.match(page.headers.get('content-security-policy'), /default-src 'none'/);
   assert.match(html, /Balance Hub/);
+  assert.match(html, /method-dialog/);
+  assert.match(html, /action\('查看'/);
+  assert.match(html, /同步现有会话/);
+  assert.match(html, /sessionSyncSupported/);
+  assert.match(html, /item\.sessionSyncRequired/);
+  assert.match(html, /需要同步/);
+  assert.doesNotMatch(html, /已在现有浏览器中打开登录页/);
+  assert.match(html, /无需重复配置/);
+  assert.match(html, /nextRenderKey!==renderKey/);
   assert.doesNotMatch(html, /OPENAI_API_KEY|access_token/);
   assert.equal(refreshAllCalls, 0, 'opening Hub must not refresh providers automatically');
 
@@ -94,13 +103,19 @@ test('browser companion jobs and callbacks share the Hub server and token', asyn
   const api = `http://127.0.0.1:${server.boundPort}/api/test-token`;
   const heartbeat = await fetch(`${api}/companion/heartbeat`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ clientId: 'edge-client-one', browser: 'Edge', sessions: ['https://anyrouter.top'] }),
+    body: JSON.stringify({ clientId: 'edge-client-one', instanceId: 'edge-worker-one', browser: 'Edge', sessions: ['https://anyrouter.top'] }),
   });
   assert.equal(heartbeat.status, 200);
 
   const resultPromise = broker.queryJson({ baseUrl: 'https://anyrouter.top', requestPath: '/api/user/self' });
-  const jobResponse = await fetch(`${api}/companion/job?clientId=edge-client-one&browser=Edge&version=1`);
+  const sessionQuery = new URLSearchParams({
+    clientId: 'edge-client-one', instanceId: 'edge-worker-one', browser: 'Edge', version: '1',
+  });
+  sessionQuery.append('session', 'https://anyrouter.top');
+  sessionQuery.append('session', 'https://chatgpt.com');
+  const jobResponse = await fetch(`${api}/companion/job?${sessionQuery}`);
   const job = (await jobResponse.json()).job;
+  assert.equal(broker.hasSession('https://chatgpt.com'), true);
   const callback = await fetch(`${api}/companion/result/${job.id}`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ ok: true, value: { status: 200, text: '{"success":true}' } }),

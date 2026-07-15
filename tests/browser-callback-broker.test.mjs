@@ -34,3 +34,44 @@ test('browser callback broker records session origins without storing cookies', 
   now += 21_000;
   assert.equal(broker.isConnected(), false);
 });
+
+test('an explicit companion heartbeat restores and replaces browser session origins', async () => {
+  const broker = new BrowserCallbackBroker();
+  broker.heartbeat({
+    clientId: 'edge-client-one',
+    browser: 'Edge',
+    sessions: ['https://anyrouter.top', 'https://agentrouter.org'],
+  });
+  assert.equal(broker.hasSession('https://anyrouter.top'), true);
+
+  broker.heartbeat({
+    clientId: 'edge-client-one',
+    browser: 'Edge',
+    sessions: ['https://agentrouter.org'],
+  });
+  assert.equal(broker.hasSession('https://anyrouter.top'), false);
+  assert.equal(broker.hasSession('https://agentrouter.org'), true);
+
+  const pending = broker.nextJob({ clientId: 'edge-client-one', browser: 'Edge' }, 1_000);
+  assert.equal(broker.hasSession('https://agentrouter.org'), true, 'job polling without a session list must preserve reported sessions');
+  broker.close();
+  assert.equal(await pending, null);
+});
+
+test('broker exposes a new companion generation when its service worker restarts', () => {
+  const broker = new BrowserCallbackBroker();
+  broker.heartbeat({
+    clientId: 'edge-client-one', browser: 'Edge', version: '0.1.4', instanceId: 'worker-one', sessions: ['https://anyrouter.top'],
+  });
+  const first = broker.getStatus();
+
+  broker.heartbeat({
+    clientId: 'edge-client-one', browser: 'Edge', version: '0.1.4', instanceId: 'worker-one', sessions: ['https://anyrouter.top'],
+  });
+  assert.equal(broker.getStatus().generation, first.generation);
+
+  broker.heartbeat({
+    clientId: 'edge-client-one', browser: 'Edge', version: '0.1.4', instanceId: 'worker-two', sessions: ['https://anyrouter.top'],
+  });
+  assert.equal(broker.getStatus().generation, first.generation + 1);
+});

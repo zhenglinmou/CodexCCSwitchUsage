@@ -18,6 +18,15 @@ test('launcher starts the host before foreground window activation work', () => 
   assert.ok(source.indexOf("$hostPath = Join-Path $root 'src\\host.mjs'") < source.indexOf('$windowActivated ='));
 });
 
+test('launcher activates packaged Codex through its AppUserModelId', () => {
+  const source = fs.readFileSync(new URL('../scripts/launch.ps1', import.meta.url), 'utf8');
+
+  assert.match(source, /IApplicationActivationManager/);
+  assert.match(source, /ActivateApplication/);
+  assert.match(source, /PackageFamilyName/);
+  assert.doesNotMatch(source, /Start-Process -FilePath \$codexExe/);
+});
+
 test('packaged launcher starts Node detached while source mode keeps its fallback', () => {
   const source = fs.readFileSync(new URL('../scripts/launch.ps1', import.meta.url), 'utf8');
 

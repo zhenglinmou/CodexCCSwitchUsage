@@ -175,8 +175,10 @@ export class HubServer {
       if (!this.browserBroker) throw new Error('浏览器伴侣回调未启用');
       const job = await this.browserBroker.nextJob({
         clientId: url.searchParams.get('clientId'),
+        instanceId: url.searchParams.get('instanceId'),
         browser: url.searchParams.get('browser'),
         version: url.searchParams.get('version'),
+        sessions: url.searchParams.getAll('session'),
       });
       if (!job) {
         response.writeHead(204, { 'cache-control': 'no-store' });

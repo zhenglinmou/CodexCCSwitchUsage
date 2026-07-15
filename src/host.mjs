@@ -1,20 +1,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { ProviderRepository } from './provider-repository.mjs';
-import { CdpClient, getBrowserWebSocketUrl, isCodexAuxiliaryTarget, isCodexTargetCandidate, listCodexTargets } from './cdp-client.mjs';
-import { CdpDisconnectGuard } from './cdp-disconnect-guard.mjs';
 import { BrowserCallbackBroker } from './browser-callback-broker.mjs';
+import { hasAuxiliaryPageTargets, isCodexTargetCandidate, listCdpTargets } from './cdp-client.mjs';
+import { ProviderRepository } from './provider-repository.mjs';
 import { HubServer } from './hub-server.mjs';
 import { ProviderQueryEngine } from './hub-provider-adapters.mjs';
 import { hubItemToUsagePayload, HubService } from './hub-service.mjs';
-import { buildInjectorScript, HUB_BINDING, INJECTOR_VERSION, REFRESH_BINDING, UPDATE_GLOBAL } from './injector-script.mjs';
-import { TargetDiscovery } from './target-discovery.mjs';
-import { disposeTargetInjector, settleTargetOperations, TargetSession } from './target-session.mjs';
+import { buildInjectorScript, INJECTOR_VERSION, UPDATE_GLOBAL } from './injector-script.mjs';
+import { decodePageActionMarker } from './page-action-channel.mjs';
+import { installTargetOnce, settleTargetOperations } from './target-session.mjs';
 
 const DATABASE_WATCH_DEBOUNCE_MS = 100;
-const CDP_DISCONNECT_GRACE_MS = 3_000;
-const DEGRADED_FALLBACK_POLL_MS = 30_000;
-const HEALTHY_FALLBACK_POLL_MS = 300_000;
+const FALLBACK_POLL_MS = 1_000;
+const INJECTOR_AUDIT_MS = 300_000;
 const STATUS_HEARTBEAT_MS = 300_000;
 
 function parseArgs(argv) {
@@ -41,9 +39,8 @@ const hubServer = new HubServer(hubService, {
   tokenPath: path.join(args.runtimeDir, 'hub-token'),
   browserBroker,
 });
-const sessions = new Map();
-const cleanedAuxiliaryTargetIds = new Set();
 const injectorScript = buildInjectorScript();
+
 function readUsageCache() {
   try {
     const cached = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
@@ -60,31 +57,31 @@ function writeUsageCache(payload) {
 }
 
 let lastPayload = readUsageCache() || { status: 'loading', providerName: 'CCSwitch', message: '读取中…' };
+const cachedQueryAt = Date.parse(String(lastPayload.updatedAt || ''));
 let lastProviderId = lastPayload.providerId || '';
-let lastQueryAt = 0;
+let lastQueryAt = Number.isFinite(cachedQueryAt) ? Math.min(Date.now(), cachedQueryAt) : 0;
 let stopped = false;
 let stopReason = null;
 let lastStatusWriteAt = 0;
 let lastConnectionError = null;
 let lastHubError = null;
-let targetDiscovery = null;
+let mountedPages = 0;
+let mountedTargetIds = new Set();
+let lastInjectorAuditAt = 0;
+let lastActionSignature = '';
 let databaseWatcher = null;
 let databaseWatchTimer = null;
 let databaseChangeToken = repository.getChangeToken();
 let controlWatcher = null;
-let usageRefreshTimer = null;
+let currentProviderRefreshTimer = null;
+let currentProviderRefreshPromise = null;
+let currentProviderRefreshPending = false;
+let currentProviderRefreshForcePending = false;
+let currentProviderRefreshInjectPending = false;
 let targetSyncPromise = null;
 let targetSyncPending = false;
-let refreshPromise = null;
-let refreshPending = false;
-let refreshForcePending = false;
-let refreshBroadcastPending = false;
+let targetAuditPending = false;
 let fallbackWake = null;
-const cdpDisconnectGuard = new CdpDisconnectGuard({
-  graceMs: CDP_DISCONNECT_GRACE_MS,
-  verifyConnection: verifyCdpConnection,
-  onExpired: () => shutdown('CDP disconnected'),
-});
 
 fs.writeFileSync(pidPath, String(process.pid), 'utf8');
 
@@ -96,11 +93,11 @@ function writeStatus(extra = {}) {
     port: args.port,
     provider: lastPayload.providerName || '',
     usageStatus: lastPayload.status || 'loading',
-    eventDrivenTargets: Boolean(targetDiscovery && !targetDiscovery.client.closed),
+    eventDrivenTargets: false,
     databaseWatch: Boolean(databaseWatcher),
     controlWatch: Boolean(controlWatcher),
-    fallbackPollMs: getFallbackPollMs(),
-    connectedPages: sessions.size,
+    fallbackPollMs: FALLBACK_POLL_MS,
+    connectedPages: mountedPages,
     connectionError: lastConnectionError,
     hubRunning: Boolean(hubServer.boundPort),
     hubPort: hubServer.boundPort || null,
@@ -121,13 +118,6 @@ function safeMessage(error) {
   return message.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]').replace(/sk-[A-Za-z0-9_-]+/g, '[redacted]');
 }
 
-function getFallbackPollMs() {
-  const targetEventsHealthy = Boolean(targetDiscovery && !targetDiscovery.client.closed);
-  return targetEventsHealthy && databaseWatcher && controlWatcher
-    ? HEALTHY_FALLBACK_POLL_MS
-    : DEGRADED_FALLBACK_POLL_MS;
-}
-
 function wakeFallbackPoll() {
   fallbackWake?.();
 }
@@ -141,44 +131,44 @@ async function waitForFallbackPoll(delayMs) {
       resolve();
     };
     fallbackWake = finish;
-    timer = setTimeout(finish, Math.max(1_000, delayMs));
+    timer = setTimeout(finish, Math.max(250, delayMs));
   });
 }
 
-function scheduleUsageRefresh(delayMs) {
-  if (usageRefreshTimer) clearTimeout(usageRefreshTimer);
+function scheduleCurrentProviderRefresh(delayMs) {
+  if (currentProviderRefreshTimer) clearTimeout(currentProviderRefreshTimer);
   if (stopped) return;
-  usageRefreshTimer = setTimeout(() => {
-    usageRefreshTimer = null;
-    requestUsageRefresh(false, true);
+  currentProviderRefreshTimer = setTimeout(() => {
+    currentProviderRefreshTimer = null;
+    requestCurrentProviderRefresh(false, true);
   }, Math.max(1_000, delayMs));
 }
 
-async function refreshUsage(force = false) {
+async function refreshCurrentProvider(force = false) {
   let provider;
   try {
     provider = repository.getCurrent();
   } catch (error) {
     lastPayload = { status: 'error', providerName: 'CCSwitch', message: safeMessage(error) };
     writeStatus({ error: lastPayload.message });
-    scheduleUsageRefresh(30_000);
+    scheduleCurrentProviderRefresh(60_000);
     return;
   }
 
   if (!provider) {
     lastPayload = { status: 'error', providerName: 'CCSwitch', message: '没有找到当前 Codex 供应商' };
     writeStatus({ error: lastPayload.message });
-    scheduleUsageRefresh(30_000);
+    scheduleCurrentProviderRefresh(60_000);
     return;
   }
 
   const providerChanged = provider.id !== lastProviderId;
-  const intervalMinutes = Math.max(1, Number(provider.usage?.autoQueryInterval || 5));
+  const intervalMinutes = Math.max(1, Number(provider.usage?.autoQueryInterval) || 5);
   const intervalMs = intervalMinutes * 60_000;
   const elapsedMs = Date.now() - lastQueryAt;
   const due = elapsedMs >= intervalMs;
   if (!force && !providerChanged && !due) {
-    scheduleUsageRefresh(intervalMs - elapsedMs);
+    scheduleCurrentProviderRefresh(intervalMs - elapsedMs);
     return;
   }
 
@@ -191,9 +181,9 @@ async function refreshUsage(force = false) {
     lastQueryAt = Date.now();
     const failed = ['error', 'login-required'].includes(item.status);
     writeStatus({ error: failed ? item.message : null });
-    scheduleUsageRefresh(failed ? 30_000 : intervalMs);
+    scheduleCurrentProviderRefresh(intervalMs);
   } catch (error) {
-    lastQueryAt = Date.now() - intervalMinutes * 60_000 + 30_000;
+    lastQueryAt = Date.now();
     const message = safeMessage(error);
     if (lastPayload.status === 'ok' && lastPayload.providerId === provider.id) {
       lastPayload = { ...lastPayload, queryError: message };
@@ -208,165 +198,136 @@ async function refreshUsage(force = false) {
       };
     }
     writeStatus({ error: message });
-    scheduleUsageRefresh(30_000);
+    scheduleCurrentProviderRefresh(intervalMs);
   }
 }
 
-async function syncTargets() {
-  const discoveredTargets = await listCodexTargets(args.port, { includeAuxiliary: true });
-  const targets = discoveredTargets.filter(isCodexTargetCandidate);
-  const auxiliaryTargets = discoveredTargets.filter(isCodexAuxiliaryTarget);
-  const activeIds = new Set(targets.map(target => target.id));
-  const auxiliaryIds = new Set(auxiliaryTargets.map(target => target.id));
-  for (const id of cleanedAuxiliaryTargetIds) {
-    if (!auxiliaryIds.has(id)) cleanedAuxiliaryTargetIds.delete(id);
-  }
-  for (const [id, session] of sessions) {
-    if (!activeIds.has(id) || session.closed) {
-      session.close();
-      sessions.delete(id);
-    }
-  }
-
-  async function syncTarget(target) {
-    let session = sessions.get(target.id);
-    try {
-      if (!session || session.closed) {
-        const client = await CdpClient.connect(target.webSocketDebuggerUrl);
-        session = new TargetSession(client, {
-          globalName: UPDATE_GLOBAL,
-          injectorVersion: INJECTOR_VERSION,
-          injectorScript,
-          refreshBindingName: REFRESH_BINDING,
-          onRefresh: () => requestUsageRefresh(true, true),
-          actionBindingName: HUB_BINDING,
-          onAction: payload => {
-            if (payload?.action !== 'open-hub') return;
-            try {
-              hubServer.open();
-              lastHubError = null;
-            } catch (error) {
-              lastHubError = safeMessage(error);
-              writeStatus({ hubError: lastHubError });
-            }
-          },
-          onContextReset: () => requestTargetSync(),
-        });
-        sessions.set(target.id, session);
-        await session.initialize();
-      }
-      await session.ensureInjector();
-      await session.updatePayload(lastPayload);
-      return true;
-    } catch (error) {
-      session?.close();
-      sessions.delete(target.id);
-      throw error;
-    }
-  }
-
-  async function cleanupAuxiliaryTarget(target) {
-    if (cleanedAuxiliaryTargetIds.has(target.id)) return false;
-    const client = await CdpClient.connect(target.webSocketDebuggerUrl);
-    try {
-      await disposeTargetInjector(client, UPDATE_GLOBAL);
-      cleanedAuxiliaryTargetIds.add(target.id);
-      return true;
-    } finally {
-      client.close();
-    }
-  }
-
-  await Promise.all([
-    settleTargetOperations(targets, syncTarget),
-    settleTargetOperations(auxiliaryTargets, cleanupAuxiliaryTarget),
-  ]);
-}
-
-async function broadcastPayload() {
-  await settleTargetOperations([...sessions], async ([id, session]) => {
-    try {
-      await session.updatePayload(lastPayload);
-    } catch (error) {
-      session.close();
-      sessions.delete(id);
-      throw error;
-    }
-  });
-}
-
-function requestUsageRefresh(force = false, broadcast = false) {
-  refreshPending = true;
-  refreshForcePending ||= force;
-  refreshBroadcastPending ||= broadcast;
-  if (refreshPromise) return refreshPromise;
-  refreshPromise = (async () => {
-    while (refreshPending && !stopped) {
-      const currentForce = refreshForcePending;
-      const currentBroadcast = refreshBroadcastPending;
-      refreshPending = false;
-      refreshForcePending = false;
-      refreshBroadcastPending = false;
+function requestCurrentProviderRefresh(force = false, inject = false) {
+  currentProviderRefreshPending = true;
+  currentProviderRefreshForcePending ||= force;
+  currentProviderRefreshInjectPending ||= inject;
+  if (currentProviderRefreshPromise) return currentProviderRefreshPromise;
+  currentProviderRefreshPromise = (async () => {
+    while (currentProviderRefreshPending && !stopped) {
+      const currentForce = currentProviderRefreshForcePending;
+      const currentInject = currentProviderRefreshInjectPending;
+      currentProviderRefreshPending = false;
+      currentProviderRefreshForcePending = false;
+      currentProviderRefreshInjectPending = false;
       try {
-        await refreshUsage(currentForce);
-        if (currentBroadcast) await broadcastPayload();
+        await refreshCurrentProvider(currentForce);
+        if (currentInject) await requestTargetSync({ audit: true });
       } catch (error) {
-        const message = safeMessage(error);
-        writeStatus({ error: message });
+        writeStatus({ error: safeMessage(error) });
       }
     }
-  })().finally(() => { refreshPromise = null; });
-  return refreshPromise;
+  })().finally(() => { currentProviderRefreshPromise = null; });
+  return currentProviderRefreshPromise;
 }
 
-function requestTargetSync() {
+function actionSignature(action) {
+  return action ? `${action.action}:${action.token}:${action.requestedAt}` : '';
+}
+
+function openHubFromAction() {
+  try {
+    hubServer.open();
+    lastHubError = null;
+  } catch (error) {
+    lastHubError = safeMessage(error);
+    writeStatus({ hubError: lastHubError });
+  }
+}
+
+async function syncTargets({ audit = true } = {}) {
+  let allTargets = await listCdpTargets(args.port);
+  let targets = allTargets.filter(target => isCodexTargetCandidate(target) && target.webSocketDebuggerUrl);
+  if (targets.length === 0) {
+    mountedPages = 0;
+    mountedTargetIds = new Set();
+    throw new Error('没有找到 Codex 主页面');
+  }
+
+  let targetActions = targets.map(target => ({ target, action: decodePageActionMarker(target.title) }));
+  const markedActions = targetActions.filter(item => item.action);
+  const pendingActions = markedActions.filter(item => actionSignature(item.action) !== lastActionSignature);
+  const targetIds = new Set(targets.map(target => target.id));
+  const targetIdentityChanged = targetIds.size !== mountedTargetIds.size
+    || [...targetIds].some(id => !mountedTargetIds.has(id));
+  const shouldAudit = audit || targetIdentityChanged;
+  const shouldInstall = shouldAudit || markedActions.length > 0;
+
+  if (!shouldInstall) {
+    mountedPages = targets.length;
+    return;
+  }
+  if (hasAuxiliaryPageTargets(allTargets)) {
+    throw new Error('检测到 Codex 内置浏览器页面，已暂停 CDP 注入');
+  }
+
+  for (const item of pendingActions) {
+    const signature = actionSignature(item.action);
+    if (item.action.action === 'refresh') await refreshCurrentProvider(true);
+    if (item.action.action === 'open-hub') openHubFromAction();
+    lastActionSignature = signature;
+  }
+
+  if (pendingActions.length > 0) {
+    allTargets = await listCdpTargets(args.port);
+    if (hasAuxiliaryPageTargets(allTargets)) {
+      throw new Error('检测到 Codex 内置浏览器页面，已暂停 CDP 注入');
+    }
+    targets = allTargets.filter(target => isCodexTargetCandidate(target) && target.webSocketDebuggerUrl);
+    if (targets.length === 0) {
+      mountedPages = 0;
+      mountedTargetIds = new Set();
+      throw new Error('没有找到 Codex 主页面');
+    }
+    targetActions = targets.map(target => ({ target, action: decodePageActionMarker(target.title) }));
+  }
+
+  const results = await settleTargetOperations(targetActions, ({ target, action }) => installTargetOnce(target, {
+    globalName: UPDATE_GLOBAL,
+    injectorVersion: INJECTOR_VERSION,
+    injectorScript,
+    payload: lastPayload,
+    acknowledgedTitle: action ? target.title : '',
+  }));
+  const failures = results.filter(result => result.status === 'rejected');
+  mountedPages = results.length - failures.length;
+  mountedTargetIds = new Set(
+    targetActions
+      .filter((_item, index) => results[index]?.status === 'fulfilled')
+      .map(item => item.target.id),
+  );
+  lastInjectorAuditAt = Date.now();
+  if (failures.length) throw failures[0].reason;
+}
+
+function requestTargetSync({ audit = false } = {}) {
   targetSyncPending = true;
+  targetAuditPending ||= audit;
   if (targetSyncPromise) return targetSyncPromise;
   targetSyncPromise = (async () => {
+    const previousMountedPages = mountedPages;
+    const previousConnectionError = lastConnectionError;
     while (targetSyncPending && !stopped) {
+      const currentAudit = targetAuditPending;
       targetSyncPending = false;
+      targetAuditPending = false;
       try {
-        await syncTargets();
-        if (lastConnectionError) {
-          lastConnectionError = null;
-          writeStatus({ connectedPages: sessions.size, connectionError: null });
-        }
+        await syncTargets({ audit: currentAudit });
+        lastConnectionError = null;
       } catch (error) {
         lastConnectionError = safeMessage(error);
-        writeStatus({ connectedPages: sessions.size, connectionError: lastConnectionError });
+        targetAuditPending ||= currentAudit;
       }
+    }
+    if (mountedPages !== previousMountedPages || lastConnectionError !== previousConnectionError) {
+      writeStatus({ connectedPages: mountedPages, connectionError: lastConnectionError });
     }
   })().finally(() => { targetSyncPromise = null; });
   return targetSyncPromise;
-}
-
-async function startTargetDiscovery() {
-  if (targetDiscovery && !targetDiscovery.client.closed) {
-    cdpDisconnectGuard.notifyConnected();
-    return true;
-  }
-  targetDiscovery?.close();
-  targetDiscovery = null;
-  try {
-    const browserUrl = await getBrowserWebSocketUrl(args.port);
-    const client = await CdpClient.connect(browserUrl);
-    const discovery = new TargetDiscovery(client, requestTargetSync, {
-      onDisconnect: () => cdpDisconnectGuard.notifyDisconnected(),
-    });
-    await discovery.start();
-    targetDiscovery = discovery;
-    cdpDisconnectGuard.notifyConnected();
-    return true;
-  } catch (error) {
-    lastConnectionError = `Target 事件不可用，使用兜底轮询: ${safeMessage(error)}`;
-    return false;
-  }
-}
-
-async function verifyCdpConnection() {
-  if (!await startTargetDiscovery()) return false;
-  await requestTargetSync();
-  return true;
 }
 
 function startDatabaseWatcher() {
@@ -382,7 +343,7 @@ function startDatabaseWatcher() {
         databaseWatchTimer = null;
         databaseChangeToken = repository.getChangeToken();
         try { hubService.syncProviders(); } catch {}
-        requestUsageRefresh(false, true);
+        requestCurrentProviderRefresh(false, true);
       }, DATABASE_WATCH_DEBOUNCE_MS);
     });
     databaseWatcher.on('error', () => {
@@ -401,7 +362,7 @@ function startControlWatcher() {
   const requestPath = path.join(args.runtimeDir, requestName);
   const consumeRequest = () => {
     try { fs.rmSync(requestPath, { force: true }); } catch {}
-    requestTargetSync();
+    requestTargetSync({ audit: true });
   };
   try {
     controlWatcher = fs.watch(args.runtimeDir, (_eventType, filename) => {
@@ -425,27 +386,29 @@ async function loop() {
   } catch (error) {
     lastHubError = safeMessage(error);
   }
-  await requestTargetSync();
-  await startTargetDiscovery();
+  await requestTargetSync({ audit: true });
   startDatabaseWatcher();
   startControlWatcher();
-  writeStatus({ connectedPages: sessions.size, connectionError: lastConnectionError });
-  requestUsageRefresh(false, true);
+  writeStatus({ connectedPages: mountedPages, connectionError: lastConnectionError });
+  requestCurrentProviderRefresh(false, true);
   while (!stopped) {
-    await waitForFallbackPoll(getFallbackPollMs());
+    await waitForFallbackPoll(FALLBACK_POLL_MS);
     if (stopped) break;
     const currentDatabaseChangeToken = repository.getChangeToken();
     const databaseChanged = currentDatabaseChangeToken !== databaseChangeToken;
     databaseChangeToken = currentDatabaseChangeToken;
+    if (databaseChanged) {
+      try { hubService.syncProviders(); } catch {}
+    }
     startDatabaseWatcher();
     startControlWatcher();
+    const auditDue = Date.now() - lastInjectorAuditAt >= INJECTOR_AUDIT_MS;
     await Promise.allSettled([
-      databaseChanged ? requestUsageRefresh(false, true) : Promise.resolve(),
-      requestTargetSync(),
-      startTargetDiscovery(),
+      databaseChanged ? requestCurrentProviderRefresh(false, true) : Promise.resolve(),
+      requestTargetSync({ audit: auditDue || databaseChanged }),
     ]);
     if (Date.now() - lastStatusWriteAt >= STATUS_HEARTBEAT_MS) {
-      writeStatus({ connectedPages: sessions.size, connectionError: lastConnectionError });
+      writeStatus({ connectedPages: mountedPages, connectionError: lastConnectionError });
     }
   }
 }
@@ -455,17 +418,12 @@ function shutdown(reason = null) {
   stopReason = reason;
   stopped = true;
   wakeFallbackPoll();
-  cdpDisconnectGuard.close();
-  targetDiscovery?.close();
   databaseWatcher?.close();
   controlWatcher?.close();
-  const auxiliaryShutdown = Promise.allSettled([
-    hubServer.close(),
-  ]);
+  const auxiliaryShutdown = Promise.allSettled([hubServer.close()]);
   browserBroker.close();
   if (databaseWatchTimer) clearTimeout(databaseWatchTimer);
-  if (usageRefreshTimer) clearTimeout(usageRefreshTimer);
-  for (const session of sessions.values()) session.close();
+  if (currentProviderRefreshTimer) clearTimeout(currentProviderRefreshTimer);
   repository.close();
   try { fs.rmSync(pidPath, { force: true }); } catch {}
   try { writeStatus({ running: false, connectedPages: 0 }); } catch {}
