@@ -1,5 +1,5 @@
 export function findUsageTooltipTarget(target) {
-  if (!target?.closest || target.closest('.refresh,.hub-open')) return null;
+  if (!target?.closest || target.closest('.refresh,.hub-trigger,.hub-open')) return null;
   return target.closest('.metric,.meter,.message');
 }
 
@@ -156,7 +156,7 @@ export function isNativeFlowCacheValid(cache, root, right) {
 }
 
 export const PAGE_ACTION_SENTINEL = '\u2063\u2063';
-export const INJECTOR_VERSION = 61;
+export const INJECTOR_VERSION = 62;
 
 function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, selectResponsiveUsageMode, calculateResponsiveMeasurements, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isNativeFlowCacheValid, pageActionSentinel, version) {
   const VERSION = version;
@@ -296,7 +296,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
   const usageStyles = `
     :host{font:inherit;color:inherit;min-width:0;transition:opacity .15s cubic-bezier(.4,0,.2,1);}
     *{box-sizing:border-box}
-    .usage{height:28px;display:flex;align-items:center;justify-content:center;gap:var(--spacing-token-button-composer-gap,4px);min-width:0;overflow:hidden;white-space:nowrap;color:var(--color-token-text-tertiary,var(--color-text-foreground-tertiary,currentColor));font-family:inherit;font-size:var(--text-sm,13px);font-weight:inherit;line-height:18px;letter-spacing:normal;cursor:pointer}
+    .usage{height:28px;display:flex;align-items:center;justify-content:center;gap:var(--spacing-token-button-composer-gap,4px);min-width:0;overflow:hidden;white-space:nowrap;color:var(--color-token-text-tertiary,var(--color-text-foreground-tertiary,currentColor));font-family:inherit;font-size:var(--text-sm,13px);font-weight:inherit;line-height:18px;letter-spacing:normal}
     .status-dot{width:6px;height:6px;border-radius:9999px;background:var(--color-text-success,#40c977);flex:0 0 auto}
     .usage[data-status="error"] .status-dot{background:var(--color-text-warning,#ff8549)}
     .usage[data-query-error="true"] .status-dot{background:var(--color-text-warning,#ff8549)}
@@ -313,19 +313,19 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     .meter[data-balance-level="critical"]>i{background:var(--color-text-danger,#ef4444)}
     .usage[data-balance-level="warning"] .remaining-value{color:var(--color-text-warning,#ff9f43)}
     .usage[data-balance-level="critical"] .remaining-value{color:var(--color-text-danger,#ef4444)}
-    .refresh{appearance:none;border:0;background:transparent;color:inherit;width:28px;height:28px;padding:6px;display:grid;place-items:center;border-radius:9999px;cursor:pointer;flex:0 0 auto;font:inherit;line-height:18px}
-    .refresh:hover{background:var(--color-background-button-tertiary-hover,rgba(127,127,127,.08))}
-    .refresh svg{display:block;width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+    .toolbar-action{appearance:none;border:0;background:transparent;color:inherit;width:28px;height:28px;padding:6px;display:grid;place-items:center;border-radius:9999px;cursor:pointer;flex:0 0 auto;font:inherit;line-height:18px}
+    .toolbar-action:hover{background:var(--color-background-button-tertiary-hover,rgba(127,127,127,.08))}
+    .toolbar-action svg{display:block;width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
     .refresh[data-loading="true"] svg{animation:codex-usage-spin .8s linear infinite}
     .message{overflow:hidden;text-overflow:ellipsis;color:inherit;font:inherit}
-    @keyframes codex-usage-spin{to{transform:rotate(360deg)}}
+    @keyframes codex-usage-spin{to{transform:rotate(-360deg)}}
     @media (prefers-reduced-motion:reduce){:host{transition:none}.refresh svg{animation:none!important}}
     :host([data-mode="compact"]) .extra-secondary{display:none}
     :host([data-mode="no-extra"]) .extra{display:none}
     :host([data-mode="no-used"]) .extra,:host([data-mode="no-used"]) .used{display:none}
     :host([data-mode="no-meter"]) .extra,:host([data-mode="no-meter"]) .used,:host([data-mode="no-meter"]) .meter{display:none}
     :host([data-mode="no-dot"]) .extra,:host([data-mode="no-dot"]) .used,:host([data-mode="no-dot"]) .meter,:host([data-mode="no-dot"]) .status-dot{display:none}
-    :host([data-mode="icon"]) .status-dot,:host([data-mode="icon"]) .metric,:host([data-mode="icon"]) .meter,:host([data-mode="icon"]) .message{display:none}
+    :host([data-mode="icon"]) .status-dot,:host([data-mode="icon"]) .metric,:host([data-mode="icon"]) .meter,:host([data-mode="icon"]) .message,:host([data-mode="icon"]) .hub-trigger{display:none}
     :host([data-mode="icon"]) .usage{justify-content:center;gap:0}
     :host([data-mode="hidden"]){opacity:0!important;visibility:hidden!important;pointer-events:none!important}
   `;
@@ -408,14 +408,16 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
         .popover-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:30px;padding:0 9px;border-radius:8px;background:var(--color-background-button-tertiary,rgba(127,127,127,.04))}
         .popover-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-token-text-tertiary,currentColor)}
         .popover-value{flex:0 0 auto;color:var(--color-token-text-primary,currentColor);font:inherit}
-        .hub-open{appearance:none;width:100%;height:34px;margin-top:9px;border:1px solid var(--color-token-border,rgba(127,127,127,.18));border-radius:9px;background:var(--color-background-button-tertiary,rgba(127,127,127,.06));color:var(--color-token-text-primary,currentColor);font:inherit;cursor:pointer}
+        .hub-open{appearance:none;width:100%;height:34px;margin-top:9px;border:1px solid var(--color-token-border,rgba(127,127,127,.18));border-radius:9px;background:var(--color-background-button-tertiary,rgba(127,127,127,.06));color:var(--color-token-text-primary,currentColor);font:inherit;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px}
         .hub-open:hover{background:var(--color-background-button-tertiary-hover,rgba(127,127,127,.12))}
+        .hub-open svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+        .hub-open .external-icon{width:12px;height:12px}
         .tooltip{position:fixed;z-index:2147483001;max-width:min(360px,calc(100vw - 16px));padding:7px 10px;border:1px solid var(--color-token-border,rgba(127,127,127,.18));border-radius:10px;background:var(--color-token-dropdown-background,rgb(38,38,38));box-shadow:0 8px 24px rgba(0,0,0,.28);color:var(--color-token-text-primary,#fff);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:13px;line-height:18px;white-space:normal;opacity:0;visibility:hidden;transform:translateY(3px);transition:opacity .1s ease,transform .1s ease,visibility .1s;pointer-events:none}
         .tooltip.open{opacity:1;visibility:visible;transform:translateY(0)}
         @media (prefers-reduced-motion:reduce){.tooltip{transition:none}}
       </style><div id="popover" class="popover" role="dialog" aria-label="完整额度">
         <div class="popover-head"><span class="popover-head-title">额度</span><svg class="popover-head-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 0-15.22-6.49L3 8"></path><path d="M3 3v5h5"></path><path d="M3 12a9 9 0 0 0 15.22 6.49L21 16"></path><path d="M16 16h5v5"></path></svg></div>
-        <div id="popover-grid" class="popover-grid"></div><button id="open-hub" class="hub-open" type="button">打开 Balance Hub</button>
+        <div id="popover-grid" class="popover-grid"></div><button id="open-hub" class="hub-open" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1.25"></rect><rect x="14" y="4" width="6" height="6" rx="1.25"></rect><rect x="4" y="14" width="6" height="6" rx="1.25"></rect><rect x="14" y="14" width="6" height="6" rx="1.25"></rect></svg><span>打开 All API Hub</span><svg class="external-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6"></path><path d="M20 4 11 13"></path><path d="M20 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h6"></path></svg></button>
       </div><div id="tooltip" class="tooltip" role="tooltip"></div>`;
       shadow.getElementById('open-hub').addEventListener('click', () => openHub());
     }
@@ -533,6 +535,23 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     return svg;
   }
 
+  function createHubIcon() {
+    const namespace = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(namespace, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('aria-hidden', 'true');
+    for (const [x, y] of [[4, 4], [14, 4], [4, 14], [14, 14]]) {
+      const rect = document.createElementNS(namespace, 'rect');
+      rect.setAttribute('x', x);
+      rect.setAttribute('y', y);
+      rect.setAttribute('width', '6');
+      rect.setAttribute('height', '6');
+      rect.setAttribute('rx', '1.25');
+      svg.appendChild(rect);
+    }
+    return svg;
+  }
+
   function publishPageAction(action) {
     state.actionToken += 1;
     const value = `${action}|${state.actionToken}|${Date.now()}`;
@@ -553,7 +572,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     publishPageAction('open-hub');
   }
 
-  function bindUsageEvents(instance, usage, refreshButton) {
+  function bindUsageEvents(instance, usage, hubButton, refreshButton) {
     usage.addEventListener('pointerover', event => {
       const tooltipTarget = findUsageTooltipTarget(event.target);
       if (!tooltipTarget || !isUsageTooltipBoundaryCrossing(event.target, event.relatedTarget, findUsageTooltipTarget)) return;
@@ -573,6 +592,21 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       if (tooltipTarget) showUsageTooltip(instance, usage.getAttribute('aria-label') || '', tooltipTarget);
     });
     usage.addEventListener('focusout', hideUsageTooltip);
+    hubButton.addEventListener('pointerenter', () => {
+      if (state.tooltipTimer) clearTimeout(state.tooltipTimer);
+      state.tooltipTimer = setTimeout(() => {
+        state.tooltipTimer = 0;
+        showUsageTooltip(instance, '打开 All API Hub', hubButton);
+      }, 700);
+    });
+    hubButton.addEventListener('pointerleave', hideUsageTooltip);
+    hubButton.addEventListener('focus', () => showUsageTooltip(instance, '打开 All API Hub', hubButton));
+    hubButton.addEventListener('blur', hideUsageTooltip);
+    hubButton.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      openHub();
+    });
     refreshButton.addEventListener('pointerenter', () => {
       if (state.tooltipTimer) clearTimeout(state.tooltipTimer);
       state.tooltipTimer = setTimeout(() => {
@@ -595,17 +629,6 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       if (shouldScheduleLayout) state.popoverOpen = !state.popoverOpen;
       render(null, shouldScheduleLayout);
     });
-    usage.addEventListener('click', event => {
-      if (event.target?.closest?.('.refresh')) return;
-      event.preventDefault();
-      event.stopPropagation();
-      openHub();
-    });
-    usage.addEventListener('keydown', event => {
-      if (event.target !== usage || !['Enter', ' '].includes(event.key)) return;
-      event.preventDefault();
-      openHub();
-    });
   }
 
   function ensureUsageElement(instance) {
@@ -613,28 +636,36 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     if (usage && usage.getRootNode() !== instance.shadow) usage = null;
     if (!usage) usage = instance.shadow.querySelector('.usage');
     if (usage) {
+      if (!usage.__codexUsageHubButton) usage.__codexUsageHubButton = usage.querySelector('.hub-trigger');
       if (!usage.__codexUsageRefreshButton) usage.__codexUsageRefreshButton = usage.querySelector('.refresh');
       instance.root.__codexUsageElement = usage;
+      instance.root.__codexUsageHubButton = usage.__codexUsageHubButton;
       instance.root.__codexUsageRefreshButton = usage.__codexUsageRefreshButton;
       return usage;
     }
     usage = document.createElement('div');
     usage.className = 'usage';
-    usage.tabIndex = 0;
     const dot = document.createElement('span');
     dot.className = 'status-dot';
     dot.setAttribute('aria-hidden', 'true');
+    const hubButton = document.createElement('button');
+    hubButton.className = 'toolbar-action hub-trigger';
+    hubButton.type = 'button';
+    hubButton.setAttribute('aria-label', '打开 All API Hub');
+    hubButton.appendChild(createHubIcon());
     const refreshButton = document.createElement('button');
-    refreshButton.className = 'refresh';
+    refreshButton.className = 'toolbar-action refresh';
     refreshButton.type = 'button';
     refreshButton.setAttribute('aria-label', '刷新 CCSwitch 用量');
     refreshButton.appendChild(createRefreshIcon());
-    usage.append(dot, refreshButton);
+    usage.append(dot, hubButton, refreshButton);
+    usage.__codexUsageHubButton = hubButton;
     usage.__codexUsageRefreshButton = refreshButton;
     instance.root.__codexUsageElement = usage;
+    instance.root.__codexUsageHubButton = hubButton;
     instance.root.__codexUsageRefreshButton = refreshButton;
     instance.shadow.getElementById('content').replaceChildren(usage);
-    bindUsageEvents(instance, usage, refreshButton);
+    bindUsageEvents(instance, usage, hubButton, refreshButton);
     return usage;
   }
 
@@ -699,13 +730,14 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     updateElementAttribute(usage, 'data-balance-level', balanceLevel);
     updateElementAttribute(usage, 'aria-label', view.title);
     const refreshButton = usage.__codexUsageRefreshButton;
+    const hubButton = usage.__codexUsageHubButton;
     updateElementAttribute(refreshButton, 'data-loading', state.loading ? 'true' : null);
     if (instance.root.__codexUsagePayload === payload) return;
     instance.root.__codexUsageMeasurements = null;
     for (const child of [...usage.children]) {
       if (child.dataset.usageDynamic === 'true') child.remove();
     }
-    for (const element of buildUsageElements(payload, balanceLevel)) usage.insertBefore(element, refreshButton);
+    for (const element of buildUsageElements(payload, balanceLevel)) usage.insertBefore(element, hubButton);
     instance.root.__codexUsagePayload = payload;
   }
 

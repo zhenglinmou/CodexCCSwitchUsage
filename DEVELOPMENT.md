@@ -1,4 +1,6 @@
-# Development and EXE packaging workflow
+# v2 development and EXE packaging workflow
+
+> 本文只适用于 `v2` 分支。v1 的使用范围与安装方式见 [docs/V1.md](./docs/V1.md)；v2 用户说明见 [docs/V2.md](./docs/V2.md)。
 
 This document is the operational guide for developing, testing, running, packaging, upgrading, and rolling back CodexCCSwitchUsage on this computer.
 
@@ -141,7 +143,7 @@ Do not reintroduce a fixed root `max-width` or an icon-mode `flex: 0 0 28px` roo
 
 ### Codex App interaction layout performance baseline
 
-The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current injector version is `61`; its title-action transport and mounted root were smoke-tested on Codex `26.707.9981.0`. Update the exhaustive interaction baseline only after completing the corresponding full live regression.
+The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current injector version is `62`; its title-action transport and mounted root were smoke-tested on Codex `26.707.9981.0`. Update the exhaustive interaction baseline only after completing the corresponding full live regression.
 
 | Codex interaction | Expected injector geometry work |
 |---|---|

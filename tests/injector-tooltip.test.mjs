@@ -41,10 +41,11 @@ test('injector script carries an exported version for hot replacement', () => {
   assert.match(buildInjectorScript(), new RegExp(`,${INJECTOR_VERSION}\\)$`));
 });
 
-test('injector caches hot-path usage and refresh DOM references on each root', () => {
+test('injector caches hot-path usage and toolbar DOM references on each root', () => {
   const source = fs.readFileSync(new URL('../src/injector-script.mjs', import.meta.url), 'utf8');
 
   assert.match(source, /root\.__codexUsageElement/);
+  assert.match(source, /root\.__codexUsageHubButton/);
   assert.match(source, /root\.__codexUsageRefreshButton/);
   assert.match(source, /const usage = root\.__codexUsageElement/);
   assert.match(source, /const refresh = root\.__codexUsageRefreshButton/);
@@ -91,11 +92,34 @@ test('refresh button publishes an invisible title action without a Runtime bindi
   assert.doesNotMatch(script, /window\[refreshBinding\]|Runtime\.addBinding/);
 });
 
-test('balance content and icon popover publish the same v2 Balance Hub title action', () => {
+test('only dedicated Hub controls publish the v2 Balance Hub title action', () => {
   const script = buildInjectorScript();
+  const eventSource = sourceSection(script, 'function bindUsageEvents(instance, usage, hubButton, refreshButton) {', 'function ensureUsageElement(instance) {');
   assert.match(script, /publishPageAction\('open-hub'/);
   assert.doesNotMatch(script, /window\[hubBinding\]|Runtime\.addBinding/);
   assert.match(script, /id="open-hub"/);
+  assert.match(script, /hubButton\.className = 'toolbar-action hub-trigger'/);
+  assert.match(eventSource, /hubButton\.addEventListener\('click'/);
+  assert.doesNotMatch(eventSource, /usage\.addEventListener\('click'/);
+  assert.doesNotMatch(eventSource, /usage\.addEventListener\('keydown'/);
+  assert.match(script, /打开 All API Hub/);
+});
+
+test('Hub control shares refresh styling and stays inside the responsive content group', () => {
+  const source = fs.readFileSync(new URL('../src/injector-script.mjs', import.meta.url), 'utf8');
+
+  assert.match(source, /\.toolbar-action\{[^}]*width:28px[^}]*height:28px/);
+  assert.match(source, /refreshButton\.className = 'toolbar-action refresh'/);
+  assert.match(source, /usage\.append\(dot, hubButton, refreshButton\)/);
+  assert.match(source, /usage\.insertBefore\(element, hubButton\)/);
+  assert.match(source, /:host\(\[data-mode="icon"\]\)[^{]*\.hub-trigger\{display:none\}/);
+});
+
+test('refresh loading animation follows the counter-clockwise arrow direction', () => {
+  const source = fs.readFileSync(new URL('../src/injector-script.mjs', import.meta.url), 'utf8');
+
+  assert.match(source, /@keyframes codex-usage-spin\{to\{transform:rotate\(-360deg\)\}\}/);
+  assert.doesNotMatch(source, /@keyframes codex-usage-spin\{to\{transform:rotate\(360deg\)\}\}/);
 });
 
 test('hot payload rendering does not replace usage or popover innerHTML', () => {
@@ -313,7 +337,7 @@ test('balance tooltip only targets usage text', () => {
   assert.equal(findUsageTooltipTarget(target({ '.metric,.meter,.message': meter })), meter);
   assert.equal(findUsageTooltipTarget(target({ '.metric,.meter,.message': message })), message);
   assert.equal(findUsageTooltipTarget(target()), null, 'blank usage area must not trigger the balance tooltip');
-  assert.equal(findUsageTooltipTarget(target({ '.refresh': {} })), null, 'refresh button must not trigger the balance tooltip');
+  assert.equal(findUsageTooltipTarget(target({ '.refresh,.hub-trigger,.hub-open': {} })), null, 'toolbar buttons must not trigger the balance tooltip');
 });
 
 test('moving inside the usage content group does not cross its hover boundary', () => {

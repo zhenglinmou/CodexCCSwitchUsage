@@ -1,4 +1,6 @@
-# CCSwitch Balance Browser Companion
+# v2 CCSwitch Balance Browser Companion
+
+> 此浏览器伴侣仅属于 v2。v1 不包含 All API Hub、WAF 同源查询或浏览器伴侣；版本差异见 [docs/V1.md](../docs/V1.md) 与 [docs/V2.md](../docs/V2.md)。
 
 这个 MV3 伴侣扩展安装在用户日常使用的 Edge 或 Chrome profile 中，通过同一个 `127.0.0.1:17891` Balance Hub 接收查询任务并回调结果。
 
