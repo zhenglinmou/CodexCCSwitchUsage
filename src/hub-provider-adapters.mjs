@@ -28,9 +28,20 @@ function finiteOrNull(value) {
 
 function authenticationFailure(status, payload, raw = {}) {
   if (raw?.loginRequired === true) return true;
-  if ([401, 403].includes(Number(status)) && payload && typeof payload === 'object') return true;
+  if (Number(status) === 401 && payload && typeof payload === 'object') return true;
   const message = String(payload?.message || payload?.error || raw?.message || '');
   return /(?:未登录|请.{0,8}登录|登录.{0,8}(?:失效|过期)|not\s+(?:logged|signed)\s+in|unauthori[sz]ed|authentication\s+required|login\s+required|invalid\s+session)/i.test(message);
+}
+
+function interactiveWafFailure(status, payload, raw = {}) {
+  const text = String(payload?.message || payload?.error || raw?.text || raw?.error || raw?.message || '');
+  if (Number(status) === 403) return true;
+  if (payload && typeof payload === 'object') return false;
+  return /(?:cloudflare|challenge|just a moment|attention required|enable javascript|captcha|waf)/i.test(text);
+}
+
+function browserPageUnavailable(message) {
+  return /(?:frame with id .*error page|no frame with id|cannot access contents|net::err_|showing error page)/i.test(String(message || ''));
 }
 
 function providerApiBase(provider) {
@@ -215,9 +226,8 @@ export function describeProviderQuery(provider) {
       waf: true,
       requiresBrowser: true,
       notes: [
-        apiBaseUrl ? `模型 API Key 先通过 ${safeRequestUrl(apiBaseUrl, '/models')} 做能力检查` : '未找到模型 API Base URL',
         'Cookie 原文保留在当前浏览器，不回传到 Balance Hub',
-        '失败不会自动打开登录页，登录必须手动触发',
+        'WAF 或登录失败时只显示“去官网认证”，必须由用户手动触发',
       ],
     };
   }
@@ -386,15 +396,10 @@ export class ProviderQueryEngine {
     if (this.browserBroker.isConnected()) {
       return this.#queryBrowserNewApi(provider);
     }
-    const probe = await this.#probeApiKey(provider);
     return {
-      source: 'api_key_probe',
+      source: 'browser_session',
       loginRequired: false,
-      message: !this.browserBroker.isConnected()
-        ? `${probe.message}；请先连接现有 Edge/Chrome 的余额伴侣扩展`
-        : probe.valid
-          ? '模型 API Key 可用，但该站余额需要网页登录；请在 Hub 中主动打开登录页，登录后再刷新'
-          : `${probe.message}；余额需要在 Hub 中主动登录后查询`,
+      message: '现有 Edge/Chrome 的余额伴侣扩展未连接；未执行无余额价值的模型 API 探测',
     };
   }
 
@@ -404,7 +409,19 @@ export class ProviderQueryEngine {
     if (!this.browserBroker.isConnected()) {
       return { source: 'browser_session', loginRequired: false, message: '现有 Edge/Chrome 的余额伴侣扩展未连接' };
     }
-    const raw = await this.browserBroker.queryJson({ ...config, headers: {}, waitMs: kind === 'agentrouter' ? 55_000 : 40_000 });
+    let raw;
+    try {
+      raw = await this.browserBroker.queryJson({ ...config, headers: {}, waitMs: kind === 'agentrouter' ? 55_000 : 40_000 });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!browserPageUnavailable(message)) throw error;
+      return {
+        source: 'browser_session',
+        loginRequired: true,
+        websiteLoginRequired: true,
+        message: `浏览器中的官网页面当前不可用（${message}）；请打开官网登录页完成认证后手动刷新`,
+      };
+    }
     const payload = parseBrowserJson(raw?.text);
     if (raw?.identityMissing === true) {
       return {
@@ -415,10 +432,30 @@ export class ProviderQueryEngine {
       };
     }
     if (authenticationFailure(raw?.status, payload, raw)) {
-      return { source: 'browser_session', loginRequired: true, message: String(raw.message || '现有浏览器尚未登录该网站') };
+      return {
+        source: 'browser_session',
+        loginRequired: true,
+        websiteLoginRequired: true,
+        message: String(raw.message || '现有浏览器登录已失效，请手动前往官网认证'),
+      };
+    }
+    if (interactiveWafFailure(raw?.status, payload, raw)) {
+      return {
+        source: 'browser_session',
+        loginRequired: true,
+        websiteLoginRequired: true,
+        message: '第三方网站要求完成 WAF 验证，请点击“去官网认证”，完成后手动刷新',
+      };
     }
     if (!payload) {
-      throw new Error(String(raw?.error || (raw?.status ? `第三方网站返回无法解析的数据（HTTP ${raw.status}）` : '第三方网站请求没有返回有效数据')));
+      return {
+        source: 'browser_session',
+        loginRequired: true,
+        websiteLoginRequired: true,
+        message: String(raw?.error || (raw?.status
+          ? `第三方网站返回了非余额页面（HTTP ${raw.status}），可能需要在官网登录或完成 WAF 验证`
+          : '第三方网站没有返回余额数据，请打开官网登录页确认登录状态')),
+      };
     }
     if (!payload?.success || !payload?.data) {
       throw new Error(String(payload?.message || `第三方网站余额接口返回 HTTP ${Number(raw?.status) || 0}`));
@@ -438,26 +475,6 @@ export class ProviderQueryEngine {
       source: 'browser_session',
       loginRequired: false,
     };
-  }
-
-  async #probeApiKey(provider) {
-    const baseUrl = providerApiBase(provider);
-    if (!provider.apiKey || !baseUrl) return { valid: false, message: '该站没有可用的模型 API Key 或 Base URL' };
-    try {
-      const { status, payload } = await fetchJson(this.fetchImpl, `${baseUrl}/models`, {
-        Authorization: `Bearer ${provider.apiKey}`,
-        Accept: 'application/json',
-      }, 20_000);
-      const valid = status === 200 && payload && Array.isArray(payload.data);
-      const message = valid
-        ? '模型 API Key 可用'
-        : String(payload?.error?.message || payload?.message || (status === 200
-          ? '模型接口返回非标准数据，无法确认 API Key'
-          : `模型 API Key 检查返回 HTTP ${status}`));
-      return { valid, message };
-    } catch (error) {
-      return { valid: false, message: error instanceof Error ? error.message : String(error) };
-    }
   }
 
   async #queryDeepSeek(provider) {

@@ -91,7 +91,7 @@ test('refresh button publishes an invisible title action without a Runtime bindi
   assert.doesNotMatch(script, /window\[refreshBinding\]|Runtime\.addBinding/);
 });
 
-test('balance content and icon popover publish a v2 Balance Hub title action', () => {
+test('balance content and icon popover publish the same v2 Balance Hub title action', () => {
   const script = buildInjectorScript();
   assert.match(script, /publishPageAction\('open-hub'/);
   assert.doesNotMatch(script, /window\[hubBinding\]|Runtime\.addBinding/);

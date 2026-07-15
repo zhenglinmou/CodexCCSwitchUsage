@@ -45,6 +45,28 @@ test('Hub state exposes safe provider fields and refreshes with bounded concurre
   assert.equal('apiKey' in state.providers[0], false);
 });
 
+test('Hub provider sync skips state rebuilds when the repository snapshot identity is unchanged', () => {
+  let providers = [provider('one', 'DeepSeek', true)];
+  const service = new HubService({ getAll: () => providers }, { query: async () => ({}) });
+  const initialState = service.getState();
+  const initialItem = service.items.get('one');
+  assert.equal(initialState.revision, 1, 'the first snapshot must still initialize Hub state');
+
+  const unchanged = service.syncProviders();
+
+  assert.deepEqual(unchanged, { changed: false, providers });
+  assert.equal(service.getState().revision, initialState.revision);
+  assert.equal(service.items.get('one'), initialItem);
+
+  providers = [provider('one', 'DeepSeek renamed', true), provider('two', 'PackyCode')];
+  const changed = service.syncProviders();
+
+  assert.deepEqual(changed, { changed: true, providers });
+  assert.equal(service.getState().revision, initialState.revision + 1);
+  assert.equal(service.getState().providers[0].name, 'DeepSeek renamed');
+  assert.equal(service.getState().providers.length, 2);
+});
+
 test('Hub errors redact bearer tokens and preserve the last successful usage', async () => {
   const item = provider('one', 'AgentRouter');
   let fail = false;
@@ -149,6 +171,20 @@ test('Hub one-time browser session sync immediately retries the provider', async
   assert.equal(result.status, 'ok');
 });
 
+test('Hub preserves an explicit website-authentication action until the user refreshes successfully', async () => {
+  const item = provider('any', 'any的国外我自己的');
+  const service = new HubService({ getAll: () => [item] }, {
+    async openLogin() { return { synced: false, opened: true, origin: 'https://anyrouter.top' }; },
+    async query() { return { source: 'browser_session', loginRequired: true, websiteLoginRequired: true, message: '需要官网认证' }; },
+  });
+
+  await service.refreshProvider(item.id);
+  assert.equal(service.getState().providers[0].websiteLoginRequired, true);
+  const opened = await service.openLogin(item.id);
+  assert.equal(opened.websiteLoginRequired, true);
+  assert.match(opened.message, /登录页/);
+});
+
 test('Hub resolves stable aliases and exposes normalized balance responses', async () => {
   const item = provider('provider-one', 'agentrouter', true);
   const service = new HubService({ getAll: () => [item] }, {
@@ -166,6 +202,8 @@ test('Hub resolves stable aliases and exposes normalized balance responses', asy
   assert.equal(service.findProvider('agentrouter').id, item.id);
   assert.ok(service.listPublicProviders()[0].balanceUrl.endsWith('/agentrouter'));
   assert.equal(service.listPublicProviders()[0].queryMethod.requiresBrowser, true);
+  assert.equal(service.getState().providers[0].loginUrl, 'https://agentrouter.org/login');
+  assert.equal(service.listPublicProviders()[0].loginUrl, 'https://agentrouter.org/login');
   const response = await service.queryBalance('agentrouter');
   assert.equal(response.success, true);
   assert.equal(response.data.remaining, 9);

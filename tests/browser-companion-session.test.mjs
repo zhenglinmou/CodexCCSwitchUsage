@@ -9,20 +9,28 @@ import {
   selectReadySessionTab,
   SessionHintStore,
   SessionIdentityStore,
+  TrailingSingleFlight,
 } from '../browser-companion/session-state.js';
 
 function memoryStorage(initial = {}) {
   const data = { ...initial };
+  const writes = [];
   return {
     data,
+    writes,
     async get(keys) {
       const names = Array.isArray(keys) ? keys : [keys];
       return Object.fromEntries(names.filter(name => name in data).map(name => [name, data[name]]));
     },
     async set(values) {
+      writes.push({ ...values });
       Object.assign(data, values);
     },
   };
+}
+
+function delay(milliseconds) {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
 }
 
 test('browser companion persists only validated origin hints across service-worker restarts', async () => {
@@ -63,6 +71,95 @@ test('browser companion persists only the numeric New API user id needed beside 
   assert.equal(await restartedWorker.get('https://anyrouter.top'), '');
 });
 
+test('browser companion skips unchanged session hint and user id writes', async () => {
+  const storage = memoryStorage({
+    validatedSessionOrigins: ['https://anyrouter.top'],
+    sessionUserIds: { 'https://anyrouter.top': '42' },
+  });
+  const hints = new SessionHintStore(storage);
+  const identities = new SessionIdentityStore(storage);
+
+  await hints.remember('https://anyrouter.top/path');
+  await hints.forget('https://agentrouter.org');
+  await identities.remember('https://anyrouter.top', 42);
+  await identities.forget('https://agentrouter.org');
+  assert.equal(storage.writes.length, 0);
+
+  await hints.remember('https://agentrouter.org');
+  await identities.remember('https://anyrouter.top', 43);
+  assert.equal(storage.writes.length, 2);
+});
+
+test('unchanged session updates still clean legacy and non-allowlisted storage values', async () => {
+  const storage = memoryStorage({
+    validatedSessionOrigins: [
+      'https://anyrouter.top/path',
+      'https://untrusted.example',
+    ],
+    sessionUserIds: {
+      'https://anyrouter.top': '042',
+      'https://untrusted.example': '99',
+    },
+  });
+  const hints = new SessionHintStore(storage);
+  const identities = new SessionIdentityStore(storage);
+
+  await hints.remember('https://anyrouter.top');
+  await identities.remember('https://anyrouter.top', 42);
+
+  assert.deepEqual(storage.data.validatedSessionOrigins, ['https://anyrouter.top']);
+  assert.deepEqual(storage.data.sessionUserIds, { 'https://anyrouter.top': '42' });
+  assert.equal(storage.writes.length, 2);
+});
+
+test('trailing single-flight runs immediately and preserves one debounced trailing update', async () => {
+  let releaseFirst;
+  const firstBlocked = new Promise(resolve => { releaseFirst = resolve; });
+  const calls = [];
+  const control = new TrailingSingleFlight(async value => {
+    calls.push(value);
+    if (calls.length === 1) await firstBlocked;
+    return value;
+  }, 5);
+
+  const first = control.runNow('first');
+  await Promise.resolve();
+  assert.deepEqual(calls, ['first']);
+
+  control.schedule('stale');
+  control.schedule('latest');
+  await delay(10);
+  assert.deepEqual(calls, ['first'], 'the trailing task must not overlap the active task');
+
+  releaseFirst();
+  assert.equal(await first, 'first');
+  await delay(0);
+  assert.deepEqual(calls, ['first', 'latest']);
+});
+
+test('an explicit run during a flight queues the latest arguments and remains awaitable', async () => {
+  let releaseFirst;
+  const firstBlocked = new Promise(resolve => { releaseFirst = resolve; });
+  const calls = [];
+  const control = new TrailingSingleFlight(async token => {
+    calls.push(token);
+    if (calls.length === 1) await firstBlocked;
+    return token;
+  }, 5);
+
+  const first = control.runNow('old-token');
+  await Promise.resolve();
+  const queued = control.runNow('stale-token');
+  const latest = control.runNow('new-token');
+  assert.notStrictEqual(queued, first);
+  assert.strictEqual(latest, queued);
+
+  releaseFirst();
+  assert.equal(await first, 'old-token');
+  assert.equal(await queued, 'new-token');
+  assert.deepEqual(calls, ['old-token', 'new-token']);
+});
+
 test('browser session outcome retains successful New API sessions and clears real authentication failures', () => {
   const request = { baseUrl: 'https://anyrouter.top', userHeader: 'New-Api-User' };
   assert.equal(browserSessionOutcome(request, {
@@ -89,6 +186,10 @@ test('browser session outcome retains successful New API sessions and clears rea
     status: 403,
     text: '<html>Cloudflare challenge</html>',
   }), null, 'a WAF HTTP 403 without an authentication payload must remain transient');
+  assert.equal(browserSessionOutcome(request, {
+    status: 403,
+    text: '{"success":false,"message":"Cloudflare challenge required"}',
+  }), null, 'a structured WAF 403 must not erase a persisted identity');
 });
 
 test('browser session user id is extracted only from a successful matching New API response', () => {
@@ -148,7 +249,7 @@ test('browser companion bounds a whole provider job and the in-page fetch', () =
   assert.match(source, /await withTimeout\(executeJob\(job, deadline\), timeoutMs \+ 1_000/);
   assert.match(source, /const controller = new AbortController\(\);/);
   assert.match(source, /signal: controller\.signal/);
-  assert.match(source, /await heartbeat\(\)\.catch\(\(\) => \{\}\);/);
+  assert.match(source, /scheduleHeartbeat\(\);/);
 });
 
 test('only an explicit login job may create or focus a website tab', () => {
@@ -157,22 +258,24 @@ test('only an explicit login job may create or focus a website tab', () => {
   const login = source.slice(source.indexOf('async function openLogin('), source.indexOf('async function executeJob('));
 
   assert.doesNotMatch(query, /chrome\.tabs\.(?:create|update)/);
-  assert.match(login, /chrome\.tabs\.update/);
-  assert.match(login, /chrome\.tabs\.create/);
+  assert.match(login, /focusLoginPage\(request\)/);
+  assert.match(source, /chrome\.tabs\.update/);
+  assert.match(source, /chrome\.tabs\.create/);
 });
 
-test('explicit New API session sync persists an id through an inactive temporary tab', () => {
+test('explicit New API session repair uses an existing tab or visibly opens the official login page', () => {
   const source = fs.readFileSync(new URL('../browser-companion/background.js', import.meta.url), 'utf8');
   const sync = source.slice(source.indexOf('async function syncNewApiSession('), source.indexOf('async function openLogin('));
   const login = source.slice(source.indexOf('async function openLogin('), source.indexOf('async function executeJob('));
 
   assert.match(login, /if \(request\.userHeader\) return syncNewApiSession\(request, deadline\)/);
-  assert.match(sync, /chrome\.tabs\.create\(\{ url: origin, active: false \}\)/);
+  assert.match(sync, /focusLoginPage\(request\)/);
   assert.match(sync, /browserSessionUserId\(request, result\)/);
   assert.match(sync, /sessionIdentities\.remember\(origin, userId\)/);
   assert.match(sync, /sessionHints\.remember\(origin\)/);
-  assert.match(sync, /chrome\.tabs\.remove\(temporaryTab\.id\)/);
-  assert.doesNotMatch(sync, /active:\s*true|focused:\s*true/);
+  assert.doesNotMatch(sync, /temporaryTab|active:\s*false/);
+  assert.match(source, /chrome\.tabs\.create\(\{ url: loginUrl, active: true \}\)/);
+  assert.match(source, /chrome\.windows\.update\([^)]*\{ focused: true \}/);
 });
 
 test('successful browser queries remember user identity and explicit auth failures clear it', () => {
@@ -182,6 +285,48 @@ test('successful browser queries remember user identity and explicit auth failur
   assert.match(poll, /browserSessionUserId\(job\.request, value\)/);
   assert.match(poll, /sessionIdentities\.remember/);
   assert.match(poll, /outcome === 'invalid'[\s\S]*sessionIdentities\.forget/);
+});
+
+test('idle job polling announces persisted sessions once instead of re-reading them for every long poll', () => {
+  const source = fs.readFileSync(new URL('../browser-companion/background.js', import.meta.url), 'utf8');
+  const poll = source.slice(source.indexOf('async function pollOnce('), source.indexOf('async function startPolling('));
+  const polling = source.slice(source.indexOf('async function startPolling('), source.indexOf('chrome.runtime.onInstalled'));
+
+  assert.doesNotMatch(poll, /knownSessions\(\)/);
+  assert.match(polling, /await heartbeat\(current\)/);
+  assert.match(polling, /await pollOnce\(current\)/);
+  assert.match(source, /periodInMinutes:\s*1/);
+  assert.equal((source.match(/chrome\.alarms\.create\(POLL_ALARM/g) || []).length, 1);
+});
+
+test('each polling iteration reuses one config and persists lastError only when it changes', () => {
+  const source = fs.readFileSync(new URL('../browser-companion/background.js', import.meta.url), 'utf8');
+  const poll = source.slice(source.indexOf('async function pollOnce('), source.indexOf('async function startPolling('));
+  const polling = source.slice(source.indexOf('async function startPolling('), source.indexOf('async function wake('));
+  const status = source.slice(source.indexOf('function updateStatus('), source.indexOf('function apiUrl('));
+
+  assert.match(poll, /async function pollOnce\(current\)/);
+  assert.doesNotMatch(poll, /\bconfig\(\)/);
+  assert.match(polling, /const current = nextConfig \|\| await config\(\)/);
+  assert.match(polling, /await heartbeat\(current\)/);
+  assert.match(polling, /await pollOnce\(current\)/);
+  assert.match(status, /nextLastError !== lastErrorValue/);
+  assert.match(source, /lastErrorValue = String\(stored\.lastError \|\| ''\)/);
+  assert.doesNotMatch(source, /if \(lastErrorValue === undefined\) lastErrorValue = String\(stored\.lastError/);
+  assert.doesNotMatch(source, /chrome\.storage\.local\.set\(\{\s*lastError:/);
+});
+
+test('event heartbeats are 350ms trailing single-flight while startup and wake stay immediate and awaitable', () => {
+  const source = fs.readFileSync(new URL('../browser-companion/background.js', import.meta.url), 'utf8');
+  const listeners = source.slice(source.indexOf('chrome.cookies.onChanged'), source.indexOf('chrome.alarms.create'));
+  const wake = source.slice(source.indexOf('async function wake('), source.indexOf('chrome.runtime.onInstalled'));
+
+  assert.match(source, /const HEARTBEAT_DEBOUNCE_MS = 350/);
+  assert.match(source, /new TrailingSingleFlight\(performHeartbeat, HEARTBEAT_DEBOUNCE_MS\)/);
+  assert.equal((listeners.match(/scheduleHeartbeat\(\)/g) || []).length, 2);
+  assert.match(wake, /const result = await heartbeat\(current\)/);
+  assert.match(listeners, /wake\(\)\.then\(sendResponse/);
+  assert.match(source, /if \(announceSessions\)[\s\S]*await heartbeat\(current\)/);
 });
 
 test('session origin normalization accepts only the companion allowlist', () => {

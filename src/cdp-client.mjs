@@ -15,17 +15,34 @@ export class CdpClient {
 
   static async connect(url, timeoutMs = 3_000) {
     const socket = new WebSocket(url);
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('连接 Codex 调试接口超时')), timeoutMs);
-      socket.addEventListener('open', () => {
-        clearTimeout(timer);
-        resolve();
-      }, { once: true });
-      socket.addEventListener('error', () => {
-        clearTimeout(timer);
-        reject(new Error('无法连接 Codex 调试接口'));
-      }, { once: true });
-    });
+    try {
+      await new Promise((resolve, reject) => {
+        let timer;
+        const cleanup = () => {
+          clearTimeout(timer);
+          socket.removeEventListener('open', handleOpen);
+          socket.removeEventListener('error', handleError);
+        };
+        const handleOpen = () => {
+          cleanup();
+          resolve();
+        };
+        const handleError = () => {
+          cleanup();
+          reject(new Error('无法连接 Codex 调试接口'));
+        };
+
+        timer = setTimeout(() => {
+          cleanup();
+          reject(new Error('连接 Codex 调试接口超时'));
+        }, timeoutMs);
+        socket.addEventListener('open', handleOpen);
+        socket.addEventListener('error', handleError);
+      });
+    } catch (error) {
+      try { socket.close(); } catch {}
+      throw error;
+    }
     return new CdpClient(socket);
   }
 

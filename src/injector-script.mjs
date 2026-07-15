@@ -156,7 +156,7 @@ export function isNativeFlowCacheValid(cache, root, right) {
 }
 
 export const PAGE_ACTION_SENTINEL = '\u2063\u2063';
-export const INJECTOR_VERSION = 59;
+export const INJECTOR_VERSION = 61;
 
 function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, selectResponsiveUsageMode, calculateResponsiveMeasurements, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isNativeFlowCacheValid, pageActionSentinel, version) {
   const VERSION = version;

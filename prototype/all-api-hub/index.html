@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="Codex CCSwitch Usage - All API Hub 静态交互原型">
+  <title>All API Hub · 静态交互原型</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <svg class="svg-sprite" aria-hidden="true">
+    <symbol id="i-logo" viewBox="0 0 24 24"><path d="M6.2 3.8 12 1l5.8 2.8L22 9l-3.2 5.7.2 6.4-7 .9-7-.9.2-6.4L2 9l4.2-5.2Z"/><path d="m8.2 8 3.8-2 3.8 2v4L12 14l-3.8-2V8Z"/></symbol>
+    <symbol id="i-layout" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 3v18M8 9h13"/></symbol>
+    <symbol id="i-wallet" viewBox="0 0 24 24"><path d="M4 6.5A2.5 2.5 0 0 1 6.5 4H18a2 2 0 0 1 2 2v2H7a3 3 0 0 0 0 6h13v4a2 2 0 0 1-2 2H6.5A2.5 2.5 0 0 1 4 17.5v-11Z"/><path d="M20 8v6h-3.5a3 3 0 0 1 0-6H20Z"/><circle cx="16.5" cy="11" r=".7"/></symbol>
+    <symbol id="i-stack" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5M3 16l9 5 9-5"/></symbol>
+    <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 19V9M10 19V5M16 19v-7M22 19V2"/></symbol>
+    <symbol id="i-browser" viewBox="0 0 24 24"><rect x="2.5" y="3" width="19" height="18" rx="3"/><path d="M2.5 8h19M7 5.5h.01M10 5.5h.01"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5h.01"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 6v5h-5M4 18v-5h5"/><path d="M18.4 9A7 7 0 0 0 6.7 6.4L4 11M5.6 15A7 7 0 0 0 17.3 17.6L20 13"/></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9"/><path d="M19 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h5"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20.5 15.2A8.5 8.5 0 0 1 8.8 3.5 8.5 8.5 0 1 0 20.5 15.2Z"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 20 5v6c0 5.2-3.4 9.2-8 11-4.6-1.8-8-5.8-8-11V5l8-3Z"/><path d="m8.5 12 2.2 2.2 4.8-5"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 3.7 2.6 17a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 3.7a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 2 1.5 5.2L18 9l-4.5 1.8L12 16l-1.5-5.2L6 9l4.5-1.8L12 2Z"/><path d="m19 15 .8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15Z"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.1 1.1"/><path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.1-1.1"/></symbol>
+    <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></symbol>
+  </svg>
+
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <span class="brand-mark"><svg><use href="#i-logo"/></svg></span>
+        <span class="brand-copy"><strong>CCSwitch</strong><small>Usage extension</small></span>
+        <span class="prototype-badge">Prototype</span>
+      </div>
+
+      <nav class="nav" aria-label="原型页面">
+        <button class="nav-item is-active" type="button" data-view-target="integration">
+          <svg><use href="#i-layout"/></svg><span>接入预览</span>
+        </button>
+        <p class="nav-label">ALL API HUB</p>
+        <button class="nav-item" type="button" data-view-target="overview">
+          <svg><use href="#i-wallet"/></svg><span>余额总览</span><span class="nav-count">8</span>
+        </button>
+        <button class="nav-item" type="button" data-view-target="providers">
+          <svg><use href="#i-stack"/></svg><span>供应商</span><span class="nav-dot warning"></span>
+        </button>
+        <button class="nav-item" type="button" data-view-target="usage">
+          <svg><use href="#i-chart"/></svg><span>用量统计</span>
+        </button>
+        <button class="nav-item" type="button" data-view-target="companion">
+          <svg><use href="#i-browser"/></svg><span>浏览器伴侣</span><span class="nav-dot ok"></span>
+        </button>
+        <button class="nav-item" type="button" data-view-target="methods">
+          <svg><use href="#i-info"/></svg><span>查询说明</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-status">
+        <div class="status-icon"><svg><use href="#i-shield"/></svg></div>
+        <div><strong>本机服务正常</strong><span><i></i> 127.0.0.1 · 只读</span></div>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button class="icon-button mobile-menu" id="mobile-menu" type="button" aria-label="打开导航"><svg><use href="#i-menu"/></svg></button>
+          <div class="breadcrumb"><span>Codex CCSwitch Usage</span><svg><use href="#i-chevron"/></svg><strong id="page-title">接入预览</strong></div>
+        </div>
+        <div class="topbar-actions">
+          <span class="live-status"><i></i><span>宿主已连接</span></span>
+          <button class="icon-button" id="theme-toggle" type="button" aria-label="切换明暗主题" title="切换明暗主题">
+            <svg class="moon-icon"><use href="#i-moon"/></svg><svg class="sun-icon"><use href="#i-sun"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <main class="main" id="main-content">
+        <section class="view is-active" data-view="integration" aria-labelledby="integration-title">
+          <div class="view-heading integration-heading">
+            <div>
+              <span class="eyebrow"><svg><use href="#i-spark"/></svg> COMPOSER INTEGRATION</span>
+              <h1 id="integration-title">把跳转变成一个真正的按钮</h1>
+              <p>余额区域只负责展示；只有独立的 <strong>All API Hub</strong> 按钮拥有跳转行为和点击反馈。</p>
+            </div>
+            <div class="decision-pill"><span>推荐方案</span>自适应独立入口</div>
+          </div>
+
+          <article class="showcase-card composer-showcase">
+            <div class="showcase-toolbar">
+              <div>
+                <strong>Codex composer footer</strong>
+                <span>可直接点击下面的按钮体验</span>
+              </div>
+              <div class="mode-switch" role="group" aria-label="响应式模式">
+                <button class="mode-button is-active" type="button" data-composer-mode="full">宽屏</button>
+                <button class="mode-button" type="button" data-composer-mode="compact">紧凑</button>
+                <button class="mode-button" type="button" data-composer-mode="icon">极窄</button>
+              </div>
+            </div>
+
+            <div class="codex-window" data-composer-preview="full">
+              <div class="codex-window-top"><span></span><span></span><span></span><small>Codex · 当前任务</small></div>
+              <div class="codex-thread">
+                <div class="ghost-message wide"></div><div class="ghost-message"></div>
+                <div class="composer-box">
+                  <div class="composer-input">Ask Codex to build, explain, or fix anything…</div>
+                  <div class="composer-footer">
+                    <div class="native-left"><button type="button" aria-label="添加附件">＋</button><span>Full access</span></div>
+
+                    <div class="balance-lane" aria-label="余额扩展动态空闲车道">
+                      <div class="balance-content">
+                        <div class="balance-readout" title="余额信息为只读展示，不会打开 Hub">
+                          <span class="provider-orb"></span>
+                          <span class="balance-provider">AnyRouter</span>
+                          <strong>¥142.80</strong>
+                          <span class="balance-reset">72% · 4h</span>
+                        </div>
+                        <button class="composer-hub-button" type="button" data-action="open-hub" aria-label="打开 All API Hub">
+                          <svg><use href="#i-grid"/></svg><span class="hub-label">All API Hub</span><svg class="hub-external"><use href="#i-external"/></svg>
+                        </button>
+                        <button class="composer-refresh" type="button" data-action="refresh-balance" aria-label="刷新当前余额" title="刷新当前余额"><svg><use href="#i-refresh"/></svg></button>
+                        <button class="icon-mode-balance" type="button" data-action="toggle-mini-popover" aria-label="查看余额详情"><span class="provider-orb"></span></button>
+                      </div>
+
+                      <div class="mini-popover" id="mini-popover">
+                        <div class="mini-popover-head"><span><i class="provider-orb"></i>AnyRouter</span><strong>¥142.80</strong></div>
+                        <div class="mini-metrics"><span>已用 <b>¥57.20</b></span><span>剩余 <b>¥142.80</b></span></div>
+                        <div class="mini-progress"><i></i></div>
+                        <button type="button" data-action="open-hub"><svg><use href="#i-grid"/></svg>打开 All API Hub<svg><use href="#i-external"/></svg></button>
+                      </div>
+                    </div>
+
+                    <div class="native-right"><span>gpt-5.5</span><button type="button" aria-label="语音输入">⌁</button><button class="send-button" type="button" aria-label="发送">↑</button></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="interaction-legend">
+              <div><span class="legend-swatch display"></span><strong>余额展示</strong><small>默认光标 · 不可跳转</small></div>
+              <div><span class="legend-swatch hub"></span><strong>All API Hub</strong><small>独立 button · 唯一跳转入口</small></div>
+              <div><span class="legend-swatch refresh"></span><strong>刷新</strong><small>独立 button · 只刷新余额</small></div>
+            </div>
+          </article>
+
+          <div class="principle-grid">
+            <article class="principle-card"><span class="principle-index">01</span><h2>点击边界清楚</h2><p>移除整条余额容器的 pointer、tabIndex、click 和 keydown。文字与空白区域不会再误触发跳转。</p></article>
+            <article class="principle-card"><span class="principle-index">02</span><h2>入口始终可识别</h2><p>宽屏显示「网格图标 + All API Hub」；紧凑模式保留独立网格图标和 tooltip。</p></article>
+            <article class="principle-card"><span class="principle-index">03</span><h2>不破坏居中</h2><p>根容器继续铺满左右原生控件之间的动态车道，只压缩内部字段，不缩小根节点。</p></article>
+          </div>
+
+          <article class="responsive-card">
+            <div><span class="eyebrow">RESPONSIVE POLICY</span><h2>三个宽度，只有一种交互语义</h2><p>极窄模式下，余额详情通过原有图标弹层展示；Hub 仍是弹层内明确的全宽按钮，不让两个 28px 图标挤占原生控件。</p></div>
+            <div class="responsive-list"><span><b>≥ 300px</b>完整文字按钮</span><span><b>160–299px</b>独立 Hub 图标</span><span><b>&lt; 160px</b>弹层内全宽按钮</span></div>
+          </article>
+        </section>
+
+        <section class="view" data-view="overview" aria-labelledby="overview-title">
+          <div class="view-heading hub-heading">
+            <div><span class="eyebrow"><svg><use href="#i-grid"/></svg> LOCAL BALANCE CENTER</span><h1 id="overview-title">All API Hub</h1><p>统一查看所有 Codex / GPT 供应商余额、查询来源与浏览器登录状态。</p></div>
+            <div class="heading-actions"><button class="secondary-button" type="button" data-action="copy-pairing"><svg><use href="#i-browser"/></svg><span class="companion-button-label">浏览器伴侣已连接</span></button><button class="primary-button" type="button" data-action="refresh-all"><svg><use href="#i-refresh"/></svg><span>刷新全部</span></button></div>
+          </div>
+
+          <div class="summary-grid" id="summary-grid">
+            <article class="summary-card"><span class="summary-icon blue"><svg><use href="#i-stack"/></svg></span><div><span>全部供应商</span><strong data-stat="all">8</strong><small>来自 CCSwitch 只读数据库</small></div></article>
+            <article class="summary-card"><span class="summary-icon green"><svg><use href="#i-check"/></svg></span><div><span>查询正常</span><strong data-stat="ok">4</strong><small>实时或官方接口</small></div></article>
+            <article class="summary-card"><span class="summary-icon amber"><svg><use href="#i-alert"/></svg></span><div><span>需要处理</span><strong data-stat="attention">3</strong><small>登录、同步或受限</small></div></article>
+            <article class="summary-card"><span class="summary-icon violet"><svg><use href="#i-wallet"/></svg></span><div><span>可用余额折合</span><strong>¥ 1,284</strong><small>仅用于总览展示</small></div></article>
+          </div>
+
+          <div class="overview-layout">
+            <article class="panel usage-overview-card">
+              <div class="panel-heading"><div><span class="panel-kicker">近 7 天</span><h2>用量趋势</h2></div><button class="text-button" type="button" data-view-target="usage">查看完整统计 <svg><use href="#i-chevron"/></svg></button></div>
+              <div class="usage-numbers"><div><span>总请求</span><strong>12,482</strong><small class="positive">↑ 12.4%</small></div><div><span>总成本</span><strong>$ 38.24</strong><small>预算的 63%</small></div><div><span>缓存命中</span><strong>72.8%</strong><small class="positive">↑ 4.1%</small></div></div>
+              <div class="overview-chart" aria-label="7 天用量趋势图">
+                <div class="chart-grid-lines"><i></i><i></i><i></i><i></i></div>
+                <svg viewBox="0 0 720 180" preserveAspectRatio="none"><defs><linearGradient id="area-gradient" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#6ea8ff" stop-opacity=".34"/><stop offset="1" stop-color="#6ea8ff" stop-opacity="0"/></linearGradient></defs><path class="area" d="M0 150 C45 140 70 104 108 116 S175 145 210 100 S282 52 318 74 S380 126 420 92 S486 42 530 58 S596 112 630 80 S687 27 720 42 L720 180 L0 180Z"/><path class="line" d="M0 150 C45 140 70 104 108 116 S175 145 210 100 S282 52 318 74 S380 126 420 92 S486 42 530 58 S596 112 630 80 S687 27 720 42"/></svg>
+                <div class="chart-labels"><span>周三</span><span>周四</span><span>周五</span><span>周六</span><span>周日</span><span>周一</span><span>今天</span></div>
+              </div>
+            </article>
+
+            <article class="panel attention-card">
+              <div class="panel-heading"><div><span class="panel-kicker">ACTION CENTER</span><h2>需要处理</h2></div><span class="count-badge">3</span></div>
+              <div class="attention-list">
+                <button type="button" data-provider-open="openai"><span class="provider-avatar openai">O</span><span><strong>OpenAI Platform</strong><small>需要同步现有会话</small></span><svg><use href="#i-chevron"/></svg></button>
+                <button type="button" data-provider-open="agentrouter"><span class="provider-avatar agent">A</span><span><strong>AgentRouter</strong><small>WAF 受限 · 已保留缓存</small></span><svg><use href="#i-chevron"/></svg></button>
+                <button type="button" data-provider-open="packy"><span class="provider-avatar packy">P</span><span><strong>PackyCode</strong><small>官网登录已过期</small></span><svg><use href="#i-chevron"/></svg></button>
+              </div>
+              <button class="panel-footer-button" type="button" data-view-target="providers">处理全部供应商 <svg><use href="#i-chevron"/></svg></button>
+            </article>
+          </div>
+
+          <article class="panel provider-preview-panel">
+            <div class="panel-heading"><div><span class="panel-kicker">PROVIDERS</span><h2>供应商余额</h2></div><button class="text-button" type="button" data-view-target="providers">查看全部 <svg><use href="#i-chevron"/></svg></button></div>
+            <div class="provider-preview-grid" id="provider-preview-grid"></div>
+          </article>
+
+          <aside class="privacy-note"><svg><use href="#i-shield"/></svg><div><strong>隐私边界默认开启</strong><span>Cookie 不离开日常浏览器；API Key、Token 和 Cookie 原文不会进入页面；CCSwitch 数据库始终只读。</span></div></aside>
+        </section>
+
+        <section class="view" data-view="providers" aria-labelledby="providers-title">
+          <div class="view-heading">
+            <div><span class="eyebrow"><svg><use href="#i-stack"/></svg> PROVIDERS</span><h1 id="providers-title">供应商余额</h1><p>余额、额度窗口、查询来源和恢复操作集中在同一处。</p></div>
+            <div class="heading-actions"><button class="secondary-button" type="button" data-action="copy-pairing"><svg><use href="#i-link"/></svg><span class="companion-button-label">伴侣已连接</span></button><button class="primary-button" type="button" data-action="refresh-all"><svg><use href="#i-refresh"/></svg><span>刷新全部</span></button></div>
+          </div>
+
+          <div class="provider-toolbar">
+            <div class="filter-tabs" role="tablist" aria-label="供应商状态筛选">
+              <button class="filter-tab is-active" type="button" data-filter="all">全部 <span>8</span></button>
+              <button class="filter-tab" type="button" data-filter="ok">正常 <span>4</span></button>
+              <button class="filter-tab" type="button" data-filter="attention">需处理 <span>3</span></button>
+              <button class="filter-tab" type="button" data-filter="idle">待查询 <span>1</span></button>
+            </div>
+            <label class="search-field"><svg><use href="#i-search"/></svg><input id="provider-search" type="search" placeholder="搜索供应商…" autocomplete="off"></label>
+          </div>
+          <div class="provider-grid" id="provider-grid" aria-live="polite"></div>
+          <div class="provider-empty" id="provider-empty" hidden><svg><use href="#i-search"/></svg><strong>没有匹配的供应商</strong><span>请换一个关键词或筛选条件。</span></div>
+        </section>
+
+        <section class="view" data-view="usage" aria-labelledby="usage-title">
+          <div class="view-heading">
+            <div><span class="eyebrow"><svg><use href="#i-chart"/></svg> USAGE ANALYTICS</span><h1 id="usage-title">用量统计</h1><p>按日期范围查看请求、Token、缓存命中和成本。</p></div>
+            <div class="range-switch" role="group" aria-label="统计日期范围"><button type="button" data-range="7" class="is-active">7 天</button><button type="button" data-range="30">30 天</button><button type="button" data-range="90">90 天</button></div>
+          </div>
+
+          <div class="analytics-summary">
+            <article><span>总请求数</span><strong id="metric-requests">12,482</strong><small class="positive">↑ 12.4% 对比上期</small></article>
+            <article><span>输入 Token</span><strong id="metric-input">48.2M</strong><small>包含 31.4M 缓存</small></article>
+            <article><span>输出 Token</span><strong id="metric-output">6.8M</strong><small class="positive">↑ 8.2% 对比上期</small></article>
+            <article><span>估算成本</span><strong id="metric-cost">$38.24</strong><small>预算使用 63%</small></article>
+          </div>
+
+          <div class="analytics-layout">
+            <article class="panel analytics-chart-card">
+              <div class="panel-heading"><div><span class="panel-kicker">REQUESTS & COST</span><h2 id="chart-range-title">近 7 天趋势</h2></div><div class="chart-legend"><span><i class="blue"></i>请求数</span><span><i class="violet"></i>成本</span></div></div>
+              <div class="bar-chart" id="bar-chart" aria-label="用量柱状图"></div>
+            </article>
+            <article class="panel distribution-card">
+              <div class="panel-heading"><div><span class="panel-kicker">DISTRIBUTION</span><h2>供应商占比</h2></div></div>
+              <div class="donut-wrap"><div class="donut"><div><strong>12.5k</strong><span>请求</span></div></div><ul><li><i class="d1"></i><span>AnyRouter</span><b>38%</b></li><li><i class="d2"></i><span>OpenAI</span><b>26%</b></li><li><i class="d3"></i><span>DeepSeek</span><b>18%</b></li><li><i class="d4"></i><span>其他</span><b>18%</b></li></ul></div>
+            </article>
+          </div>
+
+          <article class="panel activity-panel">
+            <div class="panel-heading"><div><span class="panel-kicker">RECENT ACTIVITY</span><h2>最近查询</h2></div><button class="text-button" type="button" data-action="download-demo">导出 CSV</button></div>
+            <div class="activity-table" role="table">
+              <div class="activity-row table-head" role="row"><span>时间</span><span>供应商</span><span>查询来源</span><span>状态</span><span>耗时</span></div>
+              <div class="activity-row" role="row"><span>22:41:12</span><span><i class="provider-mini any"></i>AnyRouter</span><span>现有浏览器会话</span><span><b class="status-text ok">成功</b></span><span>482 ms</span></div>
+              <div class="activity-row" role="row"><span>22:41:11</span><span><i class="provider-mini deep"></i>DeepSeek</span><span>供应商 API</span><span><b class="status-text ok">成功</b></span><span>218 ms</span></div>
+              <div class="activity-row" role="row"><span>22:41:10</span><span><i class="provider-mini agent"></i>AgentRouter</span><span>上次缓存</span><span><b class="status-text warning">受限</b></span><span>2.4 s</span></div>
+              <div class="activity-row" role="row"><span>22:40:58</span><span><i class="provider-mini openai"></i>OpenAI</span><span>OpenAI 用量接口</span><span><b class="status-text warning">需同步</b></span><span>—</span></div>
+            </div>
+          </article>
+        </section>
+
+        <section class="view" data-view="companion" aria-labelledby="companion-title">
+          <div class="view-heading">
+            <div><span class="eyebrow"><svg><use href="#i-browser"/></svg> BROWSER COMPANION</span><h1 id="companion-title">复用你已有的浏览器登录态</h1><p>需要 Cookie 或 WAF 的余额查询在日常浏览器内执行，不创建新标签页。</p></div>
+            <button class="primary-button" type="button" data-action="copy-pairing"><svg><use href="#i-copy"/></svg><span>复制连接码</span></button>
+          </div>
+
+          <article class="companion-hero panel">
+            <div class="companion-state-icon"><span><svg><use href="#i-check"/></svg></span><i></i></div>
+            <div class="companion-state-copy"><span class="panel-kicker">CONNECTED</span><h2>浏览器伴侣已自动连接</h2><p>Microsoft Edge 126 · client-7F2A · 最后心跳刚刚</p></div>
+            <div class="companion-actions"><button class="secondary-button" type="button" data-action="test-companion">测试连接</button><button class="text-button danger" type="button" data-action="disconnect-companion">断开演示</button></div>
+          </article>
+
+          <div class="companion-layout">
+            <article class="panel setup-card">
+              <div class="panel-heading"><div><span class="panel-kicker">ONE-TIME SETUP</span><h2>首次配对只需三步</h2></div></div>
+              <ol class="setup-steps"><li><span>1</span><div><strong>加载浏览器伴侣</strong><p>在 Edge / Chrome 的扩展管理页加载本地 MV3 伴侣。</p></div></li><li><span>2</span><div><strong>保存一次连接码</strong><p>连接码和稳定 clientId 只保存在 chrome.storage.local。</p></div></li><li><span>3</span><div><strong>保持官网登录</strong><p>Hub 发起显式查询时，伴侣在同源上下文复用已有登录态。</p></div></li></ol>
+              <button class="pairing-code" type="button" data-action="copy-pairing"><code>•••• •••• 7F2A</code><span>复制连接码 <svg><use href="#i-copy"/></svg></span></button>
+            </article>
+
+            <article class="panel session-card">
+              <div class="panel-heading"><div><span class="panel-kicker">ACTIVE SESSION</span><h2>已验证会话</h2></div><span class="count-badge green">3</span></div>
+              <div class="session-list"><div><span class="provider-avatar any">A</span><span><strong>AnyRouter</strong><small>api.anyrouter.top · 已验证</small></span><b class="session-ok">正常</b></div><div><span class="provider-avatar agent">A</span><span><strong>AgentRouter</strong><small>agentrouter.org · WAF 回退</small></span><b class="session-warning">受限</b></div><div><span class="provider-avatar openai">O</span><span><strong>OpenAI Platform</strong><small>platform.openai.com · 待同步</small></span><b class="session-warning">需同步</b></div></div>
+              <p class="session-note">打开 Hub 不会自动刷新；登录页、同步与余额查询都需要你的明确点击。</p>
+            </article>
+          </div>
+
+          <div class="security-grid">
+            <article><span><svg><use href="#i-browser"/></svg></span><h2>Cookie 留在浏览器</h2><p>页面和宿主只接收归一化后的查询结果，不读取或存储 Cookie 原文。</p></article>
+            <article><span><svg><use href="#i-database"/></svg></span><h2>CCSwitch 始终只读</h2><p>供应商配置来自本地 SQLite，扩展不会改写你的 CCSwitch 数据。</p></article>
+            <article><span><svg><use href="#i-shield"/></svg></span><h2>来源严格白名单</h2><p>仅允许已验证的 HTTPS 供应商来源，同端口任务带时效与身份校验。</p></article>
+          </div>
+        </section>
+
+        <section class="view" data-view="methods" aria-labelledby="methods-title">
+          <div class="view-heading">
+            <div><span class="eyebrow"><svg><use href="#i-info"/></svg> QUERY METHODS</span><h1 id="methods-title">每一笔余额从哪里来</h1><p>查询结构透明可见，但绝不显示 API Key、Cookie、Bearer Token 或账号文件原文。</p></div>
+          </div>
+
+          <div class="method-list" id="method-list">
+            <article class="method-card is-open">
+              <button type="button" class="method-toggle" aria-expanded="true"><span class="method-number">01</span><span><strong>官方 / 供应商余额 API</strong><small>优先方案 · API Key 能直接读取 Dashboard 余额时使用</small></span><span class="method-tag ok">不依赖浏览器</span><svg><use href="#i-chevron"/></svg></button>
+              <div class="method-content"><div><span>执行位置</span><strong>Balance Hub 本机宿主</strong></div><div><span>认证类别</span><strong>CCSwitch API Key（不进入页面）</strong></div><div><span>示例供应商</span><strong>DeepSeek · PackyCode · 通用 New API</strong></div><p>请求只发送到供应商配置中的已验证 HTTPS Base URL；结果归一化为已用、剩余、总额、单位与更新时间。</p></div>
+            </article>
+            <article class="method-card">
+              <button type="button" class="method-toggle" aria-expanded="false"><span class="method-number">02</span><span><strong>现有浏览器会话</strong><small>Cookie / WAF 场景 · 在日常 Edge 或 Chrome 中查询</small></span><span class="method-tag warning">需要伴侣</span><svg><use href="#i-chevron"/></svg></button>
+              <div class="method-content"><div><span>执行位置</span><strong>浏览器伴侣 · 同源页面上下文</strong></div><div><span>认证类别</span><strong>浏览器现有登录态</strong></div><div><span>示例供应商</span><strong>AnyRouter · AgentRouter · OpenAI</strong></div><p>宿主发送短时任务，伴侣使用当前浏览器会话完成请求，只返回响应结果；查询不会创建或激活网站标签页。</p></div>
+            </article>
+            <article class="method-card">
+              <button type="button" class="method-toggle" aria-expanded="false"><span class="method-number">03</span><span><strong>OpenAI 用量接口</strong><small>官方组织用量与信用额度的专用归一化</small></span><span class="method-tag blue">专用适配</span><svg><use href="#i-chevron"/></svg></button>
+              <div class="method-content"><div><span>执行位置</span><strong>本机宿主 / 浏览器回退</strong></div><div><span>认证类别</span><strong>OpenAI 现有会话</strong></div><div><span>结果来源</span><strong>组织用量与信用额度接口</strong></div><p>直接请求可用时由本机完成；受页面会话约束时回退到已配对浏览器，不在 Hub 页面暴露 Token。</p></div>
+            </article>
+            <article class="method-card">
+              <button type="button" class="method-toggle" aria-expanded="false"><span class="method-number">04</span><span><strong>本地账号与缓存回退</strong><small>CLIProxyAPI 本地账号、健康检查和最后一次成功结果</small></span><span class="method-tag neutral">本机数据</span><svg><use href="#i-chevron"/></svg></button>
+              <div class="method-content"><div><span>执行位置</span><strong>Balance Hub 本机宿主</strong></div><div><span>失败策略</span><strong>保留最后成功余额并标记“受限”</strong></div><div><span>示例来源</span><strong>CLIProxyAPI · API 健康检查 · 上次缓存</strong></div><p>普通网络或 WAF 失败不会抹掉已知余额；明确的认证失败才进入登录或会话同步路径。</p></div>
+            </article>
+          </div>
+
+          <aside class="privacy-note large"><svg><use href="#i-shield"/></svg><div><strong>页面展示的是请求结构，不是凭据</strong><span>详情弹窗只提供 URL、HTTP 方法、认证类别、执行位置、浏览器/WAF 依赖、当前状态和结果来源。</span></div></aside>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <dialog class="provider-dialog" id="provider-dialog" aria-labelledby="dialog-provider-name">
+    <div class="dialog-shell">
+      <header class="dialog-header"><div><span class="panel-kicker">BALANCE QUERY</span><h2 id="dialog-provider-name">供应商详情</h2><p id="dialog-provider-subtitle"></p></div><button class="icon-button" id="dialog-close" type="button" aria-label="关闭"><svg><use href="#i-close"/></svg></button></header>
+      <div class="dialog-body">
+        <div class="dialog-summary"><span class="dialog-provider-avatar" id="dialog-provider-avatar">A</span><div><span id="dialog-status" class="status-badge ok">正常</span><strong id="dialog-balance">¥142.80</strong><small id="dialog-updated">刚刚更新</small></div></div>
+        <dl class="method-fields" id="dialog-method-fields"></dl>
+        <section class="implementation-notes"><h3>实现说明</h3><ul id="dialog-notes"></ul></section>
+        <p class="secret-warning"><svg><use href="#i-shield"/></svg>此处不会显示 API Key、Cookie、Bearer Token、账号文件内容或其他认证原文。</p>
+      </div>
+      <footer class="dialog-footer"><button class="secondary-button" type="button" id="dialog-secondary">关闭</button><button class="primary-button" type="button" id="dialog-primary"><svg><use href="#i-refresh"/></svg><span>刷新此供应商</span></button></footer>
+    </div>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"><span class="toast-icon"><svg><use href="#i-check"/></svg></span><span id="toast-message">操作完成</span></div>
+  <div class="sidebar-scrim" id="sidebar-scrim"></div>
+  <script src="./app.js"></script>
+</body>
+</html>

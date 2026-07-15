@@ -94,7 +94,10 @@ export class HubService {
     this.providers = new Map();
     this.refreshes = new Map();
     this.refreshAllPromise = null;
+    this.cacheBatchDepth = 0;
+    this.cacheDirty = false;
     this.revision = 0;
+    this.providerSnapshot = null;
     this.lastFullRefreshAt = '';
     this.cachedItems = readCache(this.cachePath);
     try { this.syncProviders(); } catch {}
@@ -102,6 +105,7 @@ export class HubService {
 
   syncProviders() {
     const providers = this.repository.getAll();
+    if (providers === this.providerSnapshot) return { changed: false, providers };
     const activeIds = new Set();
     for (const provider of providers) {
       activeIds.add(provider.id);
@@ -109,7 +113,8 @@ export class HubService {
       const loginConfig = loginConfiguration(provider);
       const livePrevious = this.items.get(provider.id);
       const previous = livePrevious || this.cachedItems[provider.id] || {};
-      const obsoleteSource = ['legacy_bridge', 'usage_script', 'ccswitch_cookie'].includes(String(previous.source || ''));
+      const obsoleteSource = ['legacy_bridge', 'usage_script', 'ccswitch_cookie'].includes(String(previous.source || ''))
+        || (Boolean(loginConfig?.userHeader) && previous.source === 'api_key_probe');
       const staleBrowserFailure = !livePrevious
         && previous.source === 'browser_session'
         && previous.usage
@@ -121,9 +126,10 @@ export class HubService {
         && loginConfig?.userHeader
         && /浏览器伴侣连接后将自动重试|现有浏览器尚未登录/.test(String(previous.message || ''));
       const restoredBrowserFailure = staleBrowserFailure || legacySessionSyncFailure;
+      const websiteLoginRequired = previous.websiteLoginRequired === true;
       const sessionSyncRequired = Boolean(
-        previous.sessionSyncRequired
-        || (restoredBrowserFailure && loginConfig?.userHeader),
+        !websiteLoginRequired
+        && (previous.sessionSyncRequired || (restoredBrowserFailure && loginConfig?.userHeader))
       );
       this.items.set(provider.id, {
         id: provider.id,
@@ -134,14 +140,18 @@ export class HubService {
         message: obsoleteSource
           ? '等待 v2 独立余额中心重新查询'
           : restoredBrowserFailure
-            ? (sessionSyncRequired
+            ? (websiteLoginRequired
+              ? '显示上次成功余额；请点击“去官网认证”，完成后手动刷新'
+              : sessionSyncRequired
               ? '显示上次成功余额；请点击“同步现有会话”一次'
               : '显示上次成功余额；请手动重新登录后刷新')
             : String(previous.message || ''),
         source: obsoleteSource ? 'cached_previous' : String(previous.source || ''),
         loginSupported: Boolean(loginConfig),
+        loginUrl: safeWebsiteUrl(loginConfig?.loginUrl),
         sessionSyncSupported: Boolean(loginConfig?.userHeader),
         sessionSyncRequired,
+        websiteLoginRequired,
         queryMethod: describeProviderQuery(provider),
         usage: previous.usage || null,
         updatedAt: String(previous.updatedAt || ''),
@@ -154,8 +164,9 @@ export class HubService {
       }
     }
     this.cachedItems = {};
+    this.providerSnapshot = providers;
     this.revision += 1;
-    return providers;
+    return { changed: true, providers };
   }
 
   getState() {
@@ -184,6 +195,7 @@ export class HubService {
         aliases: providerAliases(provider),
         current: provider.isCurrent,
         loginSupported: Boolean(loginConfig),
+        loginUrl: safeWebsiteUrl(loginConfig?.loginUrl),
         sessionSyncSupported: Boolean(loginConfig?.userHeader),
         queryMethod: describeProviderQuery(provider),
         balanceUrl: `/v1/balance/${encodeURIComponent(providerAliases(provider).at(-1) || provider.id)}`,
@@ -210,6 +222,7 @@ export class HubService {
           message: usage ? (result.degraded ? 'API 可用性检查未通过，显示本地统计' : '') : safeMessage(result.message || '没有返回可显示的额度数据'),
           source: String(result.source || ''),
           sessionSyncRequired: result.sessionSyncRequired === true,
+          websiteLoginRequired: result.websiteLoginRequired === true,
           usage: usage || this.items.get(id).usage,
           updatedAt: String(usage?.updatedAt || new Date().toISOString()),
         };
@@ -241,6 +254,7 @@ export class HubService {
     this.syncProviders();
     const ids = [...this.providers.keys()];
     this.refreshAllPromise = (async () => {
+      this.cacheBatchDepth += 1;
       let cursor = 0;
       const worker = async () => {
         while (cursor < ids.length) {
@@ -252,9 +266,12 @@ export class HubService {
       await Promise.all(Array.from({ length: Math.min(this.concurrency, ids.length) }, worker));
       this.lastFullRefreshAt = new Date().toISOString();
       this.revision += 1;
-      this.#writeCache();
       return this.getState();
-    })().finally(() => { this.refreshAllPromise = null; });
+    })().finally(() => {
+      this.cacheBatchDepth = Math.max(0, this.cacheBatchDepth - 1);
+      if (this.cacheDirty) this.#writeCache();
+      this.refreshAllPromise = null;
+    });
     return this.refreshAllPromise;
   }
 
@@ -285,6 +302,7 @@ export class HubService {
       ...item,
       status: item.usage ? item.status : 'login-required',
       sessionSyncRequired: Boolean(item.sessionSyncSupported && !action?.opened),
+      websiteLoginRequired: action?.opened === true,
       message: safeMessage(action?.message || (action?.opened
         ? '已在现有浏览器中打开登录页；登录完成后回到 Hub 手动点击刷新'
         : '未能同步现有浏览器会话，请先在官网确认登录状态')),
@@ -324,10 +342,15 @@ export class HubService {
 
   #writeCache() {
     if (!this.cachePath) return;
+    if (this.cacheBatchDepth > 0) {
+      this.cacheDirty = true;
+      return;
+    }
     try {
       const temporary = `${this.cachePath}.tmp`;
       fs.writeFileSync(temporary, JSON.stringify({ version: 2, providers: [...this.items.values()] }), 'utf8');
       fs.renameSync(temporary, this.cachePath);
+      this.cacheDirty = false;
     } catch {}
   }
 }

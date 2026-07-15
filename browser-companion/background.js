@@ -7,15 +7,19 @@ import {
   SESSION_ORIGINS,
   SessionHintStore,
   SessionIdentityStore,
+  TrailingSingleFlight,
 } from './session-state.js';
 
 const HUB_ORIGIN = 'http://127.0.0.1:17891';
 const POLL_ALARM = 'ccswitch-balance-companion-poll';
+const HEARTBEAT_DEBOUNCE_MS = 350;
 const manifest = chrome.runtime.getManifest();
 const sessionHints = new SessionHintStore(chrome.storage.local);
 const sessionIdentities = new SessionIdentityStore(chrome.storage.local);
 const instanceId = crypto.randomUUID();
 let polling = false;
+let lastErrorValue;
+let statusUpdateChain = Promise.resolve();
 
 function delay(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -39,13 +43,33 @@ function browserName() {
 }
 
 async function config() {
-  const stored = await chrome.storage.local.get(['hubToken', 'clientId']);
+  const stored = await chrome.storage.local.get(['hubToken', 'clientId', 'lastError']);
   let clientId = stored.clientId;
   if (!/^[A-Za-z0-9_-]{8,128}$/.test(String(clientId || ''))) {
     clientId = crypto.randomUUID();
     await chrome.storage.local.set({ clientId });
   }
-  return { token: String(stored.hubToken || '').trim(), clientId };
+  lastErrorValue = String(stored.lastError || '');
+  return { token: String(stored.hubToken || '').trim(), clientId, lastError: lastErrorValue };
+}
+
+function updateStatus({ lastHeartbeatAt, lastError } = {}) {
+  const hasLastError = lastError !== undefined;
+  const nextLastError = hasLastError ? String(lastError || '') : '';
+  statusUpdateChain = statusUpdateChain.catch(() => {}).then(async () => {
+    if (lastErrorValue === undefined) {
+      const stored = await chrome.storage.local.get(['lastError']);
+      lastErrorValue = String(stored.lastError || '');
+    }
+    const update = {};
+    if (lastHeartbeatAt) update.lastHeartbeatAt = lastHeartbeatAt;
+    if (hasLastError && nextLastError !== lastErrorValue) update.lastError = nextLastError;
+    if (!Object.keys(update).length) return false;
+    await chrome.storage.local.set(update);
+    if (Object.hasOwn(update, 'lastError')) lastErrorValue = nextLastError;
+    return true;
+  });
+  return statusUpdateChain;
 }
 
 function apiUrl(token, path) {
@@ -82,35 +106,33 @@ async function post(token, path, body) {
   return response.json();
 }
 
-async function heartbeat() {
-  const current = await config();
-  if (!current.token) return { connected: false, configured: false };
+async function performHeartbeat(current) {
+  const resolved = current || await config();
+  if (!resolved.token) return { connected: false, configured: false };
   const payload = {
-    clientId: current.clientId,
+    clientId: resolved.clientId,
     instanceId,
     browser: browserName(),
     version: manifest.version,
     sessions: await knownSessions(),
   };
-  const result = await post(current.token, '/companion/heartbeat', payload);
-  await chrome.storage.local.set({ lastHeartbeatAt: new Date().toISOString(), lastError: '' });
+  const result = await post(resolved.token, '/companion/heartbeat', payload);
+  await updateStatus({ lastHeartbeatAt: new Date().toISOString(), lastError: '' });
   return { connected: true, configured: true, companion: result.companion };
+}
+
+const heartbeatControl = new TrailingSingleFlight(performHeartbeat, HEARTBEAT_DEBOUNCE_MS);
+
+function heartbeat(current) {
+  return heartbeatControl.runNow(current);
+}
+
+function scheduleHeartbeat() {
+  heartbeatControl.schedule();
 }
 
 async function matchingTabs(origin) {
   try { return await chrome.tabs.query({ url: `${origin}/*` }); } catch { return []; }
-}
-
-async function waitForTab(tabId, timeoutMs) {
-  const deadline = Date.now() + Math.max(2_000, timeoutMs);
-  while (Date.now() < deadline) {
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      if (tab.status === 'complete') return tab;
-    } catch { break; }
-    await delay(250);
-  }
-  throw new Error('等待第三方网站页面加载超时');
 }
 
 async function fetchInsideTab(tabId, request, timeoutMs) {
@@ -189,36 +211,39 @@ async function fetchFromExtension(request, userId, timeoutMs) {
 async function syncNewApiSession(request, deadline) {
   const origin = new URL(request.baseUrl).origin;
   const tabs = (await matchingTabs(origin)).filter(tab => tab.id != null);
-  let preferred = selectReadySessionTab(tabs);
-  let temporaryTab = null;
-  try {
-    if (!preferred) {
-      temporaryTab = await chrome.tabs.create({ url: origin, active: false });
-      preferred = await waitForTab(temporaryTab.id, Math.max(1_000, deadline - Date.now()));
-    }
-    const result = await fetchInsideTab(preferred.id, request, Math.max(1_000, deadline - Date.now()));
-    const userId = browserSessionUserId(request, result);
-    if (!userId) {
-      const outcome = browserSessionOutcome(request, result);
-      return {
-        synced: false,
-        opened: false,
-        origin,
-        loginRequired: outcome === 'invalid',
-        message: outcome === 'invalid'
-          ? '现有浏览器 Cookie 已失效，请先在官网完成登录'
-          : String(result.error || '未能从现有浏览器同步数字用户 ID'),
-      };
-    }
-    await sessionIdentities.remember(origin, userId);
-    await sessionHints.remember(origin);
-    heartbeat().catch(() => {});
-    return { synced: true, opened: false, origin };
-  } finally {
-    if (temporaryTab?.id != null) {
-      try { await chrome.tabs.remove(temporaryTab.id); } catch {}
-    }
+  const preferred = selectReadySessionTab(tabs);
+  if (!preferred) return focusLoginPage(request);
+  const result = await fetchInsideTab(preferred.id, request, Math.max(1_000, deadline - Date.now()));
+  const userId = browserSessionUserId(request, result);
+  if (!userId) {
+    const opened = await focusLoginPage(request);
+    const outcome = browserSessionOutcome(request, result);
+    return {
+      ...opened,
+      loginRequired: outcome === 'invalid',
+      message: outcome === 'invalid'
+        ? '现有浏览器登录已失效，已打开官网；完成认证后请手动刷新'
+        : String(result.error || '未能同步网站用户身份，已打开官网；完成认证后请手动刷新'),
+    };
   }
+  await sessionIdentities.remember(origin, userId);
+  await sessionHints.remember(origin);
+  scheduleHeartbeat();
+  return { synced: true, opened: false, origin };
+}
+
+async function focusLoginPage(request) {
+  const loginUrl = String(request.loginUrl || request.baseUrl || '');
+  if (!loginUrl.startsWith('https://')) throw new Error('登录地址无效');
+  const origin = new URL(loginUrl).origin;
+  const tabs = (await matchingTabs(origin)).filter(tab => tab.id != null);
+  if (tabs.length) {
+    await chrome.tabs.update(tabs[0].id, { url: loginUrl, active: true });
+    if (tabs[0].windowId != null) await chrome.windows.update(tabs[0].windowId, { focused: true });
+  } else {
+    await chrome.tabs.create({ url: loginUrl, active: true });
+  }
+  return { opened: true, origin };
 }
 
 async function queryThroughCurrentBrowser(request, deadline) {
@@ -238,17 +263,7 @@ async function queryThroughCurrentBrowser(request, deadline) {
 
 async function openLogin(request, deadline) {
   if (request.userHeader) return syncNewApiSession(request, deadline);
-  const loginUrl = String(request.loginUrl || request.baseUrl || '');
-  if (!loginUrl.startsWith('https://')) throw new Error('登录地址无效');
-  const origin = new URL(loginUrl).origin;
-  const tabs = (await matchingTabs(origin)).filter(tab => tab.id != null);
-  if (tabs.length) {
-    await chrome.tabs.update(tabs[0].id, { url: loginUrl, active: true });
-    if (tabs[0].windowId != null) await chrome.windows.update(tabs[0].windowId, { focused: true });
-  } else {
-    await chrome.tabs.create({ url: loginUrl, active: true });
-  }
-  return { opened: true, origin };
+  return focusLoginPage(request);
 }
 
 async function executeJob(job, deadline) {
@@ -257,11 +272,9 @@ async function executeJob(job, deadline) {
   throw new Error(`不支持的浏览器任务: ${job.type}`);
 }
 
-async function pollOnce() {
-  const current = await config();
+async function pollOnce(current) {
   if (!current.token) return false;
   const query = new URLSearchParams({ clientId: current.clientId, instanceId, browser: browserName(), version: manifest.version });
-  for (const origin of await knownSessions()) query.append('session', origin);
   const response = await fetch(apiUrl(current.token, `/companion/job?${query}`), { cache: 'no-store' });
   if (response.status === 204) return true;
   if (!response.ok) throw new Error(`Balance Hub job poll returned HTTP ${response.status}`);
@@ -283,35 +296,37 @@ async function pollOnce() {
       await sessionIdentities.forget(sessionOrigin);
     }
     await post(current.token, `/companion/result/${encodeURIComponent(job.id)}`, { ok: true, value });
-    if (outcome) heartbeat().catch(() => {});
+    if (outcome) scheduleHeartbeat();
   } catch (error) {
     await post(current.token, `/companion/result/${encodeURIComponent(job.id)}`, {
       ok: false,
       message: error instanceof Error ? error.message : String(error),
     });
-    await heartbeat().catch(() => {});
+    scheduleHeartbeat();
   }
   return true;
 }
 
-async function startPolling() {
+async function startPolling(initialConfig = null, sessionsAnnounced = false) {
   if (polling) return;
   polling = true;
-  let announceSessions = true;
+  let nextConfig = initialConfig;
+  let announceSessions = !sessionsAnnounced;
   try {
     for (let iteration = 0; iteration < 120; iteration += 1) {
-      const current = await config();
+      const current = nextConfig || await config();
+      nextConfig = null;
       if (!current.token) break;
       try {
         if (announceSessions) {
-          await heartbeat();
+          await heartbeat(current);
           announceSessions = false;
         }
-        await pollOnce();
-        await chrome.storage.local.set({ lastError: '' });
+        await pollOnce(current);
+        await updateStatus({ lastError: '' });
       } catch (error) {
         announceSessions = true;
-        await chrome.storage.local.set({ lastError: error instanceof Error ? error.message : String(error) });
+        await updateStatus({ lastError: error instanceof Error ? error.message : String(error) });
         await delay(2_000);
       }
     }
@@ -320,8 +335,19 @@ async function startPolling() {
   }
 }
 
+async function wake() {
+  const current = await config();
+  let sessionsAnnounced = false;
+  try {
+    const result = await heartbeat(current);
+    sessionsAnnounced = result.connected === true;
+    return result;
+  } finally {
+    startPolling(current, sessionsAnnounced);
+  }
+}
+
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
   startPolling();
 });
 chrome.runtime.onStartup.addListener(() => startPolling());
@@ -331,29 +357,28 @@ chrome.alarms.onAlarm.addListener(alarm => {
 chrome.cookies.onChanged.addListener(change => {
   const domain = String(change.cookie?.domain || '').replace(/^\./, '');
   const origin = SESSION_ORIGINS.find(value => new URL(value).hostname === domain || new URL(value).hostname.endsWith(`.${domain}`));
-  if (origin) heartbeat().catch(() => {});
+  if (origin) scheduleHeartbeat();
 });
 chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
   if (changeInfo.status !== 'complete' || !tab.url) return;
   try {
     const origin = new URL(tab.url).origin;
-    if (SESSION_ORIGINS.includes(origin)) heartbeat().catch(() => {});
+    if (SESSION_ORIGINS.includes(origin)) scheduleHeartbeat();
   } catch {}
 });
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'wake') {
-    startPolling();
-    heartbeat().then(sendResponse, error => sendResponse({ connected: false, error: error.message }));
+    wake().then(sendResponse, error => sendResponse({ connected: false, error: error.message }));
     return true;
   }
   if (message?.type === 'status') {
-    Promise.all([config(), chrome.storage.local.get(['lastHeartbeatAt', 'lastError'])]).then(([current, state]) => {
-      sendResponse({ configured: Boolean(current.token), lastHeartbeatAt: state.lastHeartbeatAt || '', lastError: state.lastError || '' });
+    Promise.all([config(), chrome.storage.local.get(['lastHeartbeatAt'])]).then(([current, state]) => {
+      sendResponse({ configured: Boolean(current.token), lastHeartbeatAt: state.lastHeartbeatAt || '', lastError: current.lastError });
     });
     return true;
   }
   return false;
 });
 
-chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
+chrome.alarms.create(POLL_ALARM, { periodInMinutes: 1 });
 startPolling();

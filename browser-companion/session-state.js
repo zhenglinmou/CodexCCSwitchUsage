@@ -21,9 +21,97 @@ export function normalizeSessionOrigins(values) {
   return [...new Set((Array.isArray(values) ? values : []).map(normalizeSessionOrigin).filter(Boolean))];
 }
 
+function hasCanonicalSessionOrigins(value, normalized) {
+  if (value === undefined) return normalized.length === 0;
+  return Array.isArray(value)
+    && value.length === normalized.length
+    && value.every((origin, index) => origin === normalized[index]);
+}
+
 export function browserJobTimeout(request = {}) {
   const requested = Number(request.waitMs);
   return Math.max(5_000, Math.min(35_000, Number.isFinite(requested) && requested > 0 ? requested : 30_000));
+}
+
+export class TrailingSingleFlight {
+  constructor(operation, delayMs = 350) {
+    if (typeof operation !== 'function') throw new TypeError('operation must be a function');
+    this.operation = operation;
+    this.delayMs = Math.max(0, Number(delayMs) || 0);
+    this.inFlight = null;
+    this.timer = null;
+    this.pending = false;
+    this.pendingArguments = [];
+    this.queuedImmediate = null;
+  }
+
+  runNow(...args) {
+    if (this.inFlight) {
+      this.#cancelPending();
+      if (!this.queuedImmediate) {
+        let resolve;
+        let reject;
+        const promise = new Promise((onFulfilled, onRejected) => {
+          resolve = onFulfilled;
+          reject = onRejected;
+        });
+        this.queuedImmediate = { args, promise, resolve, reject };
+      } else {
+        this.queuedImmediate.args = args;
+      }
+      return this.queuedImmediate.promise;
+    }
+    this.#cancelPending();
+    return this.#start(args);
+  }
+
+  schedule(...args) {
+    if (this.queuedImmediate) return;
+    this.pending = true;
+    this.pendingArguments = args;
+    if (this.timer !== null) clearTimeout(this.timer);
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.#flush();
+    }, this.delayMs);
+  }
+
+  #start(args) {
+    const operation = Promise.resolve().then(() => this.operation(...args));
+    this.inFlight = operation;
+    operation.then(
+      () => this.#settled(operation),
+      () => this.#settled(operation),
+    );
+    return operation;
+  }
+
+  #settled(operation) {
+    if (this.inFlight !== operation) return;
+    this.inFlight = null;
+    if (this.queuedImmediate) {
+      const queued = this.queuedImmediate;
+      this.queuedImmediate = null;
+      this.#start(queued.args).then(queued.resolve, queued.reject);
+      return;
+    }
+    if (this.pending && this.timer === null) this.#flush();
+  }
+
+  #flush() {
+    if (!this.pending || this.inFlight) return;
+    const args = this.pendingArguments;
+    this.pending = false;
+    this.pendingArguments = [];
+    this.#start(args).catch(() => {});
+  }
+
+  #cancelPending() {
+    if (this.timer !== null) clearTimeout(this.timer);
+    this.timer = null;
+    this.pending = false;
+    this.pendingArguments = [];
+  }
 }
 
 export function selectReadySessionTab(tabs) {
@@ -54,6 +142,15 @@ function normalizeSessionUserIds(value) {
     if (userId) result[origin] = userId;
   }
   return result;
+}
+
+function hasCanonicalSessionUserIds(value, normalized) {
+  if (value === undefined) return Object.keys(normalized).length === 0;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  const normalizedKeys = Object.keys(normalized);
+  return keys.length === normalizedKeys.length
+    && keys.every(origin => typeof value[origin] === 'string' && value[origin] === normalized[origin]);
 }
 
 export class SessionHintStore {
@@ -87,8 +184,12 @@ export class SessionHintStore {
 
   #update(transform) {
     this.updateChain = this.updateChain.catch(() => {}).then(async () => {
-      const current = await this.list();
+      const stored = await this.storage.get([this.key]);
+      const raw = stored?.[this.key];
+      const current = normalizeSessionOrigins(raw);
       const next = normalizeSessionOrigins(transform(current));
+      const unchanged = current.length === next.length && current.every((value, index) => value === next[index]);
+      if (unchanged && hasCanonicalSessionOrigins(raw, current)) return current;
       await this.storage.set({ [this.key]: next });
       return next;
     });
@@ -130,8 +231,11 @@ export class SessionIdentityStore {
   #update(transform) {
     this.updateChain = this.updateChain.catch(() => {}).then(async () => {
       const stored = await this.storage.get([this.key]);
-      const current = normalizeSessionUserIds(stored?.[this.key]);
+      const raw = stored?.[this.key];
+      const current = normalizeSessionUserIds(raw);
       const next = normalizeSessionUserIds(transform(current));
+      const unchanged = SESSION_ORIGINS.every(origin => current[origin] === next[origin]);
+      if (unchanged && hasCanonicalSessionUserIds(raw, current)) return current;
       await this.storage.set({ [this.key]: next });
       return next;
     });
@@ -151,9 +255,9 @@ export function browserSessionOutcome(request = {}, result = {}) {
   } catch {
     return null;
   }
-  if (status === 401 || status === 403) return 'invalid';
+  if (status === 401) return 'invalid';
   if (status < 200 || status >= 500) return null;
-  if (payload?.success === true && payload.data && typeof payload.data === 'object') return 'valid';
+  if (status < 400 && payload?.success === true && payload.data && typeof payload.data === 'object') return 'valid';
   const message = String(payload?.message || payload?.error || '');
   if (payload?.success === false && /(?:未登录|请.{0,8}登录|登录.{0,8}(?:失效|过期)|not\s+(?:logged|signed)\s+in|unauthori[sz]ed|authentication\s+required|login\s+required|invalid\s+session)/i.test(message)) {
     return 'invalid';

@@ -48,6 +48,13 @@ test('Hub server protects its local page and API with an unguessable path token'
   assert.match(html, /同步现有会话/);
   assert.match(html, /sessionSyncSupported/);
   assert.match(html, /item\.sessionSyncRequired/);
+  assert.match(html, /item\.websiteLoginRequired/);
+  assert.match(html, /loginLinkFor\(item\)/);
+  assert.match(html, /重新登录官网/);
+  assert.match(html, /官方登录页/);
+  assert.doesNotMatch(html, /item\.loginSupported&&\(item\.status==='login-required'/);
+  assert.doesNotMatch(html, /setInterval\(load/);
+  assert.match(html, /scheduleOperationMonitor/);
   assert.match(html, /需要同步/);
   assert.doesNotMatch(html, /已在现有浏览器中打开登录页/);
   assert.match(html, /无需重复配置/);

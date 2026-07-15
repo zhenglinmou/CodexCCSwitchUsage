@@ -173,12 +173,15 @@ export class HubServer {
     }
     if (request.method === 'GET' && url.pathname === `${this.apiPath}/companion/job`) {
       if (!this.browserBroker) throw new Error('浏览器伴侣回调未启用');
+      const sessions = url.searchParams.has('sessionsKnown') || url.searchParams.has('session')
+        ? url.searchParams.getAll('session')
+        : undefined;
       const job = await this.browserBroker.nextJob({
         clientId: url.searchParams.get('clientId'),
         instanceId: url.searchParams.get('instanceId'),
         browser: url.searchParams.get('browser'),
         version: url.searchParams.get('version'),
-        sessions: url.searchParams.getAll('session'),
+        sessions,
       });
       if (!job) {
         response.writeHead(204, { 'cache-control': 'no-store' });

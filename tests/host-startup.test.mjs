@@ -41,7 +41,7 @@ test('host owns no browser-wide discovery or long-lived target sessions', () => 
 
 test('target synchronization uses only HTTP snapshots and one-shot primary-page installs', () => {
   const source = hostSource();
-  const sync = source.slice(source.indexOf('async function syncTargets('), source.indexOf('function requestUsageRefresh('));
+  const sync = source.slice(source.indexOf('async function syncTargets('), source.indexOf('function requestTargetSync('));
 
   assert.match(sync, /let allTargets = await listCdpTargets\(args\.port\)/);
   assert.match(sync, /isCodexTargetCandidate\(target\)/);
@@ -49,7 +49,7 @@ test('target synchronization uses only HTTP snapshots and one-shot primary-page 
   assert.match(sync, /await settleTargetOperations\(targetActions,/);
   assert.match(sync, /installTargetOnce\(/);
   assert.match(sync, /const targetIdentityChanged =/);
-  assert.match(sync, /allTargets = await listCdpTargets\(args\.port\)/);
+  assert.ok((sync.match(/listCdpTargets\(args\.port\)/g) || []).length >= 2);
   assert.doesNotMatch(sync, /includeAuxiliary|auxiliaryTargets|cleanupAuxiliaryTarget|disposeTargetInjector/);
 });
 
@@ -68,6 +68,15 @@ test('an injector audit deferred by Browse remains pending until a safe target s
 
   assert.match(request, /const currentAudit = targetAuditPending;/);
   assert.match(request, /catch \(error\) \{[\s\S]*targetAuditPending \|\|= currentAudit;/);
+});
+
+test('a failed injector audit never accelerates maintenance beyond the one-second action poll', () => {
+  const source = hostSource();
+  const delay = source.slice(source.indexOf('function nextMaintenanceDelay('), source.indexOf('async function loop('));
+
+  assert.match(delay, /const injectorAuditDelay = targetAuditPending\s*\? PAGE_ACTION_POLL_MS\s*: until\(lastInjectorAuditAt, INJECTOR_AUDIT_MS\)/);
+  assert.match(delay, /controlWatcher \? injectorAuditDelay : WATCHER_RETRY_MS/);
+  assert.match(delay, /PAGE_ACTION_POLL_MS,\s*injectorAuditDelay,/);
 });
 
 test('status reports mounted primary pages while event-driven CDP remains disabled', () => {
@@ -90,19 +99,28 @@ test('host watches explicit remount requests from the launcher', () => {
 test('host schedules only the current CCSwitch provider and leaves Hub providers manual', () => {
   const source = hostSource();
   const loop = source.slice(source.indexOf('async function loop()'), source.indexOf('function shutdown('));
-  const sync = source.slice(source.indexOf('async function syncTargets('), source.indexOf('function requestTargetSync('));
 
-  assert.match(source, /const FALLBACK_POLL_MS = 1_000;/);
+  assert.match(source, /const CURRENT_PROVIDER_REFRESH_MS = 300_000;/);
+  assert.match(source, /const WATCHER_RETRY_MS = 1_000;/);
+  assert.match(source, /const PAGE_ACTION_POLL_MS = 1_000;/);
+  assert.match(source, /const DATABASE_AUDIT_MS = 60_000;/);
   assert.match(source, /const STATUS_HEARTBEAT_MS = 300_000;/);
   assert.match(loop, /repository\.getChangeToken\(\)/);
-  assert.match(loop, /await waitForFallbackPoll\(FALLBACK_POLL_MS\)/);
-  assert.match(loop, /requestTargetSync\(\{ audit: auditDue \|\| databaseChanged \}\)/);
-  assert.match(sync, /item\.action\.action === 'refresh'[\s\S]*await refreshCurrentProvider\(true\)/);
-  assert.match(source, /provider\.usage\?\.autoQueryInterval/);
+  assert.match(loop, /databaseAuditDue/);
+  assert.match(loop, /requestTargetSync\(\{ audit: auditDue \|\| providersChanged \}\)/);
+  assert.doesNotMatch(source, /provider\.usage\?\.autoQueryInterval/);
   assert.match(source, /hubService\.refreshProvider\(provider\.id\)/);
-  assert.match(loop, /requestCurrentProviderRefresh\(false, true\)/);
-  assert.match(loop, /databaseChanged \? requestCurrentProviderRefresh\(false, true\)/);
+  assert.match(loop, /providersChanged \? requestCurrentProviderRefresh\(false, true\)/);
+  assert.match(source, /item\.action\.action === 'refresh'[\s\S]*await refreshCurrentProvider\(true\)/);
   assert.doesNotMatch(source, /hubService\.refreshAll\(\)|refreshBrowserProviders|observeBrowserCompanion/);
+});
+
+test('host keeps only the bounded page-title action poll for responsive composer actions', () => {
+  const source = hostSource();
+
+  assert.match(source, /const PAGE_ACTION_POLL_MS = 1_000/);
+  assert.match(source, /decodePageActionMarker|lastActionSignature/);
+  assert.doesNotMatch(source, /actionEndpoint|onAction:\s*handlePageAction/);
 });
 
 test('current-provider scheduling resumes from the cached query timestamp after a host reload', () => {
@@ -128,5 +146,7 @@ test('database watcher coalesces file bursts with a low-latency debounce', () =>
   assert.ok(debounce, 'database watcher debounce must remain explicit');
   assert.ok(Number(debounce[1]) >= 75 && Number(debounce[1]) <= 150, 'debounce should coalesce WAL bursts without visible delay');
   assert.match(watcher, /if \(databaseWatchTimer\) clearTimeout\(databaseWatchTimer\)/);
+  assert.match(watcher, /const providersChanged = syncHubProviders\(\)/);
+  assert.match(watcher, /if \(providersChanged\) requestCurrentProviderRefresh\(false, true\)/);
   assert.match(watcher, /}, DATABASE_WATCH_DEBOUNCE_MS\);/);
 });

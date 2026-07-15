@@ -5,20 +5,94 @@ import { CdpClient, hasAuxiliaryPageTargets, isCodexTargetCandidate } from '../s
 class FakeSocket {
   constructor() {
     this.listeners = new Map();
+    this.closeCalls = 0;
   }
 
-  addEventListener(name, listener) {
+  addEventListener(name, listener, options = {}) {
     if (!this.listeners.has(name)) this.listeners.set(name, []);
-    this.listeners.get(name).push(listener);
+    this.listeners.get(name).push({ listener, once: Boolean(options.once) });
+  }
+
+  removeEventListener(name, listener) {
+    const listeners = this.listeners.get(name);
+    if (!listeners) return;
+    const remaining = listeners.filter(entry => entry.listener !== listener);
+    if (remaining.length > 0) this.listeners.set(name, remaining);
+    else this.listeners.delete(name);
+  }
+
+  listenerCount(name) {
+    return this.listeners.get(name)?.length || 0;
   }
 
   emit(name, event = {}) {
-    for (const listener of this.listeners.get(name) || []) listener(event);
+    for (const entry of [...(this.listeners.get(name) || [])]) {
+      if (entry.once) this.removeEventListener(name, entry.listener);
+      entry.listener(event);
+    }
   }
 
   send() {}
-  close() {}
+  close() {
+    this.closeCalls += 1;
+  }
 }
+
+function installFakeWebSocket() {
+  const hadOwnWebSocket = Object.hasOwn(globalThis, 'WebSocket');
+  const originalWebSocket = globalThis.WebSocket;
+  let socket;
+
+  globalThis.WebSocket = class extends FakeSocket {
+    constructor(url) {
+      super();
+      this.url = url;
+      socket = this;
+    }
+  };
+
+  return {
+    get socket() {
+      return socket;
+    },
+    restore() {
+      if (hadOwnWebSocket) globalThis.WebSocket = originalWebSocket;
+      else delete globalThis.WebSocket;
+    },
+  };
+}
+
+test('CDP connect closes its unowned socket and removes handshake listeners on timeout', async () => {
+  const fake = installFakeWebSocket();
+  try {
+    await assert.rejects(
+      CdpClient.connect('ws://127.0.0.1/devtools/page/timeout', 1),
+      { message: '连接 Codex 调试接口超时' },
+    );
+
+    assert.equal(fake.socket.closeCalls, 1);
+    assert.equal(fake.socket.listenerCount('open'), 0);
+    assert.equal(fake.socket.listenerCount('error'), 0);
+  } finally {
+    fake.restore();
+  }
+});
+
+test('CDP connect closes its unowned socket and removes handshake listeners on error', async () => {
+  const fake = installFakeWebSocket();
+  try {
+    const connecting = CdpClient.connect('ws://127.0.0.1/devtools/page/error');
+    const rejected = assert.rejects(connecting, { message: '无法连接 Codex 调试接口' });
+    fake.socket.emit('error');
+    await rejected;
+
+    assert.equal(fake.socket.closeCalls, 1);
+    assert.equal(fake.socket.listenerCount('open'), 0);
+    assert.equal(fake.socket.listenerCount('error'), 0);
+  } finally {
+    fake.restore();
+  }
+});
 
 test('CDP client dispatches notification events independently from call responses', () => {
   const socket = new FakeSocket();

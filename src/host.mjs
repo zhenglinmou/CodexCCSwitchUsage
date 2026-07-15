@@ -11,7 +11,10 @@ import { decodePageActionMarker } from './page-action-channel.mjs';
 import { installTargetOnce, settleTargetOperations } from './target-session.mjs';
 
 const DATABASE_WATCH_DEBOUNCE_MS = 100;
-const FALLBACK_POLL_MS = 1_000;
+const CURRENT_PROVIDER_REFRESH_MS = 300_000;
+const WATCHER_RETRY_MS = 1_000;
+const PAGE_ACTION_POLL_MS = 1_000;
+const DATABASE_AUDIT_MS = 60_000;
 const INJECTOR_AUDIT_MS = 300_000;
 const STATUS_HEARTBEAT_MS = 300_000;
 
@@ -72,6 +75,7 @@ let lastActionSignature = '';
 let databaseWatcher = null;
 let databaseWatchTimer = null;
 let databaseChangeToken = repository.getChangeToken();
+let lastDatabaseAuditAt = Date.now();
 let controlWatcher = null;
 let currentProviderRefreshTimer = null;
 let currentProviderRefreshPromise = null;
@@ -96,7 +100,10 @@ function writeStatus(extra = {}) {
     eventDrivenTargets: false,
     databaseWatch: Boolean(databaseWatcher),
     controlWatch: Boolean(controlWatcher),
-    fallbackPollMs: FALLBACK_POLL_MS,
+    fallbackPollMs: WATCHER_RETRY_MS,
+    databaseAuditMs: DATABASE_AUDIT_MS,
+    targetAuditMs: INJECTOR_AUDIT_MS,
+    pageActionPollMs: PAGE_ACTION_POLL_MS,
     connectedPages: mountedPages,
     connectionError: lastConnectionError,
     hubRunning: Boolean(hubServer.boundPort),
@@ -152,24 +159,23 @@ async function refreshCurrentProvider(force = false) {
     lastPayload = { status: 'error', providerName: 'CCSwitch', message: safeMessage(error) };
     writeStatus({ error: lastPayload.message });
     scheduleCurrentProviderRefresh(60_000);
-    return;
+    return true;
   }
 
   if (!provider) {
     lastPayload = { status: 'error', providerName: 'CCSwitch', message: '没有找到当前 Codex 供应商' };
     writeStatus({ error: lastPayload.message });
     scheduleCurrentProviderRefresh(60_000);
-    return;
+    return true;
   }
 
   const providerChanged = provider.id !== lastProviderId;
-  const intervalMinutes = Math.max(1, Number(provider.usage?.autoQueryInterval) || 5);
-  const intervalMs = intervalMinutes * 60_000;
+  const intervalMs = CURRENT_PROVIDER_REFRESH_MS;
   const elapsedMs = Date.now() - lastQueryAt;
   const due = elapsedMs >= intervalMs;
   if (!force && !providerChanged && !due) {
     scheduleCurrentProviderRefresh(intervalMs - elapsedMs);
-    return;
+    return false;
   }
 
   lastProviderId = provider.id;
@@ -182,6 +188,7 @@ async function refreshCurrentProvider(force = false) {
     const failed = ['error', 'login-required'].includes(item.status);
     writeStatus({ error: failed ? item.message : null });
     scheduleCurrentProviderRefresh(intervalMs);
+    return true;
   } catch (error) {
     lastQueryAt = Date.now();
     const message = safeMessage(error);
@@ -199,6 +206,7 @@ async function refreshCurrentProvider(force = false) {
     }
     writeStatus({ error: message });
     scheduleCurrentProviderRefresh(intervalMs);
+    return true;
   }
 }
 
@@ -215,18 +223,14 @@ function requestCurrentProviderRefresh(force = false, inject = false) {
       currentProviderRefreshForcePending = false;
       currentProviderRefreshInjectPending = false;
       try {
-        await refreshCurrentProvider(currentForce);
-        if (currentInject) await requestTargetSync({ audit: true });
+        const changed = await refreshCurrentProvider(currentForce);
+        if (currentInject && changed) await requestTargetSync({ audit: true });
       } catch (error) {
         writeStatus({ error: safeMessage(error) });
       }
     }
   })().finally(() => { currentProviderRefreshPromise = null; });
   return currentProviderRefreshPromise;
-}
-
-function actionSignature(action) {
-  return action ? `${action.action}:${action.token}:${action.requestedAt}` : '';
 }
 
 function openHubFromAction() {
@@ -237,6 +241,10 @@ function openHubFromAction() {
     lastHubError = safeMessage(error);
     writeStatus({ hubError: lastHubError });
   }
+}
+
+function actionSignature(action) {
+  return action ? `${action.action}:${action.token}:${action.requestedAt}` : '';
 }
 
 async function syncTargets({ audit = true } = {}) {
@@ -254,8 +262,7 @@ async function syncTargets({ audit = true } = {}) {
   const targetIds = new Set(targets.map(target => target.id));
   const targetIdentityChanged = targetIds.size !== mountedTargetIds.size
     || [...targetIds].some(id => !mountedTargetIds.has(id));
-  const shouldAudit = audit || targetIdentityChanged;
-  const shouldInstall = shouldAudit || markedActions.length > 0;
+  const shouldInstall = audit || targetIdentityChanged || markedActions.length > 0;
 
   if (!shouldInstall) {
     mountedPages = targets.length;
@@ -274,9 +281,7 @@ async function syncTargets({ audit = true } = {}) {
 
   if (pendingActions.length > 0) {
     allTargets = await listCdpTargets(args.port);
-    if (hasAuxiliaryPageTargets(allTargets)) {
-      throw new Error('检测到 Codex 内置浏览器页面，已暂停 CDP 注入');
-    }
+    if (hasAuxiliaryPageTargets(allTargets)) throw new Error('检测到 Codex 内置浏览器页面，已暂停 CDP 注入');
     targets = allTargets.filter(target => isCodexTargetCandidate(target) && target.webSocketDebuggerUrl);
     if (targets.length === 0) {
       mountedPages = 0;
@@ -330,6 +335,14 @@ function requestTargetSync({ audit = false } = {}) {
   return targetSyncPromise;
 }
 
+function syncHubProviders() {
+  try {
+    return hubService.syncProviders().changed;
+  } catch {
+    return true;
+  }
+}
+
 function startDatabaseWatcher() {
   if (databaseWatcher) return;
   try {
@@ -342,8 +355,9 @@ function startDatabaseWatcher() {
       databaseWatchTimer = setTimeout(() => {
         databaseWatchTimer = null;
         databaseChangeToken = repository.getChangeToken();
-        try { hubService.syncProviders(); } catch {}
-        requestCurrentProviderRefresh(false, true);
+        lastDatabaseAuditAt = Date.now();
+        const providersChanged = syncHubProviders();
+        if (providersChanged) requestCurrentProviderRefresh(false, true);
       }, DATABASE_WATCH_DEBOUNCE_MS);
     });
     databaseWatcher.on('error', () => {
@@ -379,6 +393,21 @@ function startControlWatcher() {
   }
 }
 
+function nextMaintenanceDelay() {
+  const now = Date.now();
+  const until = (lastAt, interval) => Math.max(250, interval - (now - lastAt));
+  const injectorAuditDelay = targetAuditPending
+    ? PAGE_ACTION_POLL_MS
+    : until(lastInjectorAuditAt, INJECTOR_AUDIT_MS);
+  return Math.min(
+    databaseWatcher ? until(lastDatabaseAuditAt, DATABASE_AUDIT_MS) : WATCHER_RETRY_MS,
+    controlWatcher ? injectorAuditDelay : WATCHER_RETRY_MS,
+    PAGE_ACTION_POLL_MS,
+    injectorAuditDelay,
+    until(lastStatusWriteAt, STATUS_HEARTBEAT_MS),
+  );
+}
+
 async function loop() {
   try {
     await hubServer.start();
@@ -392,20 +421,24 @@ async function loop() {
   writeStatus({ connectedPages: mountedPages, connectionError: lastConnectionError });
   requestCurrentProviderRefresh(false, true);
   while (!stopped) {
-    await waitForFallbackPoll(FALLBACK_POLL_MS);
+    await waitForFallbackPoll(nextMaintenanceDelay());
     if (stopped) break;
-    const currentDatabaseChangeToken = repository.getChangeToken();
-    const databaseChanged = currentDatabaseChangeToken !== databaseChangeToken;
-    databaseChangeToken = currentDatabaseChangeToken;
-    if (databaseChanged) {
-      try { hubService.syncProviders(); } catch {}
+    const now = Date.now();
+    const databaseAuditDue = !databaseWatcher || now - lastDatabaseAuditAt >= DATABASE_AUDIT_MS;
+    let databaseChanged = false;
+    if (databaseAuditDue) {
+      const currentDatabaseChangeToken = repository.getChangeToken();
+      databaseChanged = currentDatabaseChangeToken !== databaseChangeToken;
+      databaseChangeToken = currentDatabaseChangeToken;
+      lastDatabaseAuditAt = now;
     }
+    const providersChanged = databaseChanged && syncHubProviders();
     startDatabaseWatcher();
     startControlWatcher();
-    const auditDue = Date.now() - lastInjectorAuditAt >= INJECTOR_AUDIT_MS;
+    const auditDue = now - lastInjectorAuditAt >= INJECTOR_AUDIT_MS;
     await Promise.allSettled([
-      databaseChanged ? requestCurrentProviderRefresh(false, true) : Promise.resolve(),
-      requestTargetSync({ audit: auditDue || databaseChanged }),
+      providersChanged ? requestCurrentProviderRefresh(false, true) : Promise.resolve(),
+      requestTargetSync({ audit: auditDue || providersChanged }),
     ]);
     if (Date.now() - lastStatusWriteAt >= STATUS_HEARTBEAT_MS) {
       writeStatus({ connectedPages: mountedPages, connectionError: lastConnectionError });

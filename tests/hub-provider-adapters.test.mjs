@@ -39,7 +39,7 @@ test('provider query descriptions expose the real request shape without credenti
   assert.match(browserMethod.authentication, /Cookie/);
   assert.match(browserMethod.authentication, /扩展本地保存的数字用户 ID.*New-Api-User/);
   assert.doesNotMatch(browserMethod.authentication, /localStorage/);
-  assert.match(browserMethod.notes[0], /https:\/\/api\.agent\.example\/v1\/models/);
+  assert.doesNotMatch(JSON.stringify(browserMethod), /\/models/);
   assert.doesNotMatch(JSON.stringify(browserMethod), /password|access_token|private-key/);
 
   const apiMethod = describeProviderQuery({
@@ -72,7 +72,7 @@ test('OpenAI wham payload is normalized into primary and secondary quota windows
   assert.equal(summary.creditBalance, 7.5);
 });
 
-test('browser-only providers report a disconnected companion as transport state, not lost login', async () => {
+test('browser-only providers never probe the model API when the companion is disconnected', async () => {
   const calls = [];
   const engine = new ProviderQueryEngine({}, { hasSession: () => false, isConnected: () => false }, {
     fetchImpl: async url => {
@@ -87,13 +87,13 @@ test('browser-only providers report a disconnected companion as transport state,
   });
 
   assert.equal(result.loginRequired, false);
-  assert.equal(result.source, 'api_key_probe');
-  assert.match(result.message, /API Key 可用/);
-  assert.deepEqual(calls, ['https://api.agent.example/models']);
+  assert.equal(result.source, 'browser_session');
+  assert.match(result.message, /伴侣扩展未连接/);
+  assert.deepEqual(calls, []);
   assert.doesNotMatch(calls.join(' '), /17891/);
 });
 
-test('transient browser callback failures are not converted into login-required state', async () => {
+test('transient provider failures stay retryable while WAF challenges request an explicit website visit', async () => {
   const provider = { id: 'any', name: 'any的国内镜像', websiteUrl: '', usage: null, auth: {}, apiKey: 'key', apiBaseUrl: 'https://anyrouter.top' };
   const timeoutEngine = new ProviderQueryEngine({}, {
     isConnected: () => true,
@@ -115,7 +115,38 @@ test('transient browser callback failures are not converted into login-required 
       return { status: 403, text: '<html>Cloudflare challenge</html>' };
     },
   });
-  await assert.rejects(wafEngine.query(provider), /无法解析/);
+  const waf = await wafEngine.query(provider);
+  assert.equal(waf.loginRequired, true);
+  assert.equal(waf.websiteLoginRequired, true);
+  assert.match(waf.message, /官网认证/);
+
+  const htmlEngine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    async queryJson() {
+      return { status: 200, text: '<html><body>Access unavailable</body></html>' };
+    },
+  });
+  const html = await htmlEngine.query(provider);
+  assert.equal(html.websiteLoginRequired, true);
+  assert.match(html.message, /官网登录/);
+
+  const frameEngine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    async queryJson() { throw new Error('Frame with ID 0 is showing error page'); },
+  });
+  const frame = await frameEngine.query(provider);
+  assert.equal(frame.websiteLoginRequired, true);
+  assert.match(frame.message, /官网登录/);
+
+  const structuredWafEngine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    async queryJson() {
+      return { status: 403, text: '{"success":false,"message":"Cloudflare challenge required"}' };
+    },
+  });
+  const structuredWaf = await structuredWafEngine.query(provider);
+  assert.equal(structuredWaf.websiteLoginRequired, true);
+  assert.match(structuredWaf.message, /WAF/);
 });
 
 test('browser callback marks only explicit authentication failures as login-required', async () => {
@@ -131,6 +162,7 @@ test('browser callback marks only explicit authentication failures as login-requ
 
   assert.equal(result.loginRequired, true);
   assert.equal(result.source, 'browser_session');
+  assert.equal(result.websiteLoginRequired, true);
 });
 
 test('missing persisted New API identity requests one-time session sync instead of claiming logout', async () => {
