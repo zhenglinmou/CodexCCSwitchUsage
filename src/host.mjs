@@ -9,7 +9,7 @@ import { hubItemToUsagePayload, HubService } from './hub-service.mjs';
 import { buildInjectorScript, INJECTOR_VERSION, UPDATE_GLOBAL } from './injector-script.mjs';
 import { KeyedBackoff } from './keyed-backoff.mjs';
 import { decodePageActionMarker } from './page-action-channel.mjs';
-import { installTargetOnce, settleTargetOperations } from './target-session.mjs';
+import { acknowledgePageAction, installTargetOnce, settleTargetOperations } from './target-session.mjs';
 
 const DATABASE_WATCH_DEBOUNCE_MS = 100;
 const CURRENT_PROVIDER_REFRESH_MS = 300_000;
@@ -84,6 +84,7 @@ let currentProviderRefreshPromise = null;
 let currentProviderRefreshPending = false;
 let currentProviderRefreshForcePending = false;
 let currentProviderRefreshInjectPending = false;
+let currentProviderQueryActive = false;
 let targetSyncPromise = null;
 let targetSyncPending = false;
 let targetAuditPending = false;
@@ -227,8 +228,14 @@ function requestCurrentProviderRefresh(force = false, inject = false) {
       currentProviderRefreshForcePending = false;
       currentProviderRefreshInjectPending = false;
       try {
-        const changed = await refreshCurrentProvider(currentForce);
-        if (currentInject && changed) await requestTargetSync({ audit: true });
+        currentProviderQueryActive = true;
+        const changed = await refreshCurrentProvider(currentForce).finally(() => {
+          currentProviderQueryActive = false;
+        });
+        if (currentInject && changed) {
+          if (currentProviderRefreshPending) currentProviderRefreshInjectPending = true;
+          else await requestTargetSync({ audit: true });
+        }
       } catch (error) {
         writeStatus({ error: safeMessage(error) });
       }
@@ -252,17 +259,16 @@ function actionSignature(action) {
 }
 
 async function syncTargets({ audit = true } = {}) {
-  let allTargets = await listCdpTargets(args.port);
-  let targets = allTargets.filter(target => isCodexTargetCandidate(target) && target.webSocketDebuggerUrl);
+  const allTargets = await listCdpTargets(args.port);
+  const targets = allTargets.filter(target => isCodexTargetCandidate(target) && target.webSocketDebuggerUrl);
   if (targets.length === 0) {
     mountedPages = 0;
     mountedTargetIds = new Set();
     throw new Error('没有找到 Codex 主页面');
   }
 
-  let targetActions = targets.map(target => ({ target, action: decodePageActionMarker(target.title) }));
+  const targetActions = targets.map(target => ({ target, action: decodePageActionMarker(target.title) }));
   const markedActions = targetActions.filter(item => item.action);
-  const pendingActions = markedActions.filter(item => actionSignature(item.action) !== lastActionSignature);
   const targetIds = new Set(targets.map(target => target.id));
   const targetSignature = [...targetIds].sort().join('|');
   const targetIdentityChanged = targetIds.size !== mountedTargetIds.size
@@ -273,7 +279,7 @@ async function syncTargets({ audit = true } = {}) {
     mountedPages = targets.length;
     return { installed: false, deferred: false };
   }
-  if (pendingActions.length === 0 && !targetInstallBackoff.isReady(targetSignature)) {
+  if (markedActions.length === 0 && !targetInstallBackoff.isReady(targetSignature)) {
     targetAuditPending = true;
     return { installed: false, deferred: true };
   }
@@ -281,36 +287,47 @@ async function syncTargets({ audit = true } = {}) {
     throw new Error('检测到 Codex 内置浏览器页面，已暂停 CDP 注入');
   }
 
-  for (const item of pendingActions) {
-    const signature = actionSignature(item.action);
-    if (item.action.action === 'refresh') await refreshCurrentProvider(true);
-    if (item.action.action === 'open-hub') openHubFromAction();
-    lastActionSignature = signature;
+  if (markedActions.length > 0) {
+    const acknowledgements = await settleTargetOperations(
+      markedActions,
+      ({ target }) => acknowledgePageAction(target, target.title),
+    );
+    const failures = acknowledgements.filter(result => result.status === 'rejected');
+    let refreshRequested = false;
+    let actionAccepted = false;
+    markedActions.forEach((item, index) => {
+      if (acknowledgements[index]?.status !== 'fulfilled' || acknowledgements[index].value !== true) return;
+      if (actionSignature(item.action) === lastActionSignature) return;
+      actionAccepted = true;
+      lastActionSignature = actionSignature(item.action);
+      if (item.action.action === 'refresh') {
+        refreshRequested = true;
+        requestCurrentProviderRefresh(true, true);
+      }
+      if (item.action.action === 'open-hub') openHubFromAction();
+    });
+    mountedPages = targets.length;
+    if (actionAccepted) targetInstallBackoff.reset();
+    if (failures.length) throw failures[0].reason;
+    return {
+      installed: false,
+      deferred: !refreshRequested && actionAccepted && (audit || targetIdentityChanged),
+    };
   }
 
-  if (pendingActions.length > 0) {
-    allTargets = await listCdpTargets(args.port);
-    if (hasAuxiliaryPageTargets(allTargets)) throw new Error('检测到 Codex 内置浏览器页面，已暂停 CDP 注入');
-    targets = allTargets.filter(target => isCodexTargetCandidate(target) && target.webSocketDebuggerUrl);
-    if (targets.length === 0) {
-      mountedPages = 0;
-      mountedTargetIds = new Set();
-      throw new Error('没有找到 Codex 主页面');
-    }
-    targetActions = targets.map(target => ({ target, action: decodePageActionMarker(target.title) }));
-  }
+  if (currentProviderQueryActive) return { installed: false, deferred: audit || targetIdentityChanged };
 
-  const results = await settleTargetOperations(targetActions, ({ target, action }) => installTargetOnce(target, {
+  const installTargets = targets.map(target => ({ target }));
+  const results = await settleTargetOperations(installTargets, ({ target }) => installTargetOnce(target, {
     globalName: UPDATE_GLOBAL,
     injectorVersion: INJECTOR_VERSION,
     injectorScript,
     payload: lastPayload,
-    acknowledgedTitle: action ? target.title : '',
   }));
   const failures = results.filter(result => result.status === 'rejected');
   mountedPages = results.length - failures.length;
   mountedTargetIds = new Set(
-    targetActions
+    installTargets
       .filter((_item, index) => results[index]?.status === 'fulfilled')
       .map(item => item.target.id),
   );

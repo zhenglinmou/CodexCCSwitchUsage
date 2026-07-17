@@ -43,23 +43,37 @@ test('target synchronization uses only HTTP snapshots and one-shot primary-page 
   const source = hostSource();
   const sync = source.slice(source.indexOf('async function syncTargets('), source.indexOf('function requestTargetSync('));
 
-  assert.match(sync, /let allTargets = await listCdpTargets\(args\.port\)/);
+  assert.match(sync, /const allTargets = await listCdpTargets\(args\.port\)/);
   assert.match(sync, /isCodexTargetCandidate\(target\)/);
   assert.match(sync, /hasAuxiliaryPageTargets\(allTargets\)/);
-  assert.match(sync, /await settleTargetOperations\(targetActions,/);
+  assert.match(sync, /await settleTargetOperations\(installTargets,/);
   assert.match(sync, /installTargetOnce\(/);
   assert.match(sync, /const targetIdentityChanged =/);
-  assert.ok((sync.match(/listCdpTargets\(args\.port\)/g) || []).length >= 2);
+  assert.equal((sync.match(/listCdpTargets\(args\.port\)/g) || []).length, 1, 'an accepted action must not force a redundant target snapshot');
   assert.doesNotMatch(sync, /includeAuxiliary|auxiliaryTargets|cleanupAuxiliaryTarget|disposeTargetInjector/);
 });
 
 test('page actions are consumed from target titles without Runtime bindings', () => {
   const source = hostSource();
+  const sync = source.slice(source.indexOf('async function syncTargets('), source.indexOf('function requestTargetSync('));
 
   assert.match(source, /decodePageActionMarker\(target\.title\)/);
-  assert.match(source, /action\.action === 'refresh'/);
-  assert.match(source, /action\.action === 'open-hub'/);
+  assert.match(sync, /acknowledgePageAction\(target, target\.title\)/);
+  assert.match(sync, /action\.action === 'refresh'[\s\S]*requestCurrentProviderRefresh\(true, true\)/);
+  assert.match(sync, /action\.action === 'open-hub'[\s\S]*openHubFromAction\(\)/);
+  assert.doesNotMatch(sync, /await refreshCurrentProvider\(true\)/);
+  assert.ok(sync.indexOf('acknowledgePageAction(target, target.title)') < sync.indexOf('requestCurrentProviderRefresh(true, true)'), 'the exact marker must be acknowledged before slow network work is queued');
   assert.doesNotMatch(source, /bindingCalled|REFRESH_BINDING|HUB_BINDING/);
+});
+
+test('queued current-provider refreshes inject only the final coalesced result', () => {
+  const source = hostSource();
+  const refresh = source.slice(source.indexOf('function requestCurrentProviderRefresh('), source.indexOf('function openHubFromAction('));
+
+  assert.match(refresh, /if \(currentProviderRefreshPending\)[\s\S]*currentProviderRefreshInjectPending = true/);
+  assert.match(refresh, /else await requestTargetSync\(\{ audit: true \}\)/);
+  assert.match(refresh, /currentProviderQueryActive = true[\s\S]*currentProviderQueryActive = false/);
+  assert.match(source, /if \(currentProviderQueryActive\) return \{ installed: false, deferred: audit \|\| targetIdentityChanged \}/);
 });
 
 test('an injector audit deferred by Browse remains pending until a safe target snapshot', () => {
@@ -86,9 +100,10 @@ test('failed one-shot installs use keyed bounded backoff without delaying page-a
 
   assert.match(source, /new KeyedBackoff\(\)/);
   assert.match(sync, /const targetSignature = \[\.\.\.targetIds\]\.sort\(\)\.join\('\|'\)/);
-  assert.match(sync, /pendingActions\.length === 0 && !targetInstallBackoff\.isReady\(targetSignature\)/);
+  assert.match(sync, /markedActions\.length === 0 && !targetInstallBackoff\.isReady\(targetSignature\)/);
   assert.match(sync, /targetInstallBackoff\.fail\(targetSignature\)/);
   assert.match(sync, /targetInstallBackoff\.reset\(\)/);
+  assert.match(sync, /if \(actionAccepted\) targetInstallBackoff\.reset\(\)/);
   assert.match(request, /if \(outcome\?\.deferred\) targetAuditPending = true/);
   assert.match(source, /targetInstallRetryMs: targetInstallBackoff\.remainingMs\(\)/);
 });
@@ -125,7 +140,7 @@ test('host schedules only the current CCSwitch provider and leaves Hub providers
   assert.doesNotMatch(source, /provider\.usage\?\.autoQueryInterval/);
   assert.match(source, /hubService\.refreshProvider\(provider\.id\)/);
   assert.match(loop, /providersChanged \? requestCurrentProviderRefresh\(false, true\)/);
-  assert.match(source, /item\.action\.action === 'refresh'[\s\S]*await refreshCurrentProvider\(true\)/);
+  assert.match(source, /item\.action\.action === 'refresh'[\s\S]*requestCurrentProviderRefresh\(true, true\)/);
   assert.doesNotMatch(source, /hubService\.refreshAll\(\)|refreshBrowserProviders|observeBrowserCompanion/);
 });
 

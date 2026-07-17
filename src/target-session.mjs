@@ -5,6 +5,19 @@ export function settleTargetOperations(targets, operation) {
   return Promise.allSettled(targets.map(operation));
 }
 
+export async function acknowledgePageAction(target, acknowledgedTitle, connect = CdpClient.connect) {
+  if (!acknowledgedTitle) return false;
+  const client = await connect(target.webSocketDebuggerUrl);
+  const cleanTitle = stripPageActionMarker(acknowledgedTitle);
+  try {
+    return await client.evaluate(
+      `(() => { if (document.title !== ${JSON.stringify(acknowledgedTitle)}) return false; document.title = ${JSON.stringify(cleanTitle)}; return true; })()`,
+    ) === true;
+  } finally {
+    client.close();
+  }
+}
+
 export async function installTargetOnce(target, {
   globalName,
   injectorVersion,

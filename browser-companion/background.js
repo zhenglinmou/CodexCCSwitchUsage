@@ -13,6 +13,10 @@ import {
 const HUB_ORIGIN = 'http://127.0.0.1:17891';
 const POLL_ALARM = 'ccswitch-balance-companion-poll';
 const HEARTBEAT_DEBOUNCE_MS = 350;
+const HUB_REQUEST_TIMEOUT_MS = 10_000;
+const HUB_POLL_TIMEOUT_MS = 30_000;
+const TAB_FALLBACK_RESERVE_MS = 5_000;
+const POLL_BATCH_SIZE = 120;
 const manifest = chrome.runtime.getManifest();
 const sessionHints = new SessionHintStore(chrome.storage.local);
 const sessionIdentities = new SessionIdentityStore(chrome.storage.local);
@@ -76,6 +80,18 @@ function apiUrl(token, path) {
   return `${HUB_ORIGIN}/api/${encodeURIComponent(token)}${path}`;
 }
 
+async function requestHub(url, options = {}, timeoutMs = HUB_REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    const payload = response.status === 204 ? null : await response.json();
+    return { response, payload };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function cookieSessions() {
   const sessions = [];
   for (const origin of ['https://chatgpt.com']) {
@@ -96,14 +112,14 @@ async function knownSessions() {
 }
 
 async function post(token, path, body) {
-  const response = await fetch(apiUrl(token, path), {
+  const { response, payload } = await requestHub(apiUrl(token, path), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
     cache: 'no-store',
   });
   if (!response.ok) throw new Error(`Balance Hub callback returned HTTP ${response.status}`);
-  return response.json();
+  return payload;
 }
 
 async function performHeartbeat(current) {
@@ -249,16 +265,20 @@ async function focusLoginPage(request) {
 async function queryThroughCurrentBrowser(request, deadline) {
   const origin = new URL(request.baseUrl).origin;
   const userId = await sessionIdentities.get(origin);
-  const direct = await fetchFromExtension(request, userId, Math.max(1_000, deadline - Date.now()));
+  const direct = await fetchFromExtension(request, userId, remainingJobTime(deadline, TAB_FALLBACK_RESERVE_MS));
   const directOutcome = browserSessionOutcome(request, direct);
   if (isJsonText(direct.text) && (!request.userHeader || directOutcome === 'valid')) return direct;
 
   const tabs = (await matchingTabs(origin)).filter(tab => tab.id != null);
   const preferred = selectReadySessionTab(tabs);
   if (!preferred) return request.userHeader && !userId ? { ...direct, identityMissing: true } : direct;
-  const result = await fetchInsideTab(preferred.id, request, Math.max(1_000, deadline - Date.now()));
+  const result = await fetchInsideTab(preferred.id, request, remainingJobTime(deadline));
   if (request.userHeader && !userId && result.identityFound !== true) return { ...result, identityMissing: true };
   return result;
+}
+
+function remainingJobTime(deadline, reserveMs = 0) {
+  return Math.max(1_000, deadline - Date.now() - reserveMs);
 }
 
 async function openLogin(request, deadline) {
@@ -275,10 +295,13 @@ async function executeJob(job, deadline) {
 async function pollOnce(current) {
   if (!current.token) return false;
   const query = new URLSearchParams({ clientId: current.clientId, instanceId, browser: browserName(), version: manifest.version });
-  const response = await fetch(apiUrl(current.token, `/companion/job?${query}`), { cache: 'no-store' });
+  const { response, payload } = await requestHub(
+    apiUrl(current.token, `/companion/job?${query}`),
+    { cache: 'no-store' },
+    HUB_POLL_TIMEOUT_MS,
+  );
   if (response.status === 204) return true;
   if (!response.ok) throw new Error(`Balance Hub job poll returned HTTP ${response.status}`);
-  const payload = await response.json();
   const job = payload.job;
   const timeoutMs = browserJobTimeout(job.request);
   const deadline = Date.now() + timeoutMs;
@@ -312,11 +335,12 @@ async function startPolling(initialConfig = null, sessionsAnnounced = false) {
   polling = true;
   let nextConfig = initialConfig;
   let announceSessions = !sessionsAnnounced;
+  let continuePolling = false;
   try {
-    for (let iteration = 0; iteration < 120; iteration += 1) {
+    for (let iteration = 0; iteration < POLL_BATCH_SIZE; iteration += 1) {
       const current = nextConfig || await config();
       nextConfig = null;
-      if (!current.token) break;
+      if (!current.token) return;
       try {
         if (announceSessions) {
           await heartbeat(current);
@@ -330,8 +354,10 @@ async function startPolling(initialConfig = null, sessionsAnnounced = false) {
         await delay(2_000);
       }
     }
+    continuePolling = true;
   } finally {
     polling = false;
+    if (continuePolling) void startPolling();
   }
 }
 

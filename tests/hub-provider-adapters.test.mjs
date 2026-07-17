@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { describeProviderQuery, loginConfiguration, parseBrowserJson, ProviderQueryEngine, providerAliases, providerKind, summarizeWham } from '../src/hub-provider-adapters.mjs';
+import { describeProviderQuery, fetchJson, loginConfiguration, parseBrowserJson, ProviderQueryEngine, providerAliases, providerKind, summarizeWham } from '../src/hub-provider-adapters.mjs';
 
 test('browser callback JSON parsing rejects WAF HTML and oversized responses', () => {
   assert.deepEqual(parseBrowserJson('{"success":true}'), { success: true });
@@ -361,6 +361,129 @@ test('OpenAI WHAM direct probing is time-bounded when a browser fallback is avai
   assert.equal(directAborted, true);
   assert.equal(result.source, 'openai_wham_browser');
   assert.equal(result.usage.remaining, 90);
+});
+
+test('OpenAI WHAM starts the browser path before a stalled direct probe expires', async () => {
+  let directAborted = false;
+  let browserCalls = 0;
+  const engine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    async queryJson() {
+      browserCalls += 1;
+      return {
+        status: 200,
+        text: JSON.stringify({
+          plan_type: 'plus',
+          rate_limit: { primary_window: { used_percent: 15, limit_window_seconds: 18_000 } },
+        }),
+      };
+    },
+  }, {
+    whamBrowserProbeTimeoutMs: 1_000,
+    whamBrowserRaceDelayMs: 5,
+    fetchImpl: async (_url, options) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => {
+        directAborted = true;
+        reject(options.signal.reason || new Error('aborted'));
+      }, { once: true });
+    }),
+  });
+
+  const result = await engine.query({
+    id: 'openai-race', name: 'OpenAI Official', websiteUrl: 'https://chatgpt.com/codex', usage: null,
+    auth: { tokens: { account_id: 'account-one', access_token: 'private-token' } }, apiKey: '', apiBaseUrl: '', baseUrl: '',
+  });
+
+  assert.equal(browserCalls, 1);
+  assert.equal(directAborted, true, 'the winning browser callback must cancel the stalled direct request');
+  assert.equal(result.source, 'openai_wham_browser');
+  assert.equal(result.usage.remaining, 85);
+});
+
+test('a fast OpenAI direct response wins without starting a browser callback', async () => {
+  let browserCalls = 0;
+  const engine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    async queryJson() { browserCalls += 1; throw new Error('browser path should remain idle'); },
+  }, {
+    whamBrowserRaceDelayMs: 20,
+    fetchImpl: async () => new Response(JSON.stringify({
+      plan_type: 'plus',
+      rate_limit: { primary_window: { used_percent: 5, limit_window_seconds: 18_000 } },
+    }), { status: 200 }),
+  });
+
+  const result = await engine.query({
+    id: 'openai-direct', name: 'OpenAI Official', websiteUrl: 'https://chatgpt.com/codex', usage: null,
+    auth: { tokens: { account_id: 'account-one', access_token: 'private-token' } }, apiKey: '', apiBaseUrl: '', baseUrl: '',
+  });
+
+  assert.equal(browserCalls, 0);
+  assert.equal(result.source, 'openai_wham');
+});
+
+test('an early invalid browser response does not cancel a later valid OpenAI direct result', async () => {
+  let directAborted = false;
+  const engine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    async queryJson() { return { status: 403, text: '<html>challenge</html>' }; },
+  }, {
+    whamBrowserRaceDelayMs: 2,
+    fetchImpl: async (_url, options) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve(new Response(JSON.stringify({
+        plan_type: 'plus',
+        rate_limit: { primary_window: { used_percent: 8, limit_window_seconds: 18_000 } },
+      }), { status: 200 })), 15);
+      options.signal.addEventListener('abort', () => {
+        clearTimeout(timer);
+        directAborted = true;
+        reject(options.signal.reason || new Error('aborted'));
+      }, { once: true });
+    }),
+  });
+
+  const result = await engine.query({
+    id: 'openai-invalid-browser', name: 'OpenAI Official', websiteUrl: 'https://chatgpt.com/codex', usage: null,
+    auth: { tokens: { account_id: 'account-one', access_token: 'private-token' } }, apiKey: '', apiBaseUrl: '', baseUrl: '',
+  });
+
+  assert.equal(directAborted, false);
+  assert.equal(result.source, 'openai_wham');
+  assert.equal(result.usage.remaining, 92);
+});
+
+test('provider HTTP retries share one total deadline instead of resetting it per attempt', async () => {
+  const attemptDurations = [];
+  const startedAt = Date.now();
+  await assert.rejects(fetchJson(async (_url, options) => {
+    const attemptStartedAt = Date.now();
+    return new Promise((_resolve, reject) => {
+      const abort = () => {
+        attemptDurations.push(Date.now() - attemptStartedAt);
+        reject(options.signal.reason || new Error('timed out'));
+      };
+      if (options.signal.aborted) abort();
+      else options.signal.addEventListener('abort', abort, { once: true });
+    });
+  }, 'https://example.invalid/balance', {}, 60, 2, null, 1));
+
+  assert.equal(attemptDurations.length, 2);
+  assert.ok(attemptDurations.every(duration => duration < 50), `attempts must split the total deadline: ${attemptDurations}`);
+  assert.ok(Date.now() - startedAt < 110, 'the two attempts must not each receive the full deadline');
+});
+
+test('provider queries enforce one global deadline even when a transport ignores abort', async () => {
+  const engine = new ProviderQueryEngine({}, {}, {
+    providerQueryTimeoutMs: 15,
+    fetchImpl: async () => new Promise(() => {}),
+  });
+  const startedAt = Date.now();
+
+  await assert.rejects(engine.query({
+    id: 'hung', name: 'DeepSeek', websiteUrl: '', usage: null, auth: {}, apiKey: 'private-key', apiBaseUrl: 'https://api.deepseek.com', baseUrl: '',
+  }), /查询超过/);
+
+  assert.ok(Date.now() - startedAt < 150);
 });
 
 test('a failed browser fallback does not suppress the next OpenAI direct probe', async () => {

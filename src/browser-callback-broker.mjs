@@ -110,8 +110,8 @@ export class BrowserCallbackBroker {
     });
   }
 
-  queryJson(request) {
-    return this.#enqueue('query-json', request, this.queryTimeoutMs);
+  queryJson(request, options = {}) {
+    return this.#enqueue('query-json', request, this.queryTimeoutMs, options);
   }
 
   openLogin(request) {
@@ -148,9 +148,11 @@ export class BrowserCallbackBroker {
     this.queue = [];
   }
 
-  #enqueue(type, request, timeoutMs) {
+  #enqueue(type, request, timeoutMs, options = {}) {
     if (this.closed) return Promise.reject(new Error('浏览器余额伴侣回调已关闭'));
     if (!this.isConnected()) return Promise.reject(new Error('现有浏览器余额伴侣未连接'));
+    const signal = options?.signal;
+    if (signal?.aborted) return Promise.reject(signal.reason || new Error('浏览器余额回调已取消'));
     const origin = normalizeOrigin(request?.baseUrl || request?.loginUrl || request?.origin);
     const preferredClientId = this.#preferredClient(origin);
     const id = crypto.randomUUID();
@@ -161,14 +163,34 @@ export class BrowserCallbackBroker {
       request: { ...request, origin },
     };
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const cleanup = () => signal?.removeEventListener('abort', abort);
+      const pending = {
+        resolve(value) {
+          cleanup();
+          resolve(value);
+        },
+        reject(error) {
+          cleanup();
+          reject(error);
+        },
+        timer: null,
+      };
+      const abort = () => {
+        if (this.pending.get(id) !== pending) return;
+        this.pending.delete(id);
+        this.queue = this.queue.filter(item => item.publicJob.id !== id);
+        clearTimeout(pending.timer);
+        pending.reject(signal.reason || new Error('浏览器余额回调已取消'));
+      };
+      pending.timer = setTimeout(() => {
         this.pending.delete(id);
         this.queue = this.queue.filter(job => job.publicJob.id !== id);
-        reject(new Error('等待现有浏览器余额回调超时'));
+        pending.reject(new Error('等待现有浏览器余额回调超时'));
       }, timeoutMs);
       const job = { publicJob, preferredClientId };
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, pending);
       this.queue.push(job);
+      signal?.addEventListener('abort', abort, { once: true });
       this.#dispatch();
     });
   }

@@ -6,8 +6,10 @@ import { normalizeUsage } from './usage-client.mjs';
 const WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage';
 const QUOTA_PER_USD = 500_000;
 const WHAM_BROWSER_PROBE_TIMEOUT_MS = 5_000;
+const WHAM_BROWSER_RACE_DELAY_MS = 400;
 const WHAM_DIRECT_BACKOFF_MS = 300_000;
 const WHAM_RESULT_CACHE_MS = 30_000;
+const PROVIDER_QUERY_TIMEOUT_MS = 45_000;
 
 export function parseBrowserJson(text) {
   const source = String(text || '').trim();
@@ -73,27 +75,75 @@ async function readJsonResponse(response) {
   return { status: response.status, payload, text };
 }
 
-async function fetchJson(fetchImpl, url, headers, timeoutMs = 40_000, attempts = 2) {
+function combinedSignal(...signals) {
+  const active = signals.filter(Boolean);
+  if (active.length === 0) return undefined;
+  if (active.length === 1) return active[0];
+  return AbortSignal.any(active);
+}
+
+function abortable(operation, signal) {
+  if (!signal) return operation;
+  if (signal.aborted) return Promise.reject(signal.reason || new Error('请求已取消'));
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason || new Error('请求已取消'));
+    signal.addEventListener('abort', abort, { once: true });
+    Promise.resolve(operation).then(
+      value => {
+        signal.removeEventListener('abort', abort);
+        resolve(value);
+      },
+      error => {
+        signal.removeEventListener('abort', abort);
+        reject(error);
+      },
+    );
+  });
+}
+
+export async function fetchJson(fetchImpl, url, headers, timeoutMs = 40_000, attempts = 2, externalSignal = null, retryDelayMs = 500) {
   let lastError = null;
+  let lastResult = null;
   const maximumAttempts = Math.max(1, Math.trunc(Number(attempts) || 1));
+  const totalTimeoutMs = Math.max(1, Number(timeoutMs) || 1);
+  const deadline = Date.now() + totalTimeoutMs;
   for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
+    if (externalSignal?.aborted) throw externalSignal.reason || new Error('余额接口请求已取消');
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    const attemptsLeft = maximumAttempts - attempt;
+    const reservedRetryMs = attemptsLeft > 1 ? Math.min(Math.max(0, retryDelayMs), Math.floor(remainingMs / 4)) : 0;
+    const attemptTimeoutMs = Math.max(1, Math.floor((remainingMs - reservedRetryMs) / attemptsLeft));
+    const attemptController = new AbortController();
+    const attemptTimer = setTimeout(
+      () => attemptController.abort(new Error(`余额接口单次请求超过 ${Math.ceil(attemptTimeoutMs / 1_000)} 秒`)),
+      attemptTimeoutMs,
+    );
     try {
-      const response = await fetchImpl(url, {
+      const requestSignal = combinedSignal(externalSignal, attemptController.signal);
+      const response = await abortable(Promise.resolve().then(() => fetchImpl(url, {
         method: 'GET',
         headers,
         redirect: 'follow',
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      const result = await readJsonResponse(response);
+        signal: requestSignal,
+      })), requestSignal);
+      const result = await abortable(readJsonResponse(response), requestSignal);
+      lastResult = result;
       const retryable = [429, 500, 502, 503, 504].includes(result.status);
       if (!retryable || attempt + 1 >= maximumAttempts) return result;
     } catch (error) {
+      if (externalSignal?.aborted) throw externalSignal.reason || error;
       lastError = error;
       if (attempt + 1 >= maximumAttempts) throw error;
+    } finally {
+      clearTimeout(attemptTimer);
     }
-    await new Promise(resolve => setTimeout(resolve, 500));
+    const remainingAfterAttemptMs = deadline - Date.now();
+    if (remainingAfterAttemptMs <= 1) break;
+    await new Promise(resolve => setTimeout(resolve, Math.min(Math.max(0, retryDelayMs), remainingAfterAttemptMs - 1)));
   }
-  throw lastError || new Error('余额接口请求失败');
+  if (lastResult) return lastResult;
+  throw lastError || new Error(`余额接口请求超过 ${Math.ceil(totalTimeoutMs / 1_000)} 秒`);
 }
 
 function decodeJwtPayload(token) {
@@ -324,8 +374,10 @@ export class ProviderQueryEngine {
     this.homeDir = options.homeDir || process.env.USERPROFILE || process.env.HOME || '';
     this.now = options.now || Date.now;
     this.whamBrowserProbeTimeoutMs = Math.max(1, Number(options.whamBrowserProbeTimeoutMs) || WHAM_BROWSER_PROBE_TIMEOUT_MS);
+    this.whamBrowserRaceDelayMs = Math.max(1, Number(options.whamBrowserRaceDelayMs) || WHAM_BROWSER_RACE_DELAY_MS);
     this.whamDirectBackoffMs = Math.max(1, Number(options.whamDirectBackoffMs) || WHAM_DIRECT_BACKOFF_MS);
     this.whamResultCacheMs = Math.max(1, Number(options.whamResultCacheMs) || WHAM_RESULT_CACHE_MS);
+    this.providerQueryTimeoutMs = Math.max(1, Number(options.providerQueryTimeoutMs) || PROVIDER_QUERY_TIMEOUT_MS);
     this.whamDirectRetryAt = 0;
     this.whamInFlight = new Map();
     this.whamRecent = new Map();
@@ -340,7 +392,7 @@ export class ProviderQueryEngine {
     if (cacheKey && this.inFlightQueries.has(cacheKey)) {
       return this.#copyResult(await this.inFlightQueries.get(cacheKey), provider);
     }
-    const operation = this.#queryUncached(provider);
+    const operation = this.#queryWithDeadline(provider);
     if (cacheKey) this.inFlightQueries.set(cacheKey, operation);
     try {
       const result = await operation;
@@ -352,6 +404,23 @@ export class ProviderQueryEngine {
       for (const [key, item] of this.recentQueries) {
         if (item.createdAt < cutoff) this.recentQueries.delete(key);
       }
+    }
+  }
+
+  async #queryWithDeadline(provider) {
+    const controller = new AbortController();
+    const timeoutError = new Error(`供应商余额查询超过 ${Math.ceil(this.providerQueryTimeoutMs / 1_000)} 秒`);
+    let timer = null;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort(timeoutError);
+        reject(timeoutError);
+      }, this.providerQueryTimeoutMs);
+    });
+    try {
+      return await Promise.race([this.#queryUncached(provider, controller.signal), timeout]);
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -376,15 +445,15 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryUncached(provider) {
+  async #queryUncached(provider, signal) {
     const kind = providerKind(provider);
-    if (kind === 'anyrouter' || kind === 'agentrouter') return this.#queryWebProvider(provider);
-    if (kind === 'openai') return this.#queryOpenAi(provider);
-    if (kind === 'cpa') return this.#queryCpa(provider);
-    if (kind === 'deepseek') return this.#queryDeepSeek(provider);
-    if (kind === 'packy') return this.#queryPacky(provider);
-    if (kind === 'paid') return this.#queryPaid(provider);
-    if (provider.apiKey && providerApiBase(provider)) return this.#queryHealth(provider);
+    if (kind === 'anyrouter' || kind === 'agentrouter') return this.#queryWebProvider(provider, signal);
+    if (kind === 'openai') return this.#queryOpenAi(provider, signal);
+    if (kind === 'cpa') return this.#queryCpa(provider, signal);
+    if (kind === 'deepseek') return this.#queryDeepSeek(provider, signal);
+    if (kind === 'packy') return this.#queryPacky(provider, signal);
+    if (kind === 'paid') return this.#queryPaid(provider, signal);
+    if (provider.apiKey && providerApiBase(provider)) return this.#queryHealth(provider, signal);
     throw new Error('该供应商没有可用的 API Key、Base URL 或内置余额适配器');
   }
 
@@ -403,9 +472,9 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryWebProvider(provider) {
+  async #queryWebProvider(provider, signal) {
     if (this.browserBroker.isConnected()) {
-      return this.#queryBrowserNewApi(provider);
+      return this.#queryBrowserNewApi(provider, signal);
     }
     return {
       source: 'browser_session',
@@ -414,7 +483,7 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryBrowserNewApi(provider) {
+  async #queryBrowserNewApi(provider, signal) {
     const kind = providerKind(provider);
     const config = loginConfiguration(provider);
     if (!this.browserBroker.isConnected()) {
@@ -422,7 +491,10 @@ export class ProviderQueryEngine {
     }
     let raw;
     try {
-      raw = await this.browserBroker.queryJson({ ...config, headers: {}, waitMs: kind === 'agentrouter' ? 55_000 : 40_000 });
+      raw = await this.browserBroker.queryJson(
+        { ...config, headers: {}, waitMs: kind === 'agentrouter' ? 55_000 : 40_000 },
+        { signal },
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (!browserPageUnavailable(message)) throw error;
@@ -488,12 +560,12 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryDeepSeek(provider) {
+  async #queryDeepSeek(provider, signal) {
     const baseUrl = providerApiBase(provider) || 'https://api.deepseek.com';
     const { status, payload } = await fetchJson(this.fetchImpl, `${baseUrl}/user/balance`, {
       Authorization: `Bearer ${provider.apiKey}`,
       Accept: 'application/json',
-    });
+    }, 40_000, 2, signal);
     if (status !== 200 || !payload?.is_available) throw new Error(String(payload?.message || `DeepSeek 余额接口返回 HTTP ${status}`));
     const balances = (payload.balance_infos || []).map(item => ({ currency: String(item.currency || ''), value: Number(item.total_balance) || 0 }));
     const remaining = balances.reduce((sum, item) => sum + item.value, 0);
@@ -512,12 +584,12 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryPacky(provider) {
+  async #queryPacky(provider, signal) {
     const { status, payload } = await fetchJson(this.fetchImpl, 'https://www.packyapi.com/api/usage/token/', {
       Authorization: `Bearer ${provider.apiKey}`,
       Accept: 'application/json',
       'User-Agent': 'cc-switch/1.0',
-    });
+    }, 40_000, 2, signal);
     if (status !== 200 || payload?.code !== true || !payload.data) throw new Error(String(payload?.message || `PackyCode 余额接口返回 HTTP ${status}`));
     const remaining = (Number(payload.data.total_available) || 0) / QUOTA_PER_USD;
     const used = (Number(payload.data.total_used) || 0) / QUOTA_PER_USD;
@@ -528,14 +600,14 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryPaid(provider) {
+  async #queryPaid(provider, signal) {
     const baseUrl = providerApiBase(provider);
     if (!provider.apiKey || !baseUrl) throw new Error('付费站没有可用的 API Key 或 Base URL');
     const { status, payload } = await fetchJson(this.fetchImpl, `${baseUrl}/user/balance`, {
       Authorization: `Bearer ${provider.apiKey}`,
       Accept: 'application/json',
       'User-Agent': 'codex-ccswitch-usage/2',
-    });
+    }, 40_000, 2, signal);
     if (status !== 200 || !payload || typeof payload !== 'object') throw new Error(`付费站余额接口返回 HTTP ${status}`);
     const active = payload.status == null ? payload.is_active !== false : payload.status === 'ok';
     const quota3h = payload.quota?.['3h'] || { total: payload.limit_3h, used: payload.used_3h, remaining: payload.balance_3h };
@@ -566,7 +638,7 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryWham(accessToken, accountId) {
+  async #queryWham(accessToken, accountId, signal) {
     const cacheKey = crypto.createHash('sha256')
       .update(String(accountId))
       .update('\0')
@@ -576,7 +648,7 @@ export class ProviderQueryEngine {
     if (cached && this.now() - cached.createdAt < this.whamResultCacheMs) return cached.result;
     if (this.whamInFlight.has(cacheKey)) return this.whamInFlight.get(cacheKey);
 
-    const operation = this.#queryWhamUncached(accessToken, accountId);
+    const operation = this.#queryWhamUncached(accessToken, accountId, signal);
     this.whamInFlight.set(cacheKey, operation);
     try {
       const result = await operation;
@@ -593,83 +665,143 @@ export class ProviderQueryEngine {
     }
   }
 
-  async #queryWhamUncached(accessToken, accountId) {
+  async #queryWhamUncached(accessToken, accountId, signal) {
     const headers = {
       Authorization: `Bearer ${accessToken}`,
       'ChatGPT-Account-Id': accountId,
       Accept: 'application/json',
       'User-Agent': 'codex-ccswitch-usage/2',
     };
-    let direct = null;
-    let directError = null;
-    let directProbeFailed = false;
     const browserAvailable = typeof this.browserBroker?.queryJson === 'function'
       && (typeof this.browserBroker.isConnected !== 'function' || this.browserBroker.isConnected());
     const directReady = !browserAvailable || this.now() >= this.whamDirectRetryAt;
-    if (directReady) {
-      try {
-        direct = await fetchJson(
-          this.fetchImpl,
-          WHAM_URL,
-          headers,
-          browserAvailable ? this.whamBrowserProbeTimeoutMs : 40_000,
-          browserAvailable ? 1 : 2,
-        );
-        if (direct.payload || ![403, 429, 500, 502, 503, 504].includes(direct.status)) {
-          this.whamDirectRetryAt = 0;
-          return { ...direct, transport: 'node' };
-        }
-      } catch (error) {
-        directError = error;
-      }
-      directProbeFailed = browserAvailable;
-    }
+
+    const directController = new AbortController();
+    const directPromise = directReady
+      ? fetchJson(
+        this.fetchImpl,
+        WHAM_URL,
+        headers,
+        browserAvailable ? this.whamBrowserProbeTimeoutMs : 40_000,
+        browserAvailable ? 1 : 2,
+        combinedSignal(signal, directController.signal),
+      ).then(result => ({
+        kind: 'direct',
+        definitive: Boolean(result.payload) || ![403, 429, 500, 502, 503, 504].includes(result.status),
+        result: { ...result, transport: 'node' },
+        error: null,
+      }), error => ({ kind: 'direct', definitive: false, result: null, error }))
+      : null;
+
     if (!browserAvailable) {
-      if (direct) return { ...direct, transport: 'node' };
-      throw directError || new Error('OpenAI 用量直连失败');
+      const direct = await directPromise;
+      if (direct.result) return direct.result;
+      throw direct.error || new Error('OpenAI 用量直连失败');
     }
-    try {
-      const browserHeaders = { ...headers };
-      delete browserHeaders['User-Agent'];
-      const raw = await this.browserBroker.queryJson({
+
+    const browserHeaders = { ...headers };
+    delete browserHeaders['User-Agent'];
+    let browserController = null;
+    let browserPromise = null;
+    const startBrowser = () => {
+      if (browserPromise) return browserPromise;
+      browserController = new AbortController();
+      browserPromise = this.browserBroker.queryJson({
         baseUrl: 'https://chatgpt.com',
         requestPath: '/backend-api/wham/usage',
         headers: browserHeaders,
         navigateRequest: false,
         waitMs: 30_000,
-      });
-      if (directProbeFailed) this.whamDirectRetryAt = this.now() + this.whamDirectBackoffMs;
-      return { status: Number(raw?.status) || 0, payload: parseBrowserJson(raw?.text), text: String(raw?.text || ''), transport: 'edge' };
-    } catch (error) {
-      if (direct) return { ...direct, transport: 'node' };
-      throw directError || error;
+      }, { signal: combinedSignal(signal, browserController.signal) }).then(raw => {
+        const result = { status: Number(raw?.status) || 0, payload: parseBrowserJson(raw?.text), text: String(raw?.text || ''), transport: 'edge' };
+        return { kind: 'browser', definitive: result.status === 200 && Boolean(result.payload), result, error: null };
+      }, error => ({ kind: 'browser', definitive: false, result: null, error }));
+      return browserPromise;
+    };
+
+    const finishWithBrowser = browser => {
+      if (!browser.result) return null;
+      if (browser.definitive) {
+        if (directReady) this.whamDirectRetryAt = this.now() + this.whamDirectBackoffMs;
+        directController.abort(new Error('OpenAI WHAM 浏览器请求已先完成'));
+      }
+      return browser.result;
+    };
+
+    if (!directReady) {
+      const browser = await startBrowser();
+      if (browser.result) return browser.result;
+      throw browser.error || new Error('OpenAI 浏览器用量查询失败');
     }
+
+    let delayTimer = null;
+    const delayedBrowser = new Promise(resolve => {
+      delayTimer = setTimeout(() => resolve({ kind: 'delay' }), this.whamBrowserRaceDelayMs);
+    });
+    const first = await Promise.race([directPromise, delayedBrowser]);
+    if (first.kind === 'direct') {
+      clearTimeout(delayTimer);
+      if (first.definitive) {
+        this.whamDirectRetryAt = 0;
+        return first.result;
+      }
+      const browser = await startBrowser();
+      const browserResult = finishWithBrowser(browser);
+      if (browserResult) return browserResult;
+      if (first.result) return first.result;
+      throw first.error || browser.error;
+    }
+
+    const browser = startBrowser();
+    const winner = await Promise.race([directPromise, browser]);
+    if (winner.kind === 'browser') {
+      if (winner.definitive) return finishWithBrowser(winner);
+      const direct = await directPromise;
+      if (direct.definitive) {
+        this.whamDirectRetryAt = 0;
+        return direct.result;
+      }
+      const browserResult = finishWithBrowser(winner);
+      if (browserResult) return browserResult;
+      if (direct.result) return direct.result;
+      throw direct.error || winner.error;
+    }
+
+    if (winner.definitive) {
+      browserController.abort(new Error('OpenAI WHAM 直连请求已先完成'));
+      this.whamDirectRetryAt = 0;
+      return winner.result;
+    }
+    const browserResult = finishWithBrowser(await browser);
+    if (browserResult) return browserResult;
+    if (winner.result) return winner.result;
+    throw winner.error || (await browser).error;
   }
 
-  async #queryOpenAi(provider) {
+  async #queryOpenAi(provider, signal) {
     const tokens = provider.auth?.tokens || {};
     const accountId = String(tokens.account_id || '');
     let accessToken = String(tokens.access_token || '');
     const replacement = this.#findCpaToken(accountId);
     if (replacement?.access_token) accessToken = String(replacement.access_token);
-    let result = accessToken && accountId ? await this.#queryWham(accessToken, accountId) : { status: 401, payload: null };
+    let result = accessToken && accountId ? await this.#queryWham(accessToken, accountId, signal) : { status: 401, payload: null };
     if (result.status !== 200 || !result.payload) {
-      const browserResult = await this.#queryOpenAiBrowser(provider).catch(() => null);
+      const browserResult = await this.#queryOpenAiBrowser(provider, signal).catch(() => null);
       if (browserResult) return browserResult;
       return { source: 'openai_wham', loginRequired: true, message: String(result.payload?.error?.message || 'OpenAI 登录已失效，请在 Hub 中重新登录') };
     }
     return this.#openAiUsage(provider, result.payload, result.transport === 'edge' ? 'openai_wham_browser' : 'openai_wham');
   }
 
-  async #queryOpenAiBrowser(provider) {
+  async #queryOpenAiBrowser(provider, signal) {
     if (!this.browserBroker.hasSession('https://chatgpt.com')) return null;
     const config = loginConfiguration(provider);
-    const raw = await this.browserBroker.queryJson(config);
+    const raw = await this.browserBroker.queryJson(config, { signal });
     const session = parseBrowserJson(raw?.text);
     const accessToken = String(session?.accessToken || session?.access_token || '');
     const accountId = accountIdFromSession(session, accessToken);
     if (!accessToken || !accountId) return null;
-    const result = await this.#queryWham(accessToken, accountId);
+    const result = await this.#queryWham(accessToken, accountId, signal);
     if (result.status !== 200 || !result.payload) return null;
     return this.#openAiUsage(provider, result.payload, 'browser_session');
   }
@@ -718,13 +850,13 @@ export class ProviderQueryEngine {
     return candidates[0]?.auth || null;
   }
 
-  async #queryCpa(provider) {
+  async #queryCpa(provider, signal) {
     const accounts = this.#cpaAuthFiles().map(filename => ({
       label: path.basename(filename, path.extname(filename)),
       auth: this.#readCpaAuth(filename),
     })).filter(item => item.auth?.access_token && item.auth?.account_id);
     const results = await mapWithConcurrency(accounts, 3, async item => {
-      const result = await this.#queryWham(String(item.auth.access_token), String(item.auth.account_id)).catch(() => ({ status: 0, payload: null }));
+      const result = await this.#queryWham(String(item.auth.access_token), String(item.auth.account_id), signal).catch(() => ({ status: 0, payload: null }));
       return {
         label: item.label,
         enabled: !item.auth.disabled,
@@ -745,13 +877,13 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryHealth(provider) {
+  async #queryHealth(provider, signal) {
     const baseUrl = providerApiBase(provider);
     if (!provider.apiKey || !baseUrl) throw new Error('该站没有可用于健康检查的 API Key 或 Base URL');
     const { status, payload } = await fetchJson(this.fetchImpl, `${baseUrl}/models`, {
       Authorization: `Bearer ${provider.apiKey}`,
       Accept: 'application/json',
-    });
+    }, 40_000, 2, signal);
     let local = { requestCount: 0, totalCost: 0 };
     try { local = this.repository.getLocalUsage(provider.id); } catch {}
     const valid = status === 200 && payload && Array.isArray(payload.data);

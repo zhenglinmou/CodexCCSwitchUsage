@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
-import { installTargetOnce, settleTargetOperations } from '../src/target-session.mjs';
+import { acknowledgePageAction, installTargetOnce, settleTargetOperations } from '../src/target-session.mjs';
 
 class FakeCdpClient {
   constructor(version = 0, mounted = version > 0, mountSucceeds = true, visibleComposer = true) {
@@ -120,6 +120,22 @@ test('one-shot target install closes the socket when evaluation fails', async ()
     /renderer unavailable/,
   );
   assert.equal(client.closed, true);
+});
+
+test('page-action acknowledgement is isolated from payload updates and preserves a newer title', async () => {
+  const client = new FakeCdpClient(59, true);
+  client.evaluate = async expression => {
+    client.expressions.push(expression);
+    return false;
+  };
+
+  const acknowledged = await acknowledgePageAction({ webSocketDebuggerUrl: 'ws://main' }, 'Codex\u2063\u2063old-marker', async () => client);
+
+  assert.equal(acknowledged, false, 'a replaced title must not be acknowledged as the older action');
+  assert.equal(client.closed, true);
+  assert.equal(client.expressions.length, 1);
+  assert.match(client.expressions[0], /document\.title !==/);
+  assert.doesNotMatch(client.expressions[0], /\?\.update|\?\.mount|FULL_INJECTOR/);
 });
 
 test('one-shot target code never enables Runtime events or installs bindings', () => {

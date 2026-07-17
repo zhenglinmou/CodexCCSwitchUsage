@@ -252,6 +252,18 @@ test('browser companion bounds a whole provider job and the in-page fetch', () =
   assert.match(source, /scheduleHeartbeat\(\);/);
 });
 
+test('browser companion bounds loopback traffic and reserves time for tab fallback', () => {
+  const source = fs.readFileSync(new URL('../browser-companion/background.js', import.meta.url), 'utf8');
+  const query = source.slice(source.indexOf('async function queryThroughCurrentBrowser('), source.indexOf('async function openLogin('));
+
+  assert.match(source, /const HUB_REQUEST_TIMEOUT_MS = 10_000/);
+  assert.match(source, /const HUB_POLL_TIMEOUT_MS = 30_000/);
+  assert.match(source, /async function requestHub\(/);
+  assert.match(source, /signal: controller\.signal/);
+  assert.match(query, /remainingJobTime\(deadline, TAB_FALLBACK_RESERVE_MS\)/);
+  assert.match(query, /fetchInsideTab\([^;]*remainingJobTime\(deadline\)/s);
+});
+
 test('only an explicit login job may create or focus a website tab', () => {
   const source = fs.readFileSync(new URL('../browser-companion/background.js', import.meta.url), 'utf8');
   const query = source.slice(source.indexOf('async function queryThroughCurrentBrowser('), source.indexOf('async function openLogin('));
@@ -297,6 +309,16 @@ test('idle job polling announces persisted sessions once instead of re-reading t
   assert.match(polling, /await pollOnce\(current\)/);
   assert.match(source, /periodInMinutes:\s*1/);
   assert.equal((source.match(/chrome\.alarms\.create\(POLL_ALARM/g) || []).length, 1);
+});
+
+test('a completed polling batch hands off immediately without waiting for the next alarm', () => {
+  const source = fs.readFileSync(new URL('../browser-companion/background.js', import.meta.url), 'utf8');
+  const polling = source.slice(source.indexOf('async function startPolling('), source.indexOf('async function wake('));
+
+  assert.match(source, /const POLL_BATCH_SIZE = 120/);
+  assert.match(polling, /for \(let iteration = 0; iteration < POLL_BATCH_SIZE; iteration \+= 1\)/);
+  assert.match(polling, /continuePolling = true/);
+  assert.match(polling, /if \(continuePolling\) void startPolling\(\)/);
 });
 
 test('each polling iteration reuses one config and persists lastError only when it changes', () => {

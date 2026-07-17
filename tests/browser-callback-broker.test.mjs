@@ -24,6 +24,40 @@ test('browser callback broker never queues credentials without an active compani
   assert.equal(broker.getStatus().queuedJobs, 0);
 });
 
+test('browser callback broker cancels an obsolete queued query immediately', async () => {
+  const broker = new BrowserCallbackBroker();
+  const controller = new AbortController();
+  broker.heartbeat({ clientId: 'edge-client-one', browser: 'Edge', sessions: ['https://chatgpt.com'] });
+  const resultPromise = broker.queryJson({ baseUrl: 'https://chatgpt.com', requestPath: '/backend-api/wham/usage' }, { signal: controller.signal });
+
+  assert.equal(broker.getStatus().queuedJobs, 1);
+  assert.equal(broker.getStatus().pendingJobs, 1);
+  controller.abort(new Error('direct transport won'));
+
+  await assert.rejects(resultPromise, /direct transport won/);
+  assert.equal(broker.getStatus().queuedJobs, 0);
+  assert.equal(broker.getStatus().pendingJobs, 0);
+  broker.close();
+});
+
+test('browser callback broker releases an obsolete query after a companion has claimed it', async () => {
+  const broker = new BrowserCallbackBroker();
+  const controller = new AbortController();
+  broker.heartbeat({ clientId: 'edge-client-one', browser: 'Edge', sessions: ['https://chatgpt.com'] });
+  const jobPromise = broker.nextJob({ clientId: 'edge-client-one', browser: 'Edge' }, 1_000);
+  const resultPromise = broker.queryJson({ baseUrl: 'https://chatgpt.com', requestPath: '/backend-api/wham/usage' }, { signal: controller.signal });
+  const job = await jobPromise;
+
+  assert.equal(broker.getStatus().queuedJobs, 0);
+  assert.equal(broker.getStatus().pendingJobs, 1);
+  controller.abort(new Error('direct transport won'));
+
+  await assert.rejects(resultPromise, /direct transport won/);
+  assert.equal(broker.getStatus().pendingJobs, 0);
+  assert.equal(broker.complete(job.id, { ok: true, value: { status: 200, text: '{}' } }), false);
+  broker.close();
+});
+
 test('browser callback broker records session origins without storing cookies', () => {
   let now = 1_000_000;
   const broker = new BrowserCallbackBroker({ now: () => now, connectionMaxAgeMs: 20_000 });
