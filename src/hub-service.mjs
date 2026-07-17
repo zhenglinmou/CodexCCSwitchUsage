@@ -205,7 +205,7 @@ export class HubService {
         loginUrl: safeWebsiteUrl(loginConfig?.loginUrl),
         sessionSyncSupported: Boolean(loginConfig?.userHeader),
         queryMethod: describeProviderQuery(provider),
-        balanceUrl: `/v1/balance/${encodeURIComponent(providerAliases(provider).at(-1) || provider.id)}`,
+        balanceUrl: `/v1/balance/${encodeURIComponent(provider.id)}`,
       };
     });
   }
@@ -214,28 +214,37 @@ export class HubService {
     const resolved = this.findProvider(providerSelector);
     if (!resolved) return Promise.reject(new Error('CCSwitch 中不存在这个 Codex 供应商'));
     const id = resolved.id;
-    if (this.refreshes.has(id)) return this.refreshes.get(id);
+    const activeRefresh = this.refreshes.get(id);
+    if (activeRefresh) {
+      if (activeRefresh.provider === resolved) return activeRefresh.promise;
+      return activeRefresh.promise.catch(() => null).then(() => this.refreshProvider(id));
+    }
     const provider = resolved;
     const previous = this.items.get(id);
     const queryStartedAt = this.now();
     this.items.set(id, { ...previous, status: previous.usage ? previous.status : 'loading', message: '' });
     this.revision += 1;
-    const promise = (async () => {
+    const refresh = { provider, promise: null };
+    const isCurrentSnapshot = () => this.providers.get(id) === provider && this.items.has(id);
+    const promise = Promise.resolve().then(async () => {
       try {
         const result = await this.queryEngine.query(provider);
+        if (!isCurrentSnapshot()) return this.items.get(id) || null;
         const usage = safeUsage(result.usage);
+        const current = this.items.get(id);
         const next = {
-          ...this.items.get(id),
+          ...current,
           status: usage ? (result.degraded ? 'degraded' : 'ok') : (result.loginRequired ? 'login-required' : 'error'),
           message: usage ? (result.degraded ? 'API 可用性检查未通过，显示本地统计' : '') : safeMessage(result.message || '没有返回可显示的额度数据'),
           source: String(result.source || ''),
           sessionSyncRequired: result.sessionSyncRequired === true,
           websiteLoginRequired: result.websiteLoginRequired === true,
-          usage: usage || this.items.get(id).usage,
+          usage: usage || current.usage,
           updatedAt: String(usage?.updatedAt || new Date().toISOString()),
         };
         this.items.set(id, next);
       } catch (error) {
+        if (!isCurrentSnapshot()) return this.items.get(id) || null;
         const previous = this.items.get(id);
         const message = safeMessage(error);
         const next = {
@@ -246,17 +255,20 @@ export class HubService {
         };
         this.items.set(id, next);
       } finally {
-        this.items.set(id, {
-          ...this.items.get(id),
-          queryDurationMs: Math.max(0, this.now() - queryStartedAt),
-        });
-        this.refreshes.delete(id);
-        this.revision += 1;
-        this.#writeCache();
+        if (isCurrentSnapshot()) {
+          this.items.set(id, {
+            ...this.items.get(id),
+            queryDurationMs: Math.max(0, this.now() - queryStartedAt),
+          });
+          this.revision += 1;
+          this.#writeCache();
+        }
+        if (this.refreshes.get(id) === refresh) this.refreshes.delete(id);
       }
-      return this.items.get(id);
-    })();
-    this.refreshes.set(id, promise);
+      return this.items.get(id) || null;
+    });
+    refresh.promise = promise;
+    this.refreshes.set(id, refresh);
     return promise;
   }
 
@@ -307,6 +319,14 @@ export class HubService {
     const provider = this.findProvider(providerSelector);
     if (!provider) return { success: false, message: `Unknown provider: ${String(providerSelector || '')}` };
     const item = await this.refreshProvider(provider.id);
+    if (!item) {
+      return {
+        success: false,
+        provider: provider.id,
+        message: '供应商在余额查询期间已变更',
+        login_required: false,
+      };
+    }
     return this.#balanceResponse(item);
   }
 
@@ -324,6 +344,9 @@ export class HubService {
     const id = provider.id;
     if (!loginConfiguration(provider)) throw new Error('该供应商不支持网页登录修复');
     const action = await this.queryEngine.openLogin(provider);
+    if (this.providers.get(id) !== provider || !this.items.has(id)) {
+      throw new Error('供应商在登录操作期间已变更');
+    }
     if (action?.synced === true) return this.refreshProvider(id);
     const item = this.items.get(id);
     this.items.set(id, {

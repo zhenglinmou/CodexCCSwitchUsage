@@ -109,3 +109,24 @@ test('broker exposes a new companion generation when its service worker restarts
   });
   assert.equal(broker.getStatus().generation, first.generation + 1);
 });
+
+test('a queued job falls back when its preferred companion does not claim it', async t => {
+  let now = 1_000;
+  const broker = new BrowserCallbackBroker({ now: () => now, preferredClientGraceMs: 5_000 });
+  t.after(() => broker.close());
+  broker.heartbeat({ clientId: 'edge-client-one', browser: 'Edge', sessions: ['https://anyrouter.top'] });
+  broker.heartbeat({ clientId: 'chrome-client-two', browser: 'Chrome', sessions: [] });
+  const waiting = broker.nextJob({ clientId: 'chrome-client-two', browser: 'Chrome' }, 30_000);
+  const resultPromise = broker.queryJson({ baseUrl: 'https://anyrouter.top', requestPath: '/api/user/self' });
+  resultPromise.catch(() => {});
+
+  assert.equal(broker.getStatus().queuedJobs, 1, 'the preferred browser gets a short claim window');
+  now += 5_001;
+  broker.heartbeat({ clientId: 'chrome-client-two', browser: 'Chrome' });
+  assert.equal(broker.getStatus().queuedJobs, 0, 'another live browser may claim the abandoned job');
+
+  const job = await waiting;
+  assert.equal(job.type, 'query-json');
+  broker.complete(job.id, { ok: true, value: { status: 200, text: '{"success":true}' } });
+  assert.equal((await resultPromise).status, 200);
+});

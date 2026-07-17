@@ -66,6 +66,7 @@ export class HubServer {
     });
     this.server = null;
     this.boundPort = 0;
+    this.startPromise = null;
   }
 
   get pagePath() {
@@ -81,22 +82,39 @@ export class HubServer {
   }
 
   async start() {
-    if (this.server) return this.url;
-    this.server = http.createServer((request, response) => {
-      this.#handle(request, response).catch(error => jsonResponse(response, 500, { success: false, message: error.message }));
-    });
-    await this.#listen(this.port);
-    this.boundPort = this.server.address().port;
-    return this.url;
+    if (this.server?.listening && this.boundPort) return this.url;
+    if (this.startPromise) return this.startPromise;
+    const startPromise = (async () => {
+      const server = http.createServer((request, response) => {
+        this.#handle(request, response).catch(error => jsonResponse(response, 500, { success: false, message: error.message }));
+      });
+      this.server = server;
+      try {
+        await this.#listen(server, this.port);
+        this.boundPort = server.address().port;
+        return this.url;
+      } catch (error) {
+        if (this.server === server) this.server = null;
+        this.boundPort = 0;
+        try { server.close(); } catch {}
+        throw error;
+      }
+    })();
+    this.startPromise = startPromise;
+    try {
+      return await startPromise;
+    } finally {
+      if (this.startPromise === startPromise) this.startPromise = null;
+    }
   }
 
-  async #listen(port) {
+  async #listen(server, port) {
     await new Promise((resolve, reject) => {
-      const onError = error => { this.server.off('listening', onListening); reject(error); };
-      const onListening = () => { this.server.off('error', onError); resolve(); };
-      this.server.once('error', onError);
-      this.server.once('listening', onListening);
-      this.server.listen(port, '127.0.0.1');
+      const onError = error => { server.off('listening', onListening); reject(error); };
+      const onListening = () => { server.off('error', onError); resolve(); };
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.listen(port, '127.0.0.1');
     });
   }
 
@@ -222,6 +240,9 @@ export class HubServer {
   }
 
   async close() {
+    if (this.startPromise) {
+      try { await this.startPromise; } catch {}
+    }
     if (!this.server) return;
     const server = this.server;
     this.server = null;

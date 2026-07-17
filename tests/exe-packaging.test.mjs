@@ -56,17 +56,21 @@ test('installer upgrades only stop the plugin host and preserve runtime data', (
 test('repeatable EXE build embeds the current Node runtime and emits a versioned installer', () => {
   const packageJson = JSON.parse(read('package.json'));
   const build = read('scripts/build-exe.ps1');
+  const install = read('scripts/install.ps1');
 
   assert.equal(packageJson.scripts['build:exe'].includes('scripts/build-exe.ps1'), true);
   assert.match(build, /runtime-bin\\node\.exe/);
-  assert.match(build, /'src\\cdp-disconnect-guard\.mjs'/);
-  for (const file of ['browser-callback-broker', 'hub-provider-adapters', 'hub-service', 'hub-page', 'hub-server']) {
+  for (const file of ['browser-callback-broker', 'hub-provider-adapters', 'hub-service', 'hub-page', 'hub-server', 'keyed-backoff', 'page-action-channel']) {
     assert.match(build, new RegExp(`'src\\\\${file}\\.mjs'`));
+    assert.match(install, new RegExp(`'src\\\\${file}\\.mjs'`));
   }
-  for (const file of ['manifest.json', 'background.js', 'popup.html', 'popup.js', 'README.md']) {
+  for (const file of ['manifest.json', 'background.js', 'session-state.js', 'popup.html', 'popup.js', 'README.md']) {
     const escaped = file.replaceAll('.', '\\.');
     assert.match(build, new RegExp(`'browser-companion\\\\${escaped}'`));
+    assert.match(install, new RegExp(`'browser-companion\\\\${escaped}'`));
   }
+  assert.doesNotMatch(build, /'src\\(?:cdp-disconnect-guard|target-discovery)\.mjs'/);
+  assert.doesNotMatch(install, /'src\\(?:cdp-disconnect-guard|target-discovery)\.mjs'/);
   assert.match(build, /nodeProbe\.arch -ne 'x64'/);
   assert.match(build, /nodeProbe\.major -lt 22/);
   assert.match(build, /Framework64\\v4\.0\.30319\\csc\.exe/);

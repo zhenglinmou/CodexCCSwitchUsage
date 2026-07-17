@@ -24,12 +24,14 @@ export class BrowserCallbackBroker {
     this.now = options.now || Date.now;
     this.connectionMaxAgeMs = Math.max(10_000, Number(options.connectionMaxAgeMs) || 45_000);
     this.queryTimeoutMs = Math.max(10_000, Number(options.queryTimeoutMs) || 75_000);
+    this.preferredClientGraceMs = Math.max(1_000, Number(options.preferredClientGraceMs) || 5_000);
     this.clients = new Map();
     this.queue = [];
     this.waiters = [];
     this.pending = new Map();
     this.closed = false;
     this.generation = 0;
+    this.preferenceTimer = null;
   }
 
   heartbeat(payload = {}) {
@@ -98,7 +100,10 @@ export class BrowserCallbackBroker {
     if (!clientId) throw new Error('浏览器伴侣 clientId 无效');
     this.heartbeat(payload);
     const queued = this.#takeJob(clientId);
-    if (queued) return queued.publicJob;
+    if (queued) {
+      this.#schedulePreferenceRelease();
+      return queued.publicJob;
+    }
     return new Promise(resolve => {
       const waiter = { clientId, resolve, timer: null };
       waiter.timer = setTimeout(() => {
@@ -146,6 +151,8 @@ export class BrowserCallbackBroker {
     }
     this.pending.clear();
     this.queue = [];
+    if (this.preferenceTimer) clearTimeout(this.preferenceTimer);
+    this.preferenceTimer = null;
   }
 
   #enqueue(type, request, timeoutMs, options = {}) {
@@ -180,14 +187,20 @@ export class BrowserCallbackBroker {
         this.pending.delete(id);
         this.queue = this.queue.filter(item => item.publicJob.id !== id);
         clearTimeout(pending.timer);
+        this.#schedulePreferenceRelease();
         pending.reject(signal.reason || new Error('浏览器余额回调已取消'));
       };
       pending.timer = setTimeout(() => {
         this.pending.delete(id);
         this.queue = this.queue.filter(job => job.publicJob.id !== id);
+        this.#schedulePreferenceRelease();
         pending.reject(new Error('等待现有浏览器余额回调超时'));
       }, timeoutMs);
-      const job = { publicJob, preferredClientId };
+      const job = {
+        publicJob,
+        preferredClientId,
+        preferredUntil: preferredClientId ? this.now() + this.preferredClientGraceMs : 0,
+      };
       this.pending.set(id, pending);
       this.queue.push(job);
       signal?.addEventListener('abort', abort, { once: true });
@@ -208,6 +221,7 @@ export class BrowserCallbackBroker {
   }
 
   #dispatch() {
+    this.#releaseExpiredPreferences();
     for (const waiter of [...this.waiters]) {
       const job = this.#takeJob(waiter.clientId);
       if (!job) continue;
@@ -215,6 +229,30 @@ export class BrowserCallbackBroker {
       this.waiters = this.waiters.filter(item => item !== waiter);
       waiter.resolve(job.publicJob);
     }
+    this.#schedulePreferenceRelease();
+  }
+
+  #releaseExpiredPreferences() {
+    const now = this.now();
+    for (const job of this.queue) {
+      if (job.preferredClientId && now >= job.preferredUntil) job.preferredClientId = '';
+    }
+  }
+
+  #schedulePreferenceRelease() {
+    if (this.preferenceTimer) clearTimeout(this.preferenceTimer);
+    this.preferenceTimer = null;
+    if (this.closed) return;
+    const now = this.now();
+    const next = this.queue
+      .filter(job => job.preferredClientId && job.preferredUntil > now)
+      .reduce((minimum, job) => Math.min(minimum, job.preferredUntil), Number.POSITIVE_INFINITY);
+    if (!Number.isFinite(next)) return;
+    this.preferenceTimer = setTimeout(() => {
+      this.preferenceTimer = null;
+      this.#dispatch();
+    }, Math.max(1, next - now));
+    this.preferenceTimer.unref?.();
   }
 }
 

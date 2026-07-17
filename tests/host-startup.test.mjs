@@ -9,7 +9,7 @@ function hostSource() {
 test('host starts Balance Hub before its first one-shot main-page injection', () => {
   const source = hostSource();
   const loop = source.slice(source.indexOf('async function loop()'), source.indexOf('function shutdown('));
-  const hubStart = loop.indexOf('await hubServer.start()');
+  const hubStart = loop.indexOf('await ensureHubServer(true)');
   const targetSync = loop.indexOf('await requestTargetSync({ audit: true })');
 
   assert.ok(hubStart >= 0, 'Balance Hub must start first');
@@ -159,6 +159,42 @@ test('current-provider scheduling resumes from the cached query timestamp after 
   assert.match(source, /let lastQueryAt = Number\.isFinite\(cachedQueryAt\) \? Math\.min\(Date\.now\(\), cachedQueryAt\) : 0/);
 });
 
+test('current-provider configuration changes bypass the cached five-minute query interval', () => {
+  const source = hostSource();
+  const refresh = source.slice(source.indexOf('async function refreshCurrentProvider('), source.indexOf('function requestCurrentProviderRefresh('));
+
+  assert.match(source, /function providerRefreshSignature\(provider\)/);
+  assert.match(refresh, /const providerConfigurationChanged = providerSignature !== lastProviderSignature/);
+  assert.match(refresh, /!providerConfigurationChanged && !due/);
+  assert.match(refresh, /const syncResult = syncHubProviders\(\)/);
+  assert.match(refresh, /providerRefreshSignature\(hubProvider\) !== providerSignature/);
+  assert.doesNotMatch(refresh, /if \(!hubService\.findProvider\(provider\.id\)\) hubService\.syncProviders\(\)/);
+  assert.match(refresh, /lastProviderSignature = providerSignature/);
+});
+
+test('database change tokens advance only after a successful provider sync', () => {
+  const source = hostSource();
+  const watcher = source.slice(source.indexOf('function startDatabaseWatcher()'), source.indexOf('function startControlWatcher()'));
+
+  assert.match(watcher, /const nextDatabaseChangeToken = repository\.getChangeToken\(\)/);
+  assert.match(watcher, /const syncResult = syncHubProviders\(\)/);
+  assert.match(watcher, /if \(!syncResult\.succeeded\)/);
+  assert.match(watcher, /databaseChangeToken = nextDatabaseChangeToken/);
+  assert.ok(
+    watcher.indexOf('databaseChangeToken = nextDatabaseChangeToken') > watcher.indexOf('if (!syncResult.succeeded)'),
+    'the consumed token must be committed only after provider sync succeeds',
+  );
+});
+
+test('host retries a failed Balance Hub listener without restarting Codex', () => {
+  const source = hostSource();
+
+  assert.match(source, /const HUB_RETRY_MS = 5_000/);
+  assert.match(source, /async function ensureHubServer/);
+  assert.match(source, /await ensureHubServer\(true\)/);
+  assert.match(source, /ensureHubServer\(\)/);
+});
+
 test('host never refreshes provider balances merely because the browser companion reconnects', () => {
   const source = hostSource();
 
@@ -175,7 +211,7 @@ test('database watcher coalesces file bursts with a low-latency debounce', () =>
   assert.ok(debounce, 'database watcher debounce must remain explicit');
   assert.ok(Number(debounce[1]) >= 75 && Number(debounce[1]) <= 150, 'debounce should coalesce WAL bursts without visible delay');
   assert.match(watcher, /if \(databaseWatchTimer\) clearTimeout\(databaseWatchTimer\)/);
-  assert.match(watcher, /const providersChanged = syncHubProviders\(\)/);
-  assert.match(watcher, /if \(providersChanged\) requestCurrentProviderRefresh\(false, true\)/);
+  assert.match(watcher, /const syncResult = syncHubProviders\(\)/);
+  assert.match(watcher, /if \(syncResult\.changed\) requestCurrentProviderRefresh\(false, true\)/);
   assert.match(watcher, /}, DATABASE_WATCH_DEBOUNCE_MS\);/);
 });

@@ -10,6 +10,7 @@ const WHAM_BROWSER_RACE_DELAY_MS = 400;
 const WHAM_DIRECT_BACKOFF_MS = 300_000;
 const WHAM_RESULT_CACHE_MS = 30_000;
 const PROVIDER_QUERY_TIMEOUT_MS = 45_000;
+const PROVIDER_SCOPED_NAME = Symbol('providerScopedName');
 
 export function parseBrowserJson(text) {
   const source = String(text || '').trim();
@@ -50,11 +51,32 @@ function browserPageUnavailable(message) {
 }
 
 function providerApiBase(provider) {
-  return String(provider?.apiBaseUrl || provider?.baseUrl || '').replace(/\/+$/, '');
+  const value = configuredProviderApiBase(provider);
+  if (!value) return '';
+  try {
+    const url = new URL(value);
+    const loopback = ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(url.hostname.toLowerCase());
+    if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) return '';
+    return value;
+  } catch {
+    return '';
+  }
+}
+
+function configuredProviderApiBase(provider) {
+  return String(provider?.apiBaseUrl || provider?.baseUrl || '').trim().replace(/\/+$/, '');
+}
+
+function requiredProviderApiBase(provider, fallback = '') {
+  const configured = configuredProviderApiBase(provider);
+  if (!configured) return fallback;
+  const safe = providerApiBase(provider);
+  if (!safe) throw new Error('非本地供应商接口必须使用 HTTPS');
+  return safe;
 }
 
 function usageResult(provider, values) {
-  return normalizeUsage(provider, {
+  const usage = normalizeUsage(provider, {
     isValid: values.isValid !== false,
     invalidMessage: values.invalidMessage || '',
     planName: values.planName || provider.name,
@@ -66,6 +88,10 @@ function usageResult(provider, values) {
     periodLabel: values.periodLabel || '',
     hideTotal: values.hideTotal === true,
   });
+  if (values.providerScopedName === true) {
+    Object.defineProperty(usage, PROVIDER_SCOPED_NAME, { value: true });
+  }
+  return usage;
 }
 
 async function readJsonResponse(response) {
@@ -186,6 +212,7 @@ function windowLabel(seconds, fallback) {
 }
 
 export function summarizeWham(payload) {
+  if (!isWhamUsagePayload(payload)) throw new Error('OpenAI 用量响应缺少有效额度窗口');
   const rateLimit = payload?.rate_limit || {};
   const limits = [];
   for (const [id, fallback] of [['primary', '主窗口'], ['secondary', '次窗口']]) {
@@ -213,6 +240,16 @@ export function summarizeWham(payload) {
     creditBalance: payload?.credits?.balance ?? null,
     limitReached: Boolean(rateLimit.limit_reached),
   };
+}
+
+export function isWhamUsagePayload(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+  const rateLimit = payload.rate_limit;
+  if (!rateLimit || typeof rateLimit !== 'object' || Array.isArray(rateLimit)) return false;
+  return ['primary_window', 'secondary_window'].some(key => {
+    const window = rateLimit[key];
+    return window && typeof window === 'object' && finiteOrNull(window.used_percent) !== null;
+  });
 }
 
 export function providerKind(provider) {
@@ -440,6 +477,7 @@ export class ProviderQueryEngine {
       usage: {
         ...result.usage,
         providerId: provider.id,
+        providerName: result.usage[PROVIDER_SCOPED_NAME] ? provider.name : result.usage.providerName,
         websiteUrl: provider.websiteUrl,
       },
     };
@@ -453,7 +491,7 @@ export class ProviderQueryEngine {
     if (kind === 'deepseek') return this.#queryDeepSeek(provider, signal);
     if (kind === 'packy') return this.#queryPacky(provider, signal);
     if (kind === 'paid') return this.#queryPaid(provider, signal);
-    if (provider.apiKey && providerApiBase(provider)) return this.#queryHealth(provider, signal);
+    if (provider.apiKey && configuredProviderApiBase(provider)) return this.#queryHealth(provider, signal);
     throw new Error('该供应商没有可用的 API Key、Base URL 或内置余额适配器');
   }
 
@@ -549,6 +587,7 @@ export class ProviderQueryEngine {
     return {
       usage: usageResult(provider, {
         planName: data.group || provider.name,
+        providerScopedName: !data.group,
         remaining,
         used,
         total: remaining + used,
@@ -561,7 +600,7 @@ export class ProviderQueryEngine {
   }
 
   async #queryDeepSeek(provider, signal) {
-    const baseUrl = providerApiBase(provider) || 'https://api.deepseek.com';
+    const baseUrl = requiredProviderApiBase(provider, 'https://api.deepseek.com');
     const { status, payload } = await fetchJson(this.fetchImpl, `${baseUrl}/user/balance`, {
       Authorization: `Bearer ${provider.apiKey}`,
       Accept: 'application/json',
@@ -601,7 +640,7 @@ export class ProviderQueryEngine {
   }
 
   async #queryPaid(provider, signal) {
-    const baseUrl = providerApiBase(provider);
+    const baseUrl = requiredProviderApiBase(provider);
     if (!provider.apiKey || !baseUrl) throw new Error('付费站没有可用的 API Key 或 Base URL');
     const { status, payload } = await fetchJson(this.fetchImpl, `${baseUrl}/user/balance`, {
       Authorization: `Bearer ${provider.apiKey}`,
@@ -625,6 +664,7 @@ export class ProviderQueryEngine {
     return {
       usage: usageResult(provider, {
         planName: provider.name,
+        providerScopedName: true,
         extra: `3H剩:${short(quota3h.remaining)}`,
         periodLabel: '1D',
         hideTotal: true,
@@ -652,7 +692,7 @@ export class ProviderQueryEngine {
     this.whamInFlight.set(cacheKey, operation);
     try {
       const result = await operation;
-      if (result?.status === 200 && result.payload) {
+      if (result?.status === 200 && isWhamUsagePayload(result.payload)) {
         this.whamRecent.set(cacheKey, { result, createdAt: this.now() });
       }
       return result;
@@ -687,7 +727,8 @@ export class ProviderQueryEngine {
         combinedSignal(signal, directController.signal),
       ).then(result => ({
         kind: 'direct',
-        definitive: Boolean(result.payload) || ![403, 429, 500, 502, 503, 504].includes(result.status),
+        definitive: isWhamUsagePayload(result.payload)
+          || (result.status !== 200 && (Boolean(result.payload) || ![403, 429, 500, 502, 503, 504].includes(result.status))),
         result: { ...result, transport: 'node' },
         error: null,
       }), error => ({ kind: 'direct', definitive: false, result: null, error }))
@@ -714,7 +755,7 @@ export class ProviderQueryEngine {
         waitMs: 30_000,
       }, { signal: combinedSignal(signal, browserController.signal) }).then(raw => {
         const result = { status: Number(raw?.status) || 0, payload: parseBrowserJson(raw?.text), text: String(raw?.text || ''), transport: 'edge' };
-        return { kind: 'browser', definitive: result.status === 200 && Boolean(result.payload), result, error: null };
+        return { kind: 'browser', definitive: result.status === 200 && isWhamUsagePayload(result.payload), result, error: null };
       }, error => ({ kind: 'browser', definitive: false, result: null, error }));
       return browserPromise;
     };
@@ -785,10 +826,11 @@ export class ProviderQueryEngine {
     const replacement = this.#findCpaToken(accountId);
     if (replacement?.access_token) accessToken = String(replacement.access_token);
     let result = accessToken && accountId ? await this.#queryWham(accessToken, accountId, signal) : { status: 401, payload: null };
-    if (result.status !== 200 || !result.payload) {
+    if (result.status !== 200 || !isWhamUsagePayload(result.payload)) {
       const browserResult = await this.#queryOpenAiBrowser(provider, signal).catch(() => null);
       if (browserResult) return browserResult;
-      return { source: 'openai_wham', loginRequired: true, message: String(result.payload?.error?.message || 'OpenAI 登录已失效，请在 Hub 中重新登录') };
+      const payloadError = typeof result.payload?.error === 'string' ? result.payload.error : result.payload?.error?.message;
+      return { source: 'openai_wham', loginRequired: true, message: String(payloadError || result.payload?.message || 'OpenAI 登录已失效，请在 Hub 中重新登录') };
     }
     return this.#openAiUsage(provider, result.payload, result.transport === 'edge' ? 'openai_wham_browser' : 'openai_wham');
   }
@@ -802,7 +844,7 @@ export class ProviderQueryEngine {
     const accountId = accountIdFromSession(session, accessToken);
     if (!accessToken || !accountId) return null;
     const result = await this.#queryWham(accessToken, accountId, signal);
-    if (result.status !== 200 || !result.payload) return null;
+    if (result.status !== 200 || !isWhamUsagePayload(result.payload)) return null;
     return this.#openAiUsage(provider, result.payload, 'browser_session');
   }
 
@@ -860,7 +902,7 @@ export class ProviderQueryEngine {
       return {
         label: item.label,
         enabled: !item.auth.disabled,
-        summary: result.status === 200 && result.payload ? summarizeWham(result.payload) : null,
+        summary: result.status === 200 && isWhamUsagePayload(result.payload) ? summarizeWham(result.payload) : null,
       };
     });
     const successful = results.filter(item => item.summary);
@@ -878,7 +920,7 @@ export class ProviderQueryEngine {
   }
 
   async #queryHealth(provider, signal) {
-    const baseUrl = providerApiBase(provider);
+    const baseUrl = requiredProviderApiBase(provider);
     if (!provider.apiKey || !baseUrl) throw new Error('该站没有可用于健康检查的 API Key 或 Base URL');
     const { status, payload } = await fetchJson(this.fetchImpl, `${baseUrl}/models`, {
       Authorization: `Bearer ${provider.apiKey}`,
@@ -891,6 +933,7 @@ export class ProviderQueryEngine {
     return {
       usage: usageResult(provider, {
         planName: provider.name,
+        providerScopedName: true,
         used: local.totalCost,
         remaining: null,
         total: null,

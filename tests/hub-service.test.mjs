@@ -135,6 +135,69 @@ test('Hub provider sync skips state rebuilds when the repository snapshot identi
   assert.equal(service.getState().providers.length, 2);
 });
 
+test('removing a provider during refresh neither throws nor resurrects a partial item', async () => {
+  let providers = [provider('one', 'DeepSeek', true)];
+  let finishQuery;
+  const service = new HubService({ getAll: () => providers }, {
+    query: async () => new Promise(resolve => { finishQuery = resolve; }),
+  });
+
+  const refresh = service.refreshProvider('one');
+  const balance = service.queryBalance('one');
+  await Promise.resolve();
+  providers = [];
+  service.syncProviders();
+  finishQuery({ source: 'test', message: 'obsolete result' });
+
+  assert.equal(await refresh, null);
+  assert.deepEqual(await balance, {
+    success: false,
+    provider: 'one',
+    message: '供应商在余额查询期间已变更',
+    login_required: false,
+  });
+  assert.deepEqual(service.getState().providers, []);
+});
+
+test('replacing provider configuration during refresh queues a query for the new snapshot', async () => {
+  let providers = [provider('one', 'DeepSeek old', true)];
+  const pendingQueries = [];
+  const service = new HubService({ getAll: () => providers }, {
+    query: async item => new Promise(resolve => pendingQueries.push({ item, resolve })),
+  });
+
+  const firstRefresh = service.refreshProvider('one');
+  await Promise.resolve();
+  providers = [provider('one', 'DeepSeek new', true)];
+  service.syncProviders();
+  const replacementRefresh = service.refreshProvider('one');
+  pendingQueries[0].resolve({
+    source: 'test',
+    usage: {
+      status: 'ok', providerId: 'one', providerName: 'DeepSeek old', used: 1, remaining: 9, total: 10,
+      unit: 'USD', extra: '', updatedAt: '2026-07-17T00:00:00.000Z', refreshIntervalMinutes: 5,
+    },
+  });
+  const obsoleteRefresh = await firstRefresh;
+  assert.equal(obsoleteRefresh.name, 'DeepSeek new');
+  assert.equal(obsoleteRefresh.usage, null);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(pendingQueries.length, 2);
+  assert.equal(pendingQueries[1].item.name, 'DeepSeek new');
+  pendingQueries[1].resolve({
+    source: 'test',
+    usage: {
+      status: 'ok', providerId: 'one', providerName: 'DeepSeek new', used: 2, remaining: 8, total: 10,
+      unit: 'USD', extra: '', updatedAt: '2026-07-17T00:01:00.000Z', refreshIntervalMinutes: 5,
+    },
+  });
+
+  const refreshed = await replacementRefresh;
+  assert.equal(refreshed.name, 'DeepSeek new');
+  assert.equal(refreshed.usage.providerName, 'DeepSeek new');
+  assert.equal(refreshed.usage.remaining, 8);
+});
+
 test('Hub errors redact bearer tokens and preserve the last successful usage', async () => {
   const item = provider('one', 'AgentRouter');
   let fail = false;
@@ -268,7 +331,7 @@ test('Hub resolves stable aliases and exposes normalized balance responses', asy
   });
 
   assert.equal(service.findProvider('agentrouter').id, item.id);
-  assert.ok(service.listPublicProviders()[0].balanceUrl.endsWith('/agentrouter'));
+  assert.ok(service.listPublicProviders()[0].balanceUrl.endsWith('/provider-one'));
   assert.equal(service.listPublicProviders()[0].queryMethod.requiresBrowser, true);
   assert.equal(service.getState().providers[0].loginUrl, 'https://agentrouter.org/login');
   assert.equal(service.listPublicProviders()[0].loginUrl, 'https://agentrouter.org/login');
@@ -276,6 +339,22 @@ test('Hub resolves stable aliases and exposes normalized balance responses', asy
   assert.equal(response.success, true);
   assert.equal(response.data.remaining, 9);
   assert.equal(response.data.source, 'browser_session');
+});
+
+test('public balance URLs remain unique when provider aliases collide', () => {
+  const providers = [
+    provider('deepseek-one', 'DeepSeek'),
+    provider('deepseek-two', 'DeepSeek copy'),
+  ];
+  const service = new HubService({ getAll: () => providers }, { query: async () => ({}) });
+  const listed = service.listPublicProviders();
+
+  assert.deepEqual(listed.map(item => item.balanceUrl), [
+    '/v1/balance/deepseek-one',
+    '/v1/balance/deepseek-two',
+  ]);
+  assert.equal(service.findProvider('deepseek').id, 'deepseek-one', 'the optional alias may remain ambiguous');
+  assert.equal(service.findProvider('deepseek-two').id, 'deepseek-two', 'the advertised URL must use the unique id');
 });
 
 test('Codex footer payload is derived from Hub state and preserves cached usage on login errors', () => {

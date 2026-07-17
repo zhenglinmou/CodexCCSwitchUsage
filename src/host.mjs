@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { BrowserCallbackBroker } from './browser-callback-broker.mjs';
 import { hasAuxiliaryPageTargets, isCodexTargetCandidate, listCdpTargets } from './cdp-client.mjs';
 import { ProviderRepository } from './provider-repository.mjs';
@@ -18,6 +19,7 @@ const PAGE_ACTION_POLL_MS = 1_000;
 const DATABASE_AUDIT_MS = 60_000;
 const INJECTOR_AUDIT_MS = 300_000;
 const STATUS_HEARTBEAT_MS = 300_000;
+const HUB_RETRY_MS = 5_000;
 
 function parseArgs(argv) {
   const result = { port: 9334, database: path.join(process.env.USERPROFILE, '.cc-switch', 'cc-switch.db'), runtimeDir: path.join(process.cwd(), 'runtime') };
@@ -55,15 +57,19 @@ function readUsageCache() {
   }
 }
 
-function writeUsageCache(payload) {
+function writeUsageCache(payload, providerSignature = '') {
   const temporary = `${cachePath}.tmp`;
-  fs.writeFileSync(temporary, JSON.stringify(payload), 'utf8');
+  fs.writeFileSync(temporary, JSON.stringify({ ...payload, providerSignature }), 'utf8');
   fs.renameSync(temporary, cachePath);
 }
 
-let lastPayload = readUsageCache() || { status: 'loading', providerName: 'CCSwitch', message: '读取中…' };
+const cachedUsage = readUsageCache();
+const cachedProviderSignature = String(cachedUsage?.providerSignature || '');
+if (cachedUsage) delete cachedUsage.providerSignature;
+let lastPayload = cachedUsage || { status: 'loading', providerName: 'CCSwitch', message: '读取中…' };
 const cachedQueryAt = Date.parse(String(lastPayload.updatedAt || ''));
 let lastProviderId = lastPayload.providerId || '';
+let lastProviderSignature = cachedProviderSignature;
 let lastQueryAt = Number.isFinite(cachedQueryAt) ? Math.min(Date.now(), cachedQueryAt) : 0;
 let stopped = false;
 let stopReason = null;
@@ -89,6 +95,7 @@ let targetSyncPromise = null;
 let targetSyncPending = false;
 let targetAuditPending = false;
 let fallbackWake = null;
+let lastHubStartAttemptAt = 0;
 
 fs.writeFileSync(pidPath, String(process.pid), 'utf8');
 
@@ -130,6 +137,21 @@ function safeMessage(error) {
   return message.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]').replace(/sk-[A-Za-z0-9_-]+/g, '[redacted]');
 }
 
+function providerRefreshSignature(provider) {
+  if (!provider) return '';
+  const material = JSON.stringify([
+    provider.id,
+    provider.name,
+    provider.websiteUrl,
+    provider.apiKey,
+    provider.apiBaseUrl,
+    provider.baseUrl,
+    provider.auth,
+    provider.usage,
+  ]);
+  return crypto.createHash('sha256').update(material).digest('base64url');
+}
+
 function wakeFallbackPoll() {
   fallbackWake?.();
 }
@@ -168,6 +190,8 @@ async function refreshCurrentProvider(force = false) {
   }
 
   if (!provider) {
+    lastProviderId = '';
+    lastProviderSignature = '';
     lastPayload = { status: 'error', providerName: 'CCSwitch', message: '没有找到当前 Codex 供应商' };
     writeStatus({ error: lastPayload.message });
     scheduleCurrentProviderRefresh(60_000);
@@ -175,20 +199,32 @@ async function refreshCurrentProvider(force = false) {
   }
 
   const providerChanged = provider.id !== lastProviderId;
+  const providerSignature = providerRefreshSignature(provider);
+  const providerConfigurationChanged = providerSignature !== lastProviderSignature;
   const intervalMs = CURRENT_PROVIDER_REFRESH_MS;
   const elapsedMs = Date.now() - lastQueryAt;
   const due = elapsedMs >= intervalMs;
-  if (!force && !providerChanged && !due) {
+  if (!force && !providerChanged && !providerConfigurationChanged && !due) {
     scheduleCurrentProviderRefresh(intervalMs - elapsedMs);
     return false;
   }
 
-  lastProviderId = provider.id;
+  let configurationReady = false;
   try {
-    if (!hubService.findProvider(provider.id)) hubService.syncProviders();
+    const syncResult = syncHubProviders();
+    if (!syncResult.succeeded) throw syncResult.error;
+    const hubProvider = hubService.findProvider(provider.id);
+    if (!hubProvider) throw new Error('当前供应商尚未同步到 Balance Hub');
+    if (providerRefreshSignature(hubProvider) !== providerSignature) {
+      throw new Error('当前供应商配置与 Balance Hub 快照不一致');
+    }
+    configurationReady = true;
+    lastProviderId = provider.id;
+    lastProviderSignature = providerSignature;
     const item = await hubService.refreshProvider(provider.id);
+    if (!item) throw new Error('当前供应商在额度刷新期间已变更');
     lastPayload = hubItemToUsagePayload(provider, item);
-    if (lastPayload.status === 'ok') writeUsageCache(lastPayload);
+    if (lastPayload.status === 'ok') writeUsageCache(lastPayload, providerSignature);
     lastQueryAt = Date.now();
     const failed = ['error', 'login-required'].includes(item.status);
     writeStatus({ error: failed ? item.message : null });
@@ -210,7 +246,7 @@ async function refreshCurrentProvider(force = false) {
       };
     }
     writeStatus({ error: message });
-    scheduleCurrentProviderRefresh(intervalMs);
+    scheduleCurrentProviderRefresh(configurationReady ? intervalMs : 60_000);
     return true;
   }
 }
@@ -251,6 +287,24 @@ function openHubFromAction() {
   } catch (error) {
     lastHubError = safeMessage(error);
     writeStatus({ hubError: lastHubError });
+  }
+}
+
+async function ensureHubServer(force = false) {
+  if (hubServer.boundPort) return true;
+  const now = Date.now();
+  if (!force && now - lastHubStartAttemptAt < HUB_RETRY_MS) return false;
+  lastHubStartAttemptAt = now;
+  const previousError = lastHubError;
+  try {
+    await hubServer.start();
+    lastHubError = null;
+    if (previousError) writeStatus({ hubError: null });
+    return true;
+  } catch (error) {
+    lastHubError = safeMessage(error);
+    if (lastHubError !== previousError) writeStatus({ hubError: lastHubError });
+    return false;
   }
 }
 
@@ -375,9 +429,9 @@ function requestTargetSync({ audit = false } = {}) {
 
 function syncHubProviders() {
   try {
-    return hubService.syncProviders().changed;
-  } catch {
-    return true;
+    return { succeeded: true, changed: hubService.syncProviders().changed, error: null };
+  } catch (error) {
+    return { succeeded: false, changed: false, error };
   }
 }
 
@@ -392,10 +446,17 @@ function startDatabaseWatcher() {
       if (databaseWatchTimer) clearTimeout(databaseWatchTimer);
       databaseWatchTimer = setTimeout(() => {
         databaseWatchTimer = null;
-        databaseChangeToken = repository.getChangeToken();
+        const nextDatabaseChangeToken = repository.getChangeToken();
+        const syncResult = syncHubProviders();
+        if (!syncResult.succeeded) {
+          lastDatabaseAuditAt = Date.now() - DATABASE_AUDIT_MS + WATCHER_RETRY_MS;
+          writeStatus({ error: safeMessage(syncResult.error) });
+          wakeFallbackPoll();
+          return;
+        }
+        databaseChangeToken = nextDatabaseChangeToken;
         lastDatabaseAuditAt = Date.now();
-        const providersChanged = syncHubProviders();
-        if (providersChanged) requestCurrentProviderRefresh(false, true);
+        if (syncResult.changed) requestCurrentProviderRefresh(false, true);
       }, DATABASE_WATCH_DEBOUNCE_MS);
     });
     databaseWatcher.on('error', () => {
@@ -447,12 +508,7 @@ function nextMaintenanceDelay() {
 }
 
 async function loop() {
-  try {
-    await hubServer.start();
-    lastHubError = null;
-  } catch (error) {
-    lastHubError = safeMessage(error);
-  }
+  await ensureHubServer(true);
   await requestTargetSync({ audit: true });
   startDatabaseWatcher();
   startControlWatcher();
@@ -463,18 +519,28 @@ async function loop() {
     if (stopped) break;
     const now = Date.now();
     const databaseAuditDue = !databaseWatcher || now - lastDatabaseAuditAt >= DATABASE_AUDIT_MS;
-    let databaseChanged = false;
+    let providersChanged = false;
     if (databaseAuditDue) {
       const currentDatabaseChangeToken = repository.getChangeToken();
-      databaseChanged = currentDatabaseChangeToken !== databaseChangeToken;
-      databaseChangeToken = currentDatabaseChangeToken;
-      lastDatabaseAuditAt = now;
+      if (currentDatabaseChangeToken !== databaseChangeToken) {
+        const syncResult = syncHubProviders();
+        if (syncResult.succeeded) {
+          databaseChangeToken = currentDatabaseChangeToken;
+          lastDatabaseAuditAt = now;
+          providersChanged = syncResult.changed;
+        } else {
+          lastDatabaseAuditAt = now - DATABASE_AUDIT_MS + WATCHER_RETRY_MS;
+          writeStatus({ error: safeMessage(syncResult.error) });
+        }
+      } else {
+        lastDatabaseAuditAt = now;
+      }
     }
-    const providersChanged = databaseChanged && syncHubProviders();
     startDatabaseWatcher();
     startControlWatcher();
     const auditDue = now - lastInjectorAuditAt >= INJECTOR_AUDIT_MS;
     await Promise.allSettled([
+      ensureHubServer(),
       providersChanged ? requestCurrentProviderRefresh(false, true) : Promise.resolve(),
       requestTargetSync({ audit: auditDue || providersChanged }),
     ]);

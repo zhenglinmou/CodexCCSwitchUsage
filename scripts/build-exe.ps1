@@ -42,14 +42,14 @@ if ($nodeProbe.arch -ne 'x64' -or [int]$nodeProbe.major -lt 22 -or -not $nodePro
 $payloadFiles = @(
     'package.json', '.gitignore', 'README.md', 'assets\codex.ico',
     'src\provider-repository.mjs', 'src\evaluator-worker.mjs', 'src\evaluator.mjs',
-    'src\usage-client.mjs', 'src\cdp-client.mjs', 'src\cdp-disconnect-guard.mjs', 'src\injector-script.mjs',
+    'src\usage-client.mjs', 'src\cdp-client.mjs', 'src\injector-script.mjs',
     'src\browser-callback-broker.mjs', 'src\hub-provider-adapters.mjs', 'src\hub-service.mjs',
     'src\hub-page.mjs', 'src\hub-server.mjs',
-    'src\target-session.mjs', 'src\target-discovery.mjs', 'src\host.mjs',
+    'src\keyed-backoff.mjs', 'src\page-action-channel.mjs', 'src\target-session.mjs', 'src\host.mjs',
     'scripts\install.ps1', 'scripts\launch.ps1', 'scripts\stop.ps1',
     'scripts\stop-host.ps1', 'scripts\check-current.mjs',
     'scripts\status.ps1', 'scripts\uninstall.ps1',
-    'browser-companion\manifest.json', 'browser-companion\background.js',
+    'browser-companion\manifest.json', 'browser-companion\background.js', 'browser-companion\session-state.js',
     'browser-companion\popup.html', 'browser-companion\popup.js', 'browser-companion\README.md'
 )
 foreach ($relative in $payloadFiles) {

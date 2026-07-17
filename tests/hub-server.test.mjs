@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -94,6 +95,29 @@ test('Hub server protects its local page and API with an unguessable path token'
 test('Hub uses the former bridge port as its stable local gateway', () => {
   const server = new HubServer({}, { token: 'test-token', openUrl() {} });
   assert.equal(server.port, 17891);
+});
+
+test('Hub server can retry after its port is released', async t => {
+  const blocker = http.createServer((_request, response) => response.end('occupied'));
+  await new Promise((resolve, reject) => {
+    blocker.once('error', reject);
+    blocker.listen(0, '127.0.0.1', resolve);
+  });
+  const port = blocker.address().port;
+  const service = { getState: () => ({ providers: [], refreshing: false }) };
+  const server = new HubServer(service, { port, token: 'test-token', openUrl() {} });
+  t.after(async () => {
+    if (blocker.listening) await new Promise(resolve => blocker.close(resolve));
+    await server.close();
+  });
+
+  await assert.rejects(server.start(), error => error?.code === 'EADDRINUSE');
+  await new Promise(resolve => blocker.close(resolve));
+
+  const url = await server.start();
+  assert.equal(server.boundPort, port);
+  assert.equal(server.server?.listening, true);
+  assert.equal(url, `http://127.0.0.1:${port}/hub/test-token`);
 });
 
 test('browser companion jobs and callbacks share the Hub server and token', async t => {

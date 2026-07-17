@@ -93,6 +93,35 @@ test('browser-only providers never probe the model API when the companion is dis
   assert.doesNotMatch(calls.join(' '), /17891/);
 });
 
+test('provider API keys are never sent to remote HTTP endpoints', async () => {
+  const calls = [];
+  const engine = new ProviderQueryEngine({}, {}, {
+    fetchImpl: async (url, options) => {
+      calls.push({ url: String(url), authorization: options.headers.Authorization });
+      return new Response(JSON.stringify({
+        is_available: true,
+        balance_infos: [{ currency: 'USD', total_balance: '1' }],
+      }), { status: 200 });
+    },
+  });
+
+  await assert.rejects(engine.query({
+    id: 'remote-http', name: 'DeepSeek', websiteUrl: '', usage: null, auth: {},
+    apiKey: 'private-key', apiBaseUrl: 'http://remote.example', baseUrl: '',
+  }), /非本地供应商接口必须使用 HTTPS/);
+  assert.deepEqual(calls, []);
+
+  const local = await engine.query({
+    id: 'local-http', name: 'DeepSeek', websiteUrl: '', usage: null, auth: {},
+    apiKey: 'local-key', apiBaseUrl: 'http://127.0.0.1:18080', baseUrl: '',
+  });
+  assert.equal(local.usage.remaining, 1);
+  assert.deepEqual(calls, [{
+    url: 'http://127.0.0.1:18080/user/balance',
+    authorization: 'Bearer local-key',
+  }]);
+});
+
 test('transient provider failures stay retryable while WAF challenges request an explicit website visit', async () => {
   const provider = { id: 'any', name: 'any的国内镜像', websiteUrl: '', usage: null, auth: {}, apiKey: 'key', apiBaseUrl: 'https://anyrouter.top' };
   const timeoutEngine = new ProviderQueryEngine({}, {
@@ -452,6 +481,56 @@ test('an early invalid browser response does not cancel a later valid OpenAI dir
   assert.equal(result.usage.remaining, 92);
 });
 
+test('an HTTP 200 browser error payload never masquerades as full OpenAI quota', async () => {
+  let directAborted = false;
+  const engine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    hasSession: () => false,
+    async queryJson() { return { status: 200, text: '{"error":"upstream failure"}' }; },
+  }, {
+    whamBrowserRaceDelayMs: 2,
+    fetchImpl: async (_url, options) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve(new Response(JSON.stringify({
+        plan_type: 'plus',
+        rate_limit: { primary_window: { used_percent: 8, limit_window_seconds: 18_000 } },
+      }), { status: 200 })), 15);
+      options.signal.addEventListener('abort', () => {
+        clearTimeout(timer);
+        directAborted = true;
+        reject(options.signal.reason || new Error('aborted'));
+      }, { once: true });
+    }),
+  });
+
+  const result = await engine.query({
+    id: 'openai-json-error', name: 'OpenAI Official', websiteUrl: 'https://chatgpt.com/codex', usage: null,
+    auth: { tokens: { account_id: 'account-one', access_token: 'private-token' } }, apiKey: '', apiBaseUrl: '', baseUrl: '',
+  });
+
+  assert.equal(directAborted, false);
+  assert.equal(result.source, 'openai_wham');
+  assert.equal(result.usage.remaining, 92);
+});
+
+test('only a valid WHAM quota payload can produce OpenAI usage', async () => {
+  const engine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    hasSession: () => false,
+    async queryJson() { return { status: 200, text: '{"error":"upstream failure"}' }; },
+  }, {
+    whamBrowserRaceDelayMs: 1,
+    fetchImpl: async () => { throw new Error('direct unavailable'); },
+  });
+
+  const result = await engine.query({
+    id: 'openai-invalid-only', name: 'OpenAI Official', websiteUrl: 'https://chatgpt.com/codex', usage: null,
+    auth: { tokens: { account_id: 'account-one', access_token: 'private-token' } }, apiKey: '', apiBaseUrl: '', baseUrl: '',
+  });
+
+  assert.equal(result.loginRequired, true);
+  assert.equal(result.usage, undefined);
+});
+
 test('provider HTTP retries share one total deadline instead of resetting it per attempt', async () => {
   const attemptDurations = [];
   const startedAt = Date.now();
@@ -596,5 +675,7 @@ test('paid-site copies sharing one API key reuse the result across mirror domain
 
   assert.equal(requests, 1);
   assert.equal(first.usage.remaining, 9);
+  assert.equal(first.usage.providerName, '付费站');
   assert.equal(second.usage.providerId, 'copy');
+  assert.equal(second.usage.providerName, '付费站 copy');
 });
