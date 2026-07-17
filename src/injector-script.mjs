@@ -160,7 +160,15 @@ export function isComposerFooterCandidate(element, editor, rect, editorRect) {
   return rect.height <= 52 && rect.top >= editorRect.bottom - 24;
 }
 
-export function isNativeFlowCacheValid(cache, root, right) {
+export function isNativeFlowCacheValid(cache, root, right, getStyle = globalThis.getComputedStyle) {
+  const flowSignature = lane => {
+    const signature = element => {
+      if (!element) return '';
+      const style = getStyle(element);
+      return [style.display || '', style.flexGrow || '', style.flexShrink || ''].join(':');
+    };
+    return `${signature(lane)}|${signature(lane?.parentElement)}`;
+  };
   return Boolean(
     cache
     && cache.right === right
@@ -168,18 +176,42 @@ export function isNativeFlowCacheValid(cache, root, right) {
     && (cache.before == null || cache.before.isConnected)
     && root?.parentElement === cache.lane
     && root?.nextElementSibling === cache.before
+    && cache.signature === flowSignature(cache.lane)
   );
 }
 
 export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = globalThis.getComputedStyle) {
   const toolbarParent = toolbar?.parentElement;
   if (toolbarParent && right?.contains?.(toolbarParent) && getStyle(toolbarParent).display === 'flex') {
+    const outerToolbar = toolbarParent.parentElement;
+    const toolbarParentStyle = getStyle(toolbarParent);
+    const outerToolbarStyle = outerToolbar ? getStyle(outerToolbar) : null;
+    if (
+      Number.parseFloat(toolbarParentStyle.flexGrow) <= 0
+      && outerToolbar
+      && outerToolbar !== right
+      && right.contains?.(outerToolbar)
+      && outerToolbarStyle?.display === 'flex'
+      && Number.parseFloat(outerToolbarStyle.flexShrink) > 0
+    ) {
+      return { lane: outerToolbar, before: toolbarParent };
+    }
     return { lane: toolbarParent, before: toolbar };
   }
 
-  const outerToolbar = Array.from(right?.children || []).find(element => (
-    element !== root && getStyle(element).display === 'flex'
-  )) || right?.firstElementChild || right;
+  const findFlexContainer = container => {
+    for (const element of Array.from(container?.children || [])) {
+      if (element === root) continue;
+      const display = getStyle(element).display;
+      if (display === 'flex') return element;
+      if (display === 'contents') {
+        const nested = findFlexContainer(element);
+        if (nested) return nested;
+      }
+    }
+    return null;
+  };
+  const outerToolbar = findFlexContainer(right) || right;
   const flexibleLane = Array.from(outerToolbar?.children || []).find(element => (
     element !== root
     && getStyle(element).display === 'flex'
@@ -191,7 +223,7 @@ export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = glob
 }
 
 export const PAGE_ACTION_SENTINEL = '\u2063\u2063';
-export const INJECTOR_VERSION = 65;
+export const INJECTOR_VERSION = 69;
 
 function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, selectResponsiveUsageMode, calculateResponsiveMeasurements, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, pageActionSentinel, version) {
   const VERSION = version;
@@ -434,9 +466,13 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
         *{box-sizing:border-box}
         .popover{position:fixed;z-index:2147483000;width:min(236px,calc(100vw - 16px));padding:12px;border:1px solid var(--color-token-border,var(--color-token-button-border,rgba(127,127,127,.16)));border-radius:14px;background:var(--color-token-dropdown-background,rgb(38,38,38));box-shadow:0 12px 32px rgba(0,0,0,.32);color:var(--color-token-text-primary,currentColor);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:var(--text-sm,13px);font-weight:445;line-height:18px;letter-spacing:normal;opacity:0;visibility:hidden;transform:translateY(4px);transition:opacity .12s ease,transform .12s ease,visibility .12s;pointer-events:none}
         .popover.open{opacity:1;visibility:visible;transform:translateY(0);pointer-events:auto}
-        .popover-head{display:flex;align-items:center;justify-content:space-between;color:var(--color-token-text-tertiary,currentColor);height:20px}
+        .popover-head{display:flex;align-items:center;justify-content:space-between;color:var(--color-token-text-tertiary,currentColor);height:24px}
         .popover-head-title{font:inherit}
-        .popover-head-icon{width:16px;height:16px;color:var(--color-token-text-tertiary,currentColor);fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+        .popover-refresh{appearance:none;display:grid;place-items:center;width:28px;height:28px;margin:-2px -6px -2px 0;padding:0;border:0;border-radius:7px;background:transparent;color:var(--color-token-text-tertiary,currentColor);cursor:pointer}
+        .popover-refresh:hover{background:var(--color-background-button-tertiary-hover,rgba(127,127,127,.12));color:var(--color-token-text-primary,currentColor)}
+        .popover-refresh:focus-visible{outline:2px solid var(--color-token-text-primary,currentColor);outline-offset:1px}
+        .popover-refresh svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+        .popover-refresh[data-loading="true"] svg{animation:popover-refresh-spin .9s linear infinite}
         .popover-grid{display:grid;gap:6px;margin-top:8px}
         .popover-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:30px;padding:0 9px;border-radius:8px;background:var(--color-background-button-tertiary,rgba(127,127,127,.04))}
         .popover-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-token-text-tertiary,currentColor)}
@@ -447,12 +483,18 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
         .hub-open .external-icon{width:12px;height:12px}
         .tooltip{position:fixed;z-index:2147483001;max-width:min(360px,calc(100vw - 16px));padding:7px 10px;border:1px solid var(--color-token-border,rgba(127,127,127,.18));border-radius:10px;background:var(--color-token-dropdown-background,rgb(38,38,38));box-shadow:0 8px 24px rgba(0,0,0,.28);color:var(--color-token-text-primary,#fff);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:13px;line-height:18px;white-space:normal;opacity:0;visibility:hidden;transform:translateY(3px);transition:opacity .1s ease,transform .1s ease,visibility .1s;pointer-events:none}
         .tooltip.open{opacity:1;visibility:visible;transform:translateY(0)}
-        @media (prefers-reduced-motion:reduce){.tooltip{transition:none}}
+        @keyframes popover-refresh-spin{to{transform:rotate(-360deg)}}
+        @media (prefers-reduced-motion:reduce){.tooltip{transition:none}.popover-refresh[data-loading="true"] svg{animation:none}}
       </style><div id="popover" class="popover" role="dialog" aria-label="完整额度">
-        <div class="popover-head"><span class="popover-head-title">额度</span><svg class="popover-head-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 0-15.22-6.49L3 8"></path><path d="M3 3v5h5"></path><path d="M3 12a9 9 0 0 0 15.22 6.49L21 16"></path><path d="M16 16h5v5"></path></svg></div>
+        <div class="popover-head"><span class="popover-head-title">额度</span><button id="popover-refresh" class="popover-refresh" type="button" aria-label="刷新 CCSwitch 用量"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 0-15.22-6.49L3 8"></path><path d="M3 3v5h5"></path><path d="M3 12a9 9 0 0 0 15.22 6.49L21 16"></path><path d="M16 16h5v5"></path></svg></button></div>
         <div id="popover-grid" class="popover-grid"></div><button id="open-hub" class="hub-open" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1.25"></rect><rect x="14" y="4" width="6" height="6" rx="1.25"></rect><rect x="4" y="14" width="6" height="6" rx="1.25"></rect><rect x="14" y="14" width="6" height="6" rx="1.25"></rect></svg><span>打开 All API Hub</span><svg class="external-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6"></path><path d="M20 4 11 13"></path><path d="M20 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h6"></path></svg></button>
       </div><div id="tooltip" class="tooltip" role="tooltip"></div>`;
       shadow.getElementById('open-hub').addEventListener('click', () => openHub());
+      shadow.getElementById('popover-refresh').addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        requestRefresh(state.popoverAnchor, false);
+      });
     }
     state.popoverRoot = host;
     state.popoverShadow = host.shadowRoot;
@@ -605,6 +647,17 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     publishPageAction('open-hub');
   }
 
+  function requestRefresh(instance, togglePopover = false) {
+    hideUsageTooltip();
+    state.refreshToken += 1;
+    state.refreshRequestedAt = Date.now();
+    publishPageAction('refresh');
+    state.loading = true;
+    if (instance?.root?.isConnected) state.popoverAnchor = instance;
+    if (togglePopover) state.popoverOpen = !state.popoverOpen;
+    render(null, togglePopover);
+  }
+
   function bindUsageEvents(instance, usage, hubButton, refreshButton) {
     usage.addEventListener('pointerover', event => {
       const tooltipTarget = findUsageTooltipTarget(event.target);
@@ -653,14 +706,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     refreshButton.addEventListener('click', event => {
       event.preventDefault();
       event.stopPropagation();
-      state.refreshToken += 1;
-      state.refreshRequestedAt = Date.now();
-      publishPageAction('refresh');
-      state.loading = true;
-      state.popoverAnchor = instance;
-      const shouldScheduleLayout = instance.root.dataset.mode === 'icon';
-      if (shouldScheduleLayout) state.popoverOpen = !state.popoverOpen;
-      render(null, shouldScheduleLayout);
+      requestRefresh(instance, instance.root.dataset.mode === 'icon');
     });
   }
 
@@ -817,6 +863,8 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     const portal = state.popoverShadow || (state.popoverOpen ? ensurePopoverPortal() : null);
     if (portal) {
       portal.getElementById('popover').classList.toggle('open', state.popoverOpen);
+      const popoverRefreshButton = portal.getElementById('popover-refresh');
+      updateElementAttribute(popoverRefreshButton, 'data-loading', state.loading ? 'true' : null);
       renderPopoverRows(portal, payload);
     }
     if (shouldScheduleLayout) scheduleLayout();
@@ -843,10 +891,15 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
 
   function placeInNativeFlow(root, right) {
     let flow = root.__codexUsageNativeFlow;
-    if (!isNativeFlowCacheValid(flow, root, right)) {
+    if (!isNativeFlowCacheValid(flow, root, right, getComputedStyle)) {
       const toolbar = findRightToolbar(right);
       const { lane, before } = resolveNativeFlowPlacement(right, root, toolbar, getComputedStyle);
-      flow = { right, lane, before };
+      const signature = element => {
+        if (!element) return '';
+        const style = getComputedStyle(element);
+        return [style.display || '', style.flexGrow || '', style.flexShrink || ''].join(':');
+      };
+      flow = { right, lane, before, signature: `${signature(lane)}|${signature(lane?.parentElement)}` };
       root.__codexUsageNativeFlow = flow;
     }
     const { lane, before } = flow;
@@ -1064,6 +1117,10 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     if (!state.resizeObserver) state.resizeObserver = new ResizeObserver(entries => {
       const roots = [state.root, ...state.mirrors.map(mirror => mirror.root)].filter(Boolean);
       const rootChanged = hasMeaningfulRootResize(entries, roots);
+      const nativeFlowChanged = roots.some(root => {
+        const flow = root.__codexUsageNativeFlow;
+        return flow && !isNativeFlowCacheValid(flow, root, flow.right, getComputedStyle);
+      });
       const collapsed = entries.some(entry => (
         (entry.target === state.footer || entry.target === state.root || state.mirrors.some(mirror => entry.target === mirror.footer || entry.target === mirror.root))
         && (entry.contentRect.width <= 0 || entry.contentRect.height <= 0)
@@ -1073,8 +1130,8 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
         if (recovered) scheduleLayout();
         return;
       }
-      if (!rootChanged) return;
-      if (roots.some(rootResizeNeedsLayout)) scheduleLayout();
+      if (!rootChanged && !nativeFlowChanged) return;
+      if (nativeFlowChanged || roots.some(rootResizeNeedsLayout)) scheduleLayout();
     });
     state.resizeObservedElements = uniqueElements;
     seedRootResizeSizes(roots);

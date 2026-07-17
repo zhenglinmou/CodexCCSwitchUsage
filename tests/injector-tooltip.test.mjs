@@ -138,6 +138,16 @@ test('refresh button publishes an invisible title action without a Runtime bindi
   assert.doesNotMatch(script, /window\[refreshBinding\]|Runtime\.addBinding/);
 });
 
+test('icon popover exposes a refresh button that refreshes without closing the panel', () => {
+  const script = buildInjectorScript();
+  const portalSource = sourceSection(script, 'function ensurePopoverPortal() {', 'function usageTitle(');
+
+  assert.match(portalSource, /<button id="popover-refresh" class="popover-refresh" type="button" aria-label="刷新 CCSwitch 用量">/);
+  assert.match(portalSource, /getElementById\('popover-refresh'\)\.addEventListener\('click', event => \{/);
+  assert.match(portalSource, /requestRefresh\(state\.popoverAnchor, false\)/);
+  assert.match(script, /updateElementAttribute\(popoverRefreshButton, 'data-loading', state\.loading \? 'true' : null\)/);
+});
+
 test('only dedicated Hub controls publish the v2 Balance Hub title action', () => {
   const script = buildInjectorScript();
   const eventSource = sourceSection(script, 'function bindUsageEvents(instance, usage, hubButton, refreshButton) {', 'function ensureUsageElement(instance) {');
@@ -309,7 +319,7 @@ test('a collapsed observed composer enters immediate recovery', () => {
   );
 });
 
-test('root resize schedules layout only when the responsive mode must change', () => {
+test('root resize schedules layout only for a responsive-mode or native-flow change', () => {
   const script = buildInjectorScript();
   const resizeHelpers = sourceSection(
     script,
@@ -328,8 +338,9 @@ test('root resize schedules layout only when the responsive mode must change', (
   assert.match(resizeHelpers, /const selected = selectResponsiveUsageMode\(measurements, previousMode\);/);
   assert.match(resizeHelpers, /return selected !== previousMode;/);
   assert.match(resizeObserver, /const rootChanged = hasMeaningfulRootResize\(entries, roots\);/);
-  assert.match(resizeObserver, /if \(!rootChanged\) return;/);
-  assert.match(resizeObserver, /if \(roots\.some\(rootResizeNeedsLayout\)\) scheduleLayout\(\);/);
+  assert.match(resizeObserver, /const nativeFlowChanged = roots\.some\(root => \{/);
+  assert.match(resizeObserver, /if \(!rootChanged && !nativeFlowChanged\) return;/);
+  assert.match(resizeObserver, /if \(nativeFlowChanged \|\| roots\.some\(rootResizeNeedsLayout\)\) scheduleLayout\(\);/);
   assert.doesNotMatch(resizeObserver, /scheduleRootResizeBurst/);
 });
 
@@ -563,29 +574,37 @@ test('refresh loading state skips geometry work unless icon mode toggles the pop
   const script = buildInjectorScript();
   const refreshHandler = sourceSection(
     script,
-    "refreshButton.addEventListener('click', event => {",
+    'function requestRefresh(instance, togglePopover = false) {',
     'function ensureUsageElement(instance) {',
   );
 
-  assert.match(refreshHandler, /const shouldScheduleLayout = instance\.root\.dataset\.mode === 'icon';/);
-  assert.match(refreshHandler, /if \(shouldScheduleLayout\) state\.popoverOpen = !state\.popoverOpen;/);
-  assert.match(refreshHandler, /render\(null, shouldScheduleLayout\);/);
+  assert.match(refreshHandler, /if \(togglePopover\) state\.popoverOpen = !state\.popoverOpen;/);
+  assert.match(refreshHandler, /render\(null, togglePopover\);/);
+  assert.match(refreshHandler, /requestRefresh\(instance, instance\.root\.dataset\.mode === 'icon'\);/);
   assert.doesNotMatch(refreshHandler, /\n\s*render\(\);/);
 });
 
 test('toolbar flow cache is reused only while its DOM placement remains valid', () => {
   const right = {};
   const before = { isConnected: true };
-  const lane = { isConnected: true };
+  const laneParent = {};
+  const lane = { isConnected: true, parentElement: laneParent };
   const root = { parentElement: lane, nextElementSibling: before };
-  const cache = { right, lane, before };
+  const styles = new Map([
+    [lane, { display: 'flex', flexGrow: '1', flexShrink: '1' }],
+    [laneParent, { display: 'flex', flexGrow: '0', flexShrink: '1' }],
+  ]);
+  const getStyle = element => styles.get(element) || { display: 'block', flexGrow: '0', flexShrink: '1' };
+  const cache = { right, lane, before, signature: 'flex:1:1|flex:0:1' };
 
-  assert.equal(isNativeFlowCacheValid(cache, root, right), true);
-  assert.equal(isNativeFlowCacheValid(cache, { ...root, nextElementSibling: null }, right), false);
-  assert.equal(isNativeFlowCacheValid({ ...cache, before: { isConnected: false } }, root, right), false);
+  assert.equal(isNativeFlowCacheValid(cache, root, right, getStyle), true);
+  assert.equal(isNativeFlowCacheValid(cache, { ...root, nextElementSibling: null }, right, getStyle), false);
+  assert.equal(isNativeFlowCacheValid({ ...cache, before: { isConnected: false } }, root, right, getStyle), false);
+  styles.set(laneParent, { display: 'flex', flexGrow: '0', flexShrink: '0' });
+  assert.equal(isNativeFlowCacheValid(cache, root, right, getStyle), false);
 });
 
-test('toolbar fallback keeps the usage root inside the flexible model lane', () => {
+test('toolbar fallback preserves the Codex model lane and unwraps the ChatGPT contents layer', () => {
   const root = {};
   const modelGroup = {};
   const modelLane = {
@@ -620,6 +639,46 @@ test('toolbar fallback keeps the usage root inside the flexible model lane', () 
   assert.deepEqual(
     resolveNativeFlowPlacement(right, root, modelGroup, getStyle),
     { lane: modelLane, before: modelGroup },
+  );
+
+  const chatgptActions = {};
+  const chatgptToolbar = {
+    children: [chatgptActions],
+    firstElementChild: chatgptActions,
+  };
+  const contents = {
+    children: [chatgptToolbar],
+    firstElementChild: chatgptToolbar,
+  };
+  const chatgptRight = {
+    children: [contents],
+    firstElementChild: contents,
+    contains: element => [contents, chatgptToolbar, chatgptActions].includes(element),
+  };
+  styles.set(chatgptRight, { display: 'block', flexGrow: '0' });
+  styles.set(contents, { display: 'contents', flexGrow: '0' });
+  styles.set(chatgptToolbar, { display: 'flex', flexGrow: '0' });
+  styles.set(chatgptActions, { display: 'flex', flexGrow: '0' });
+
+  assert.deepEqual(
+    resolveNativeFlowPlacement(chatgptRight, root, null, getStyle),
+    { lane: chatgptToolbar, before: chatgptActions },
+  );
+
+  const chatgptModelGroup = { parentElement: chatgptActions };
+  chatgptActions.parentElement = chatgptToolbar;
+  styles.set(chatgptToolbar, { display: 'flex', flexGrow: '0', flexShrink: '0' });
+  assert.deepEqual(
+    resolveNativeFlowPlacement(chatgptRight, root, chatgptModelGroup, getStyle),
+    { lane: chatgptActions, before: chatgptModelGroup },
+    'single-line Chat keeps the accepted inline placement',
+  );
+
+  styles.set(chatgptToolbar, { display: 'flex', flexGrow: '0', flexShrink: '1' });
+  assert.deepEqual(
+    resolveNativeFlowPlacement(chatgptRight, root, chatgptModelGroup, getStyle),
+    { lane: chatgptToolbar, before: chatgptActions },
+    'multiline Chat promotes the root into the full free lane',
   );
 });
 
