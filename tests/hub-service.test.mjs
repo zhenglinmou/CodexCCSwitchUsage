@@ -41,8 +41,76 @@ test('Hub state exposes safe provider fields and refreshes with bounded concurre
   assert.equal(state.providers[0].usage.remaining, 9);
   assert.equal(state.providers[0].queryMethod.label, 'DeepSeek 官方余额 API');
   assert.equal(state.providers[0].queryMethod.authentication, 'Bearer API Key');
+  assert.ok(Number.isFinite(state.providers[0].queryDurationMs));
+  assert.ok(Number.isFinite(state.lastFullRefreshDurationMs));
   assert.equal('auth' in state.providers[0], false);
   assert.equal('apiKey' in state.providers[0], false);
+});
+
+test('Hub reserves a serial browser lane without increasing total refresh concurrency', async () => {
+  const providers = [
+    provider('direct-one', 'DeepSeek'),
+    provider('browser-one', 'agentrouter'),
+    provider('direct-two', 'PackyCode'),
+    provider('browser-two', 'any的国内镜像'),
+    provider('direct-three', '付费站'),
+  ];
+  let running = 0;
+  let runningBrowser = 0;
+  let runningDirect = 0;
+  let maximum = 0;
+  let maximumBrowser = 0;
+  let maximumDirect = 0;
+  const service = new HubService({ getAll: () => providers }, {
+    async query(item) {
+      const browser = /agentrouter|any/.test(item.name);
+      running += 1;
+      if (browser) runningBrowser += 1;
+      else runningDirect += 1;
+      maximum = Math.max(maximum, running);
+      maximumBrowser = Math.max(maximumBrowser, runningBrowser);
+      maximumDirect = Math.max(maximumDirect, runningDirect);
+      await new Promise(resolve => setTimeout(resolve, 8));
+      running -= 1;
+      if (browser) runningBrowser -= 1;
+      else runningDirect -= 1;
+      return {
+        source: 'test',
+        usage: {
+          status: 'ok', providerId: item.id, providerName: item.name, used: 1, remaining: 9, total: 10,
+          unit: 'USD', extra: '', updatedAt: '2026-07-17T00:00:00.000Z', refreshIntervalMinutes: 5,
+        },
+      };
+    },
+  }, { concurrency: 3, browserConcurrency: 1 });
+
+  await service.refreshAll();
+
+  assert.equal(maximum, 3);
+  assert.equal(maximumBrowser, 1);
+  assert.equal(maximumDirect, 2);
+});
+
+test('Hub records provider query duration with an injectable monotonic clock', async () => {
+  const item = provider('one', 'DeepSeek');
+  let now = 1_000;
+  const service = new HubService({ getAll: () => [item] }, {
+    async query() {
+      now = 1_037;
+      return {
+        source: 'test',
+        usage: {
+          status: 'ok', providerId: item.id, providerName: item.name, used: 1, remaining: 9, total: 10,
+          unit: 'USD', extra: '', updatedAt: '2026-07-17T00:00:00.000Z', refreshIntervalMinutes: 5,
+        },
+      };
+    },
+  }, { now: () => now });
+
+  const refreshed = await service.refreshProvider(item.id);
+
+  assert.equal(refreshed.queryDurationMs, 37);
+  assert.equal(service.getState().providers[0].queryDurationMs, 37);
 });
 
 test('Hub provider sync skips state rebuilds when the repository snapshot identity is unchanged', () => {

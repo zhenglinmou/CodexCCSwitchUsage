@@ -103,6 +103,7 @@ export function findMutationObserverTarget(footer, documentNode = globalThis.doc
 
 export function classifyComposerMutations(records, footer, root) {
   const selector = '.ProseMirror[contenteditable="true"],[contenteditable="true"].ProseMirror,[contenteditable="true"][role="textbox"],[contenteditable="true"][data-lexical-editor="true"],.composer-surface-chrome,[data-composer-surface],[data-composer-footer],[class*="_footer_"]';
+  const stableMount = Boolean(footer?.isConnected && root?.isConnected);
   for (let recordIndex = 0; recordIndex < records.length; recordIndex += 1) {
     const record = records[recordIndex];
     for (let listIndex = 0; listIndex < 2; listIndex += 1) {
@@ -111,14 +112,14 @@ export function classifyComposerMutations(records, footer, root) {
         const node = nodes[nodeIndex];
         if (node?.nodeType !== 1) continue;
         if (
-          (listIndex === 1 && (
+          (listIndex === 1 && !stableMount && (
             node === footer
             || node === root
             || node.contains?.(footer)
             || node.contains?.(root)
           ))
           || node.matches?.(selector)
-          || node.querySelector?.(selector)
+          || (node.childElementCount !== 0 && node.querySelector?.(selector))
         ) return 'mount';
       }
     }
@@ -144,6 +145,21 @@ export function updateElementAttribute(element, name, value) {
   return true;
 }
 
+export function isComposerFooterCandidate(element, editor, rect, editorRect) {
+  const children = Array.from(element?.children || []);
+  if (!editor || children.length < 3 || !rect || !editorRect) return false;
+  if (rect.width <= 0 || rect.height < 20) return false;
+
+  const editorPart = children.find(child => child === editor || child.contains?.(editor));
+  const embeddedEditorLayout = Boolean(editorPart && children.filter(child => (
+    child !== editorPart
+    && child.querySelector?.('button,[role="button"],[aria-label]')
+  )).length >= 2);
+
+  if (embeddedEditorLayout) return true;
+  return rect.height <= 52 && rect.top >= editorRect.bottom - 24;
+}
+
 export function isNativeFlowCacheValid(cache, root, right) {
   return Boolean(
     cache
@@ -155,18 +171,36 @@ export function isNativeFlowCacheValid(cache, root, right) {
   );
 }
 
-export const PAGE_ACTION_SENTINEL = '\u2063\u2063';
-export const INJECTOR_VERSION = 62;
+export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = globalThis.getComputedStyle) {
+  const toolbarParent = toolbar?.parentElement;
+  if (toolbarParent && right?.contains?.(toolbarParent) && getStyle(toolbarParent).display === 'flex') {
+    return { lane: toolbarParent, before: toolbar };
+  }
 
-function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, selectResponsiveUsageMode, calculateResponsiveMeasurements, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isNativeFlowCacheValid, pageActionSentinel, version) {
+  const outerToolbar = Array.from(right?.children || []).find(element => (
+    element !== root && getStyle(element).display === 'flex'
+  )) || right?.firstElementChild || right;
+  const flexibleLane = Array.from(outerToolbar?.children || []).find(element => (
+    element !== root
+    && getStyle(element).display === 'flex'
+    && Number.parseFloat(getStyle(element).flexGrow) > 0
+  ));
+  const lane = flexibleLane || (getStyle(outerToolbar).display === 'flex' ? outerToolbar : right);
+  const candidateBefore = lane?.firstElementChild || null;
+  return { lane, before: candidateBefore === root ? root.nextElementSibling : candidateBefore };
+}
+
+export const PAGE_ACTION_SENTINEL = '\u2063\u2063';
+export const INJECTOR_VERSION = 65;
+
+function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, selectResponsiveUsageMode, calculateResponsiveMeasurements, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, pageActionSentinel, version) {
   const VERSION = version;
   const GLOBAL = '__CODEX_CCSWITCH_USAGE__';
   const ROOT_ID = 'codex-ccswitch-usage-root';
   const POPOVER_ID = 'codex-ccswitch-usage-popover';
   const existing = window[GLOBAL];
   if (existing?.version === VERSION) {
-    existing.mount();
-    return true;
+    return existing.mount() === true;
   }
   const eventController = createInjectorEventController(existing);
   if (existing) {
@@ -256,8 +290,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       const parts = footerParts(element);
       if (!parts) continue;
       const rect = element.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height < 20 || rect.height > 52) continue;
-      if (rect.top < editorRect.bottom - 24) continue;
+      if (!isComposerFooterCandidate(element, editor, rect, editorRect)) continue;
       const className = String(element.className || '');
       let score = 0;
       if (element.hasAttribute('data-composer-footer')) score += 8;
@@ -796,7 +829,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       current = current.parentElement;
       if (current.tagName === 'DIV' && getComputedStyle(current).display === 'flex') return current;
     }
-    return right.firstElementChild?.firstElementChild || right;
+    return null;
   }
 
   function setStyleIfChanged(style, property, value) {
@@ -812,12 +845,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     let flow = root.__codexUsageNativeFlow;
     if (!isNativeFlowCacheValid(flow, root, right)) {
       const toolbar = findRightToolbar(right);
-      const toolbarParent = toolbar?.parentElement;
-      const lane = toolbarParent && right.contains(toolbarParent) && getComputedStyle(toolbarParent).display === 'flex'
-        ? toolbarParent
-        : right;
-      const candidateBefore = lane === toolbarParent ? toolbar : lane.firstElementChild;
-      const before = candidateBefore === root ? root.nextElementSibling : candidateBefore;
+      const { lane, before } = resolveNativeFlowPlacement(right, root, toolbar, getComputedStyle);
       flow = { right, lane, before };
       root.__codexUsageNativeFlow = flow;
     }
@@ -1152,12 +1180,11 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     if (document.visibilityState === 'visible') recoverOnActivation();
   }, { signal: state.eventController.signal });
   window[GLOBAL] = state;
-  mount();
-  return true;
+  return mount();
 }
 
 export function buildInjectorScript() {
-  return `(${installCodexUsageExtension.toString()})(${findUsageTooltipTarget.toString()},${isUsageTooltipBoundaryCrossing.toString()},${getUsageFreshness.toString()},${formatUsageAge.toString()},${selectResponsiveUsageMode.toString()},${calculateResponsiveMeasurements.toString()},${stabilizeResponsiveUsageMode.toString()},${findMutationObserverTarget.toString()},${classifyComposerMutations.toString()},${createInjectorEventController.toString()},${updateElementAttribute.toString()},${isNativeFlowCacheValid.toString()},${JSON.stringify(PAGE_ACTION_SENTINEL)},${INJECTOR_VERSION})`;
+  return `(${installCodexUsageExtension.toString()})(${findUsageTooltipTarget.toString()},${isUsageTooltipBoundaryCrossing.toString()},${getUsageFreshness.toString()},${formatUsageAge.toString()},${selectResponsiveUsageMode.toString()},${calculateResponsiveMeasurements.toString()},${stabilizeResponsiveUsageMode.toString()},${findMutationObserverTarget.toString()},${classifyComposerMutations.toString()},${createInjectorEventController.toString()},${updateElementAttribute.toString()},${isComposerFooterCandidate.toString()},${isNativeFlowCacheValid.toString()},${resolveNativeFlowPlacement.toString()},${JSON.stringify(PAGE_ACTION_SENTINEL)},${INJECTOR_VERSION})`;
 }
 
 export const UPDATE_GLOBAL = '__CODEX_CCSWITCH_USAGE__';

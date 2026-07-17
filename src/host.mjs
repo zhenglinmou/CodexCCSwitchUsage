@@ -7,6 +7,7 @@ import { HubServer } from './hub-server.mjs';
 import { ProviderQueryEngine } from './hub-provider-adapters.mjs';
 import { hubItemToUsagePayload, HubService } from './hub-service.mjs';
 import { buildInjectorScript, INJECTOR_VERSION, UPDATE_GLOBAL } from './injector-script.mjs';
+import { KeyedBackoff } from './keyed-backoff.mjs';
 import { decodePageActionMarker } from './page-action-channel.mjs';
 import { installTargetOnce, settleTargetOperations } from './target-session.mjs';
 
@@ -43,6 +44,7 @@ const hubServer = new HubServer(hubService, {
   browserBroker,
 });
 const injectorScript = buildInjectorScript();
+const targetInstallBackoff = new KeyedBackoff();
 
 function readUsageCache() {
   try {
@@ -104,6 +106,8 @@ function writeStatus(extra = {}) {
     databaseAuditMs: DATABASE_AUDIT_MS,
     targetAuditMs: INJECTOR_AUDIT_MS,
     pageActionPollMs: PAGE_ACTION_POLL_MS,
+    targetInstallFailures: targetInstallBackoff.failures,
+    targetInstallRetryMs: targetInstallBackoff.remainingMs(),
     connectedPages: mountedPages,
     connectionError: lastConnectionError,
     hubRunning: Boolean(hubServer.boundPort),
@@ -260,13 +264,18 @@ async function syncTargets({ audit = true } = {}) {
   const markedActions = targetActions.filter(item => item.action);
   const pendingActions = markedActions.filter(item => actionSignature(item.action) !== lastActionSignature);
   const targetIds = new Set(targets.map(target => target.id));
+  const targetSignature = [...targetIds].sort().join('|');
   const targetIdentityChanged = targetIds.size !== mountedTargetIds.size
     || [...targetIds].some(id => !mountedTargetIds.has(id));
   const shouldInstall = audit || targetIdentityChanged || markedActions.length > 0;
 
   if (!shouldInstall) {
     mountedPages = targets.length;
-    return;
+    return { installed: false, deferred: false };
+  }
+  if (pendingActions.length === 0 && !targetInstallBackoff.isReady(targetSignature)) {
+    targetAuditPending = true;
+    return { installed: false, deferred: true };
   }
   if (hasAuxiliaryPageTargets(allTargets)) {
     throw new Error('检测到 Codex 内置浏览器页面，已暂停 CDP 注入');
@@ -306,7 +315,13 @@ async function syncTargets({ audit = true } = {}) {
       .map(item => item.target.id),
   );
   lastInjectorAuditAt = Date.now();
-  if (failures.length) throw failures[0].reason;
+  if (failures.length) {
+    targetInstallBackoff.fail(targetSignature);
+    targetAuditPending = true;
+    throw failures[0].reason;
+  }
+  targetInstallBackoff.reset();
+  return { installed: true, deferred: false };
 }
 
 function requestTargetSync({ audit = false } = {}) {
@@ -316,19 +331,25 @@ function requestTargetSync({ audit = false } = {}) {
   targetSyncPromise = (async () => {
     const previousMountedPages = mountedPages;
     const previousConnectionError = lastConnectionError;
+    const previousTargetInstallFailures = targetInstallBackoff.failures;
     while (targetSyncPending && !stopped) {
       const currentAudit = targetAuditPending;
       targetSyncPending = false;
       targetAuditPending = false;
       try {
-        await syncTargets({ audit: currentAudit });
-        lastConnectionError = null;
+        const outcome = await syncTargets({ audit: currentAudit });
+        if (outcome?.deferred) targetAuditPending = true;
+        else lastConnectionError = null;
       } catch (error) {
         lastConnectionError = safeMessage(error);
         targetAuditPending ||= currentAudit;
       }
     }
-    if (mountedPages !== previousMountedPages || lastConnectionError !== previousConnectionError) {
+    if (
+      mountedPages !== previousMountedPages
+      || lastConnectionError !== previousConnectionError
+      || targetInstallBackoff.failures !== previousTargetInstallFailures
+    ) {
       writeStatus({ connectedPages: mountedPages, connectionError: lastConnectionError });
     }
   })().finally(() => { targetSyncPromise = null; });

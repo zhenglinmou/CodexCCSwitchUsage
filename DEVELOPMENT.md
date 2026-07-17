@@ -51,6 +51,7 @@ The installer preserves the stable `runtime` directory during an upgrade. A real
 | `src\evaluator-worker.mjs` | Sandboxed `node:vm` execution of `usage_script` |
 | `src\cdp-client.mjs` | Short-lived CDP HTTP/WebSocket client and strict target filtering |
 | `src\target-session.mjs` | One-shot injector installation, hot replacement, and payload delivery |
+| `src\keyed-backoff.mjs` | Target-keyed bounded retry state for failed one-shot injector installations |
 | `src\page-action-channel.mjs` | Invisible, bounded page-title action markers for refresh and Hub clicks |
 | `scripts\launch.ps1` | Finds/starts Codex with CDP, starts the host, activates the window |
 | `scripts\stop-host.ps1` | Stops plugin hosts without stopping Codex |
@@ -114,6 +115,8 @@ Expected fields include:
   "running": true,
   "eventDrivenTargets": false,
   "databaseWatch": true,
+  "targetInstallFailures": 0,
+  "targetInstallRetryMs": 0,
   "connectedPages": 1,
   "connectionError": null
 }
@@ -125,7 +128,11 @@ The injected refresh and Hub buttons append a bounded invisible action marker (`
 
 The CCSwitch database uses `fs.watch` for immediate changes. While the watcher is healthy, the three SQLite files are audited only every 60,000 ms; the 1,000 ms retry is used only when a watcher is unavailable. SQLite/WAL activity that leaves the cached provider snapshot unchanged does not rebuild Hub state, increment its revision, or request a current-provider refresh. The Hub page loads state once and polls only while a user-started refresh operation is in progress. Only the current CCSwitch provider owns a fixed 300,000 ms balance timer.
 
-CDP target isolation is fail-closed. The host connects only to a `page` target whose URL is exactly the canonical Codex main document, `app://-/index.html`, with no query or fragment. Every eligible target WebSocket exists only for the inspection/injection/update call and is closed in `finally`; a socket whose handshake times out or fails is closed before ownership can transfer to a client. Deferred audits remain pending but never accelerate the maintenance loop beyond the 1,000 ms page-action cadence. The host never calls browser-wide `Target.setDiscoverTargets`, never keeps a target session, and never calls `Runtime.enable` or `Runtime.addBinding`. Empty URLs, `about:blank`, external pages, Browser Use WebViews, MCP App guests, and auxiliary `initialRoute` windows are never connected. If any auxiliary `page`, `webview`, or `iframe` target is active, all injector connections are deferred until it disappears.
+CDP target isolation is fail-closed. The host connects only to a `page` target whose URL is exactly the canonical Codex main document, `app://-/index.html`, with no query or fragment. Every eligible target WebSocket exists only for the inspection/injection/update call and is closed in `finally`; a socket whose handshake times out or fails is closed before ownership can transfer to a client. Deferred audits remain pending but never accelerate the maintenance loop beyond the 1,000 ms page-action cadence. A persistent one-shot installation failure uses a target-keyed `1,000 / 2,000 / 5,000 / 10,000 / 30,000 ms` retry sequence; a replacement target or new page action bypasses the old target's delay. The host never calls browser-wide `Target.setDiscoverTargets`, never keeps a target session, and never calls `Runtime.enable` or `Runtime.addBinding`. Empty URLs, `about:blank`, external pages, Browser Use WebViews, MCP App guests, and auxiliary `initialRoute` windows are never connected. If any auxiliary `page`, `webview`, or `iframe` target is active, all injector connections are deferred until it disappears.
+
+Hub full refresh keeps its existing total concurrency bound while reserving a serial lane for providers that require the browser companion, so a slow browser callback cannot occupy every direct-API worker. Hub state records `queryDurationMs` per provider and `lastFullRefreshDurationMs` for the complete operation; these fields contain timing only and never credentials.
+
+OpenAI WHAM queries keep the direct Node transport as the fast path. When the browser companion is connected, that direct path gets one bounded 5,000 ms probe instead of two long retries; a successful browser fallback then suppresses repeated direct probes for 300,000 ms. A failed browser fallback does not open that backoff, and companion-offline queries retain the longer direct retry policy. Concurrent and 30,000 ms recent successful WHAM results are shared by the SHA-256 hash of account id plus access token, allowing overlapping OpenAI and CPA providers to avoid duplicate requests without caching credential text; failures are never cached.
 
 ### Balance positioning invariant
 

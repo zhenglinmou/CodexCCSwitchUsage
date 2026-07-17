@@ -11,10 +11,12 @@ import {
   findUsageTooltipTarget,
   getUsageFreshness,
   INJECTOR_VERSION,
+  isComposerFooterCandidate,
   isNativeFlowCacheValid,
   isUsageTooltipBoundaryCrossing,
   mutationNeedsComposerSync,
   PAGE_ACTION_SENTINEL,
+  resolveNativeFlowPlacement,
   selectResponsiveUsageMode,
   stabilizeResponsiveUsageMode,
   updateElementAttribute,
@@ -39,6 +41,50 @@ function sourceSection(source, startMarker, endMarker) {
 test('injector script carries an exported version for hot replacement', () => {
   assert.equal(Number.isInteger(INJECTOR_VERSION), true);
   assert.match(buildInjectorScript(), new RegExp(`,${INJECTOR_VERSION}\\)$`));
+});
+
+test('composer footer detection accepts the embedded-editor grid and rejects its wrapper', () => {
+  const editor = {};
+  const actionPart = {
+    contains: () => false,
+    querySelector: () => ({}),
+  };
+  const editorPart = {
+    contains: node => node === editor,
+    querySelector: () => null,
+  };
+  const decorativePart = {
+    contains: () => false,
+    querySelector: () => null,
+  };
+  const embeddedFooter = { children: [actionPart, editorPart, actionPart] };
+  const outerWrapper = {
+    children: [
+      decorativePart,
+      { contains: node => node === editor, querySelector: () => ({}) },
+      decorativePart,
+    ],
+  };
+  const currentFooterRect = { width: 736, height: 76, top: 920 };
+  const currentEditorRect = { bottom: 964 };
+
+  assert.equal(
+    isComposerFooterCandidate(embeddedFooter, editor, currentFooterRect, currentEditorRect),
+    true,
+  );
+  assert.equal(
+    isComposerFooterCandidate(outerWrapper, editor, { width: 736, height: 98, top: 906 }, currentEditorRect),
+    false,
+  );
+  assert.equal(
+    isComposerFooterCandidate(
+      { children: [decorativePart, decorativePart, actionPart] },
+      editor,
+      { width: 736, height: 28, top: 968 },
+      currentEditorRect,
+    ),
+    true,
+  );
 });
 
 test('injector caches hot-path usage and toolbar DOM references on each root', () => {
@@ -212,12 +258,20 @@ test('mutation classifier mounts only for composer lifecycle changes', () => {
   const footerChild = {};
   const footerWithChildren = { isConnected: true, contains: node => node === footerChild };
   const detachedRoot = { ...root, isConnected: false };
+  const stableRemovedLeaf = {
+    nodeType: 1,
+    childElementCount: 0,
+    contains: () => { throw new Error('stable mounts must skip detached-root containment checks'); },
+    matches: () => false,
+    querySelector: () => { throw new Error('leaf mutations must not scan descendants'); },
+  };
 
   assert.equal(classifyComposerMutations([{ addedNodes: [textNode, unrelatedElement], removedNodes: [] }], footer, root), 'ignore');
   assert.equal(classifyComposerMutations([{ addedNodes: [editorElement], removedNodes: [] }], footer, root), 'mount');
   assert.equal(classifyComposerMutations([{ target: footerChild, addedNodes: [unrelatedElement], removedNodes: [] }], footerWithChildren, root), 'ignore');
   assert.equal(classifyComposerMutations([{ addedNodes: [unrelatedElement], removedNodes: [] }], footer, detachedRoot), 'ignore');
   assert.equal(classifyComposerMutations([{ addedNodes: [], removedNodes: [detachedRoot] }], footer, detachedRoot), 'mount');
+  assert.equal(classifyComposerMutations([{ addedNodes: [], removedNodes: [stableRemovedLeaf] }], footer, root), 'ignore');
   assert.equal(mutationNeedsComposerSync([{ addedNodes: [textNode, unrelatedElement], removedNodes: [] }], footer, root), false);
   assert.equal(mutationNeedsComposerSync([{ addedNodes: [editorElement], removedNodes: [] }], footer, root), true);
   assert.equal(mutationNeedsComposerSync([{ target: footerChild, addedNodes: [unrelatedElement], removedNodes: [] }], footerWithChildren, root), false);
@@ -529,6 +583,44 @@ test('toolbar flow cache is reused only while its DOM placement remains valid', 
   assert.equal(isNativeFlowCacheValid(cache, root, right), true);
   assert.equal(isNativeFlowCacheValid(cache, { ...root, nextElementSibling: null }, right), false);
   assert.equal(isNativeFlowCacheValid({ ...cache, before: { isConnected: false } }, root, right), false);
+});
+
+test('toolbar fallback keeps the usage root inside the flexible model lane', () => {
+  const root = {};
+  const modelGroup = {};
+  const modelLane = {
+    children: [modelGroup],
+    firstElementChild: modelGroup,
+  };
+  const fixedActions = {};
+  const outerToolbar = {
+    children: [root, modelLane, fixedActions],
+    firstElementChild: root,
+  };
+  const right = {
+    children: [outerToolbar],
+    firstElementChild: outerToolbar,
+    contains: element => [outerToolbar, modelLane, modelGroup, fixedActions].includes(element),
+  };
+  modelGroup.parentElement = modelLane;
+  root.nextElementSibling = modelLane;
+
+  const styles = new Map([
+    [right, { display: 'block', flexGrow: '0' }],
+    [outerToolbar, { display: 'flex', flexGrow: '0' }],
+    [modelLane, { display: 'flex', flexGrow: '1' }],
+    [fixedActions, { display: 'flex', flexGrow: '0' }],
+  ]);
+  const getStyle = element => styles.get(element) || { display: 'block', flexGrow: '0' };
+
+  assert.deepEqual(
+    resolveNativeFlowPlacement(right, root, null, getStyle),
+    { lane: modelLane, before: modelGroup },
+  );
+  assert.deepEqual(
+    resolveNativeFlowPlacement(right, root, modelGroup, getStyle),
+    { lane: modelLane, before: modelGroup },
+  );
 });
 
 test('usage root spans the entire free toolbar lane in every responsive mode', () => {

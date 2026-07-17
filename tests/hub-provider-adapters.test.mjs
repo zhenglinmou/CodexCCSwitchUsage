@@ -274,6 +274,167 @@ test('OpenAI token queries fall back to the paired existing-browser callback wit
   assert.equal(JSON.stringify(result).includes('private-token'), false);
 });
 
+test('OpenAI WHAM failures use one fast probe and temporarily bypass repeated direct attempts', async () => {
+  let now = 1_000;
+  let directCalls = 0;
+  let browserCalls = 0;
+  const engine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    async queryJson() {
+      browserCalls += 1;
+      return {
+        status: 200,
+        text: JSON.stringify({
+          plan_type: 'plus',
+          rate_limit: { primary_window: { used_percent: 25, limit_window_seconds: 18_000 } },
+        }),
+      };
+    },
+  }, {
+    now: () => now,
+    whamDirectBackoffMs: 100,
+    fetchImpl: async () => {
+      directCalls += 1;
+      throw new Error('node transport unavailable');
+    },
+  });
+  const provider = (id, accountId) => ({
+    id,
+    name: `OpenAI Official ${id}`,
+    websiteUrl: 'https://chatgpt.com/codex',
+    usage: null,
+    auth: { tokens: { account_id: accountId, access_token: `private-token-${id}` } },
+    apiKey: '',
+    apiBaseUrl: '',
+    baseUrl: '',
+  });
+
+  const first = await engine.query(provider('one', 'account-one'));
+  const second = await engine.query(provider('two', 'account-two'));
+
+  assert.equal(first.source, 'openai_wham_browser');
+  assert.equal(second.source, 'openai_wham_browser');
+  assert.equal(directCalls, 1, 'the active backoff must skip the second direct probe');
+  assert.equal(browserCalls, 2);
+
+  now += 100;
+  const third = await engine.query(provider('three', 'account-three'));
+
+  assert.equal(third.source, 'openai_wham_browser');
+  assert.equal(directCalls, 2, 'direct probing must resume after the backoff expires');
+  assert.equal(browserCalls, 3);
+});
+
+test('OpenAI WHAM direct probing is time-bounded when a browser fallback is available', async () => {
+  let directAborted = false;
+  const engine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    async queryJson() {
+      return {
+        status: 200,
+        text: JSON.stringify({
+          plan_type: 'plus',
+          rate_limit: { primary_window: { used_percent: 10, limit_window_seconds: 18_000 } },
+        }),
+      };
+    },
+  }, {
+    homeDir: 'Z:\\missing-home',
+    whamBrowserProbeTimeoutMs: 5,
+    fetchImpl: async (_url, options) => new Promise((_resolve, reject) => {
+      const keepAlive = setTimeout(() => reject(new Error('direct probe did not abort')), 250);
+      const abort = () => {
+        clearTimeout(keepAlive);
+        directAborted = true;
+        reject(new Error('direct probe timed out'));
+      };
+      if (options.signal.aborted) abort();
+      else options.signal.addEventListener('abort', abort, { once: true });
+    }),
+  });
+
+  const result = await engine.query({
+    id: 'openai-timeout', name: 'OpenAI Official', websiteUrl: 'https://chatgpt.com/codex', usage: null,
+    auth: { tokens: { account_id: 'account-one', access_token: 'private-token' } }, apiKey: '', apiBaseUrl: '', baseUrl: '',
+  });
+
+  assert.equal(directAborted, true);
+  assert.equal(result.source, 'openai_wham_browser');
+  assert.equal(result.usage.remaining, 90);
+});
+
+test('a failed browser fallback does not suppress the next OpenAI direct probe', async () => {
+  let directCalls = 0;
+  const engine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    async queryJson() { throw new Error('browser transport unavailable'); },
+  }, {
+    fetchImpl: async () => {
+      directCalls += 1;
+      throw new Error('node transport unavailable');
+    },
+  });
+  const provider = id => ({
+    id,
+    name: `OpenAI Official ${id}`,
+    websiteUrl: 'https://chatgpt.com/codex',
+    usage: null,
+    auth: { tokens: { account_id: `account-${id}`, access_token: `private-token-${id}` } },
+    apiKey: '',
+    apiBaseUrl: '',
+    baseUrl: '',
+  });
+
+  await assert.rejects(engine.query(provider('one')), /node transport unavailable/);
+  await assert.rejects(engine.query(provider('two')), /node transport unavailable/);
+
+  assert.equal(directCalls, 2);
+});
+
+test('overlapping OpenAI and CPA accounts reuse one successful WHAM query without caching credentials', async () => {
+  let now = 1_000;
+  let directCalls = 0;
+  const engine = new ProviderQueryEngine({}, {}, {
+    now: () => now,
+    whamResultCacheMs: 100,
+    fetchImpl: async () => {
+      directCalls += 1;
+      await new Promise(resolve => setTimeout(resolve, 5));
+      return new Response(JSON.stringify({
+        plan_type: 'plus',
+        rate_limit: { primary_window: { used_percent: 20, limit_window_seconds: 18_000 } },
+      }), { status: 200 });
+    },
+  });
+  const provider = (id, token = 'shared-private-token') => ({
+    id,
+    name: `OpenAI Official ${id}`,
+    websiteUrl: 'https://chatgpt.com/codex',
+    usage: null,
+    auth: { tokens: { account_id: 'shared-account', access_token: token } },
+    apiKey: '',
+    apiBaseUrl: '',
+    baseUrl: '',
+  });
+
+  const [first, second] = await Promise.all([
+    engine.query(provider('one')),
+    engine.query(provider('two')),
+  ]);
+  const cached = await engine.query(provider('three'));
+
+  assert.equal(directCalls, 1);
+  assert.equal(first.usage.providerId, 'one');
+  assert.equal(second.usage.providerId, 'two');
+  assert.equal(cached.usage.providerId, 'three');
+
+  now += 100;
+  await engine.query(provider('after-expiry'));
+  await engine.query(provider('rotated-token', 'new-private-token'));
+
+  assert.equal(directCalls, 3, 'cache expiry and token rotation must each force a new WHAM query');
+});
+
 test('duplicate provider copies reuse one recent balance request to avoid rate limiting', async () => {
   let requests = 0;
   const engine = new ProviderQueryEngine({}, {}, {

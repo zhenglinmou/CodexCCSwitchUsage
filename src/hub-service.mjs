@@ -90,6 +90,8 @@ export class HubService {
     this.queryEngine = queryEngine;
     this.cachePath = options.cachePath || '';
     this.concurrency = Math.max(1, Math.min(6, Number(options.concurrency) || 3));
+    this.browserConcurrency = Math.max(1, Math.min(this.concurrency, Number(options.browserConcurrency) || 1));
+    this.now = options.now || Date.now;
     this.items = new Map();
     this.providers = new Map();
     this.refreshes = new Map();
@@ -99,6 +101,7 @@ export class HubService {
     this.revision = 0;
     this.providerSnapshot = null;
     this.lastFullRefreshAt = '';
+    this.lastFullRefreshDurationMs = null;
     this.cachedItems = readCache(this.cachePath);
     try { this.syncProviders(); } catch {}
   }
@@ -155,6 +158,9 @@ export class HubService {
         queryMethod: describeProviderQuery(provider),
         usage: previous.usage || null,
         updatedAt: String(previous.updatedAt || ''),
+        queryDurationMs: Number.isFinite(Number(previous.queryDurationMs))
+          ? Math.max(0, Number(previous.queryDurationMs))
+          : null,
       });
     }
     for (const id of this.items.keys()) {
@@ -175,6 +181,7 @@ export class HubService {
       revision: this.revision,
       refreshing: this.refreshes.size > 0,
       lastFullRefreshAt: this.lastFullRefreshAt,
+      lastFullRefreshDurationMs: this.lastFullRefreshDurationMs,
       providers: [...this.items.values()].map(item => ({ ...item, refreshing: this.refreshes.has(item.id) })),
     };
   }
@@ -210,6 +217,7 @@ export class HubService {
     if (this.refreshes.has(id)) return this.refreshes.get(id);
     const provider = resolved;
     const previous = this.items.get(id);
+    const queryStartedAt = this.now();
     this.items.set(id, { ...previous, status: previous.usage ? previous.status : 'loading', message: '' });
     this.revision += 1;
     const promise = (async () => {
@@ -227,7 +235,6 @@ export class HubService {
           updatedAt: String(usage?.updatedAt || new Date().toISOString()),
         };
         this.items.set(id, next);
-        return next;
       } catch (error) {
         const previous = this.items.get(id);
         const message = safeMessage(error);
@@ -238,12 +245,16 @@ export class HubService {
           updatedAt: new Date().toISOString(),
         };
         this.items.set(id, next);
-        return next;
       } finally {
+        this.items.set(id, {
+          ...this.items.get(id),
+          queryDurationMs: Math.max(0, this.now() - queryStartedAt),
+        });
         this.refreshes.delete(id);
         this.revision += 1;
         this.#writeCache();
       }
+      return this.items.get(id);
     })();
     this.refreshes.set(id, promise);
     return promise;
@@ -254,17 +265,34 @@ export class HubService {
     this.syncProviders();
     const ids = [...this.providers.keys()];
     this.refreshAllPromise = (async () => {
+      const refreshStartedAt = this.now();
       this.cacheBatchDepth += 1;
-      let cursor = 0;
-      const worker = async () => {
-        while (cursor < ids.length) {
-          const id = ids[cursor];
-          cursor += 1;
-          await this.refreshProvider(id);
-        }
+      const runPool = async (poolIds, concurrency) => {
+        let cursor = 0;
+        const worker = async () => {
+          while (cursor < poolIds.length) {
+            const id = poolIds[cursor];
+            cursor += 1;
+            await this.refreshProvider(id);
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(concurrency, poolIds.length) }, worker));
       };
-      await Promise.all(Array.from({ length: Math.min(this.concurrency, ids.length) }, worker));
+      const browserIds = ids.filter(id => this.items.get(id)?.queryMethod?.requiresBrowser === true);
+      const browserIdSet = new Set(browserIds);
+      const directIds = ids.filter(id => !browserIdSet.has(id));
+      if (browserIds.length > 0 && directIds.length > 0 && this.concurrency > 1) {
+        const browserSlots = Math.min(this.browserConcurrency, this.concurrency - 1, browserIds.length);
+        const directSlots = this.concurrency - browserSlots;
+        await Promise.all([
+          runPool(directIds, directSlots),
+          runPool(browserIds, browserSlots),
+        ]);
+      } else {
+        await runPool(ids, this.concurrency);
+      }
       this.lastFullRefreshAt = new Date().toISOString();
+      this.lastFullRefreshDurationMs = Math.max(0, this.now() - refreshStartedAt);
       this.revision += 1;
       return this.getState();
     })().finally(() => {

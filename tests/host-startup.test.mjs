@@ -79,6 +79,20 @@ test('a failed injector audit never accelerates maintenance beyond the one-secon
   assert.match(delay, /PAGE_ACTION_POLL_MS,\s*injectorAuditDelay,/);
 });
 
+test('failed one-shot installs use keyed bounded backoff without delaying page-action snapshots', () => {
+  const source = hostSource();
+  const sync = source.slice(source.indexOf('async function syncTargets('), source.indexOf('function requestTargetSync('));
+  const request = source.slice(source.indexOf('function requestTargetSync('), source.indexOf('function syncHubProviders('));
+
+  assert.match(source, /new KeyedBackoff\(\)/);
+  assert.match(sync, /const targetSignature = \[\.\.\.targetIds\]\.sort\(\)\.join\('\|'\)/);
+  assert.match(sync, /pendingActions\.length === 0 && !targetInstallBackoff\.isReady\(targetSignature\)/);
+  assert.match(sync, /targetInstallBackoff\.fail\(targetSignature\)/);
+  assert.match(sync, /targetInstallBackoff\.reset\(\)/);
+  assert.match(request, /if \(outcome\?\.deferred\) targetAuditPending = true/);
+  assert.match(source, /targetInstallRetryMs: targetInstallBackoff\.remainingMs\(\)/);
+});
+
 test('status reports mounted primary pages while event-driven CDP remains disabled', () => {
   const source = hostSource();
   const writeStatus = source.slice(source.indexOf('function writeStatus('), source.indexOf('function safeMessage('));

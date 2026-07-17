@@ -5,6 +5,9 @@ import { normalizeUsage } from './usage-client.mjs';
 
 const WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage';
 const QUOTA_PER_USD = 500_000;
+const WHAM_BROWSER_PROBE_TIMEOUT_MS = 5_000;
+const WHAM_DIRECT_BACKOFF_MS = 300_000;
+const WHAM_RESULT_CACHE_MS = 30_000;
 
 export function parseBrowserJson(text) {
   const source = String(text || '').trim();
@@ -70,9 +73,10 @@ async function readJsonResponse(response) {
   return { status: response.status, payload, text };
 }
 
-async function fetchJson(fetchImpl, url, headers, timeoutMs = 40_000) {
+async function fetchJson(fetchImpl, url, headers, timeoutMs = 40_000, attempts = 2) {
   let lastError = null;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  const maximumAttempts = Math.max(1, Math.trunc(Number(attempts) || 1));
+  for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
     try {
       const response = await fetchImpl(url, {
         method: 'GET',
@@ -82,10 +86,10 @@ async function fetchJson(fetchImpl, url, headers, timeoutMs = 40_000) {
       });
       const result = await readJsonResponse(response);
       const retryable = [429, 500, 502, 503, 504].includes(result.status);
-      if (!retryable || attempt > 0) return result;
+      if (!retryable || attempt + 1 >= maximumAttempts) return result;
     } catch (error) {
       lastError = error;
-      if (attempt > 0) throw error;
+      if (attempt + 1 >= maximumAttempts) throw error;
     }
     await new Promise(resolve => setTimeout(resolve, 500));
   }
@@ -318,6 +322,13 @@ export class ProviderQueryEngine {
     this.browserBroker = browserBroker;
     this.fetchImpl = options.fetchImpl || fetch;
     this.homeDir = options.homeDir || process.env.USERPROFILE || process.env.HOME || '';
+    this.now = options.now || Date.now;
+    this.whamBrowserProbeTimeoutMs = Math.max(1, Number(options.whamBrowserProbeTimeoutMs) || WHAM_BROWSER_PROBE_TIMEOUT_MS);
+    this.whamDirectBackoffMs = Math.max(1, Number(options.whamDirectBackoffMs) || WHAM_DIRECT_BACKOFF_MS);
+    this.whamResultCacheMs = Math.max(1, Number(options.whamResultCacheMs) || WHAM_RESULT_CACHE_MS);
+    this.whamDirectRetryAt = 0;
+    this.whamInFlight = new Map();
+    this.whamRecent = new Map();
     this.inFlightQueries = new Map();
     this.recentQueries = new Map();
   }
@@ -556,6 +567,33 @@ export class ProviderQueryEngine {
   }
 
   async #queryWham(accessToken, accountId) {
+    const cacheKey = crypto.createHash('sha256')
+      .update(String(accountId))
+      .update('\0')
+      .update(String(accessToken))
+      .digest('base64url');
+    const cached = this.whamRecent.get(cacheKey);
+    if (cached && this.now() - cached.createdAt < this.whamResultCacheMs) return cached.result;
+    if (this.whamInFlight.has(cacheKey)) return this.whamInFlight.get(cacheKey);
+
+    const operation = this.#queryWhamUncached(accessToken, accountId);
+    this.whamInFlight.set(cacheKey, operation);
+    try {
+      const result = await operation;
+      if (result?.status === 200 && result.payload) {
+        this.whamRecent.set(cacheKey, { result, createdAt: this.now() });
+      }
+      return result;
+    } finally {
+      if (this.whamInFlight.get(cacheKey) === operation) this.whamInFlight.delete(cacheKey);
+      const cutoff = this.now() - this.whamResultCacheMs;
+      for (const [key, item] of this.whamRecent) {
+        if (item.createdAt <= cutoff) this.whamRecent.delete(key);
+      }
+    }
+  }
+
+  async #queryWhamUncached(accessToken, accountId) {
     const headers = {
       Authorization: `Bearer ${accessToken}`,
       'ChatGPT-Account-Id': accountId,
@@ -564,11 +602,31 @@ export class ProviderQueryEngine {
     };
     let direct = null;
     let directError = null;
-    try {
-      direct = await fetchJson(this.fetchImpl, WHAM_URL, headers, 40_000);
-      if (direct.payload || ![403, 429, 500, 502, 503, 504].includes(direct.status)) return { ...direct, transport: 'node' };
-    } catch (error) {
-      directError = error;
+    let directProbeFailed = false;
+    const browserAvailable = typeof this.browserBroker?.queryJson === 'function'
+      && (typeof this.browserBroker.isConnected !== 'function' || this.browserBroker.isConnected());
+    const directReady = !browserAvailable || this.now() >= this.whamDirectRetryAt;
+    if (directReady) {
+      try {
+        direct = await fetchJson(
+          this.fetchImpl,
+          WHAM_URL,
+          headers,
+          browserAvailable ? this.whamBrowserProbeTimeoutMs : 40_000,
+          browserAvailable ? 1 : 2,
+        );
+        if (direct.payload || ![403, 429, 500, 502, 503, 504].includes(direct.status)) {
+          this.whamDirectRetryAt = 0;
+          return { ...direct, transport: 'node' };
+        }
+      } catch (error) {
+        directError = error;
+      }
+      directProbeFailed = browserAvailable;
+    }
+    if (!browserAvailable) {
+      if (direct) return { ...direct, transport: 'node' };
+      throw directError || new Error('OpenAI 用量直连失败');
     }
     try {
       const browserHeaders = { ...headers };
@@ -580,6 +638,7 @@ export class ProviderQueryEngine {
         navigateRequest: false,
         waitMs: 30_000,
       });
+      if (directProbeFailed) this.whamDirectRetryAt = this.now() + this.whamDirectBackoffMs;
       return { status: Number(raw?.status) || 0, payload: parseBrowserJson(raw?.text), text: String(raw?.text || ''), transport: 'edge' };
     } catch (error) {
       if (direct) return { ...direct, transport: 'node' };
