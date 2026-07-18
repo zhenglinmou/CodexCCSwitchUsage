@@ -44,12 +44,27 @@ The installer preserves the stable `runtime` directory during an upgrade. A real
 | `src\evaluator-worker.mjs` | Sandboxed `node:vm` execution of `usage_script` |
 | `src\cdp-client.mjs` | CDP HTTP/WebSocket client |
 | `src\target-session.mjs` | Injector installation, hot replacement, payload delivery |
+| `balance-bridge\` | Optional v1-only standalone Python balance gateway and its tests |
+| `balance-bridge\providers.ccswitch.example.json` | Sanitized template for the original CCSwitch-specific bridge modes |
 | `scripts\launch.ps1` | Finds/starts Codex with CDP, starts the host, activates the window |
 | `scripts\stop-host.ps1` | Stops plugin hosts without stopping Codex |
 | `scripts\stop.ps1` | Stops plugin hosts and the Codex process tree; not for normal development reloads |
 | `packaging\launcher\Program.cs` | Hidden Windows EXE wrapper that launches the existing PowerShell flow |
 | `packaging\setup.iss` | Inno Setup installer definition |
 | `scripts\build-exe.ps1` | Repeatable launcher/installer build |
+
+### Optional v1 Python balance bridge
+
+The source under `balance-bridge\` belongs to v1 and is intentionally separate from the Node plugin host. It listens only on `127.0.0.1:17891`, normalizes provider-specific balance APIs, and generates a v1-compatible CCSwitch `usage_script`. It is not bundled into or automatically started by the v1 EXE.
+
+Never commit `balance-bridge\providers.json`, credentials, cookies, logs, browser profiles, or real CCSwitch provider UUIDs. Start from one of the tracked example files. The original CCSwitch-specific layout is preserved as a sanitized `providers.ccswitch.example.json`.
+
+Do not run this bridge alongside the v2 Balance Hub because both use port `17891`. Changes to the bridge do not require an injector version bump or a Codex host reload. Verify the bridge independently from its directory:
+
+```powershell
+Set-Location .\balance-bridge
+python -m unittest discover -s tests -v
+```
 
 ## 3. Enter development mode
 

@@ -1,0 +1,68 @@
+{
+  "server": {"host": "127.0.0.1", "port": 17891},
+  "browser": {"channel": "msedge", "headless": false},
+  "providers": [
+    {
+      "id": "example-api-key",
+      "name": "API Key 示例",
+      "enabled": true,
+      "adapter": "generic_http",
+      "base_url": "https://api.example.com",
+      "timeout_seconds": 30,
+      "request": {
+        "path": "/v1/account/balance",
+        "method": "GET",
+        "headers": {
+          "Accept": "application/json",
+          "Authorization": "Bearer ${ENV:EXAMPLE_API_KEY}"
+        }
+      },
+      "response": {
+        "success": {"path": "success", "equals": true},
+        "message_paths": ["message", "error.message"],
+        "fields": {
+          "planName": {"path": "data.plan", "default": "默认套餐"},
+          "remaining": {"path": "data.balance", "default": 0},
+          "used": {"path": "data.used", "default": 0},
+          "total": {"paths": ["data.balance", "data.used"], "aggregate": "sum"},
+          "unit": {"path": "data.currency", "default": "USD"}
+        }
+      }
+    },
+    {
+      "id": "example-browser",
+      "name": "网页登录示例",
+      "enabled": true,
+      "adapter": "browser_fetch",
+      "base_url": "https://console.example.com",
+      "login_path": "/login",
+      "fallback_user_id": "123456",
+      "request": {
+        "path": "/api/user/self",
+        "method": "GET",
+        "headers": {"Accept": "application/json"},
+        "browser_user_header": "New-Api-User"
+      },
+      "response": {
+        "success": {"path": "success", "equals": true},
+        "fields": {
+          "planName": {"path": "data.group", "default": "默认套餐"},
+          "remaining": {"path": "data.quota", "divisor": 500000},
+          "used": {"path": "data.used_quota", "divisor": 500000},
+          "total": {"paths": ["data.quota", "data.used_quota"], "aggregate": "sum", "divisor": 500000},
+          "unit": {"default": "USD"}
+        }
+      }
+    },
+    {
+      "id": "example-plugin",
+      "name": "特殊接口插件示例",
+      "enabled": true,
+      "adapter": "python_plugin",
+      "plugin": "plugins/example_plugin.py",
+      "settings": {
+        "api_key": "${ENV:EXAMPLE_PLUGIN_API_KEY}"
+      }
+    }
+  ]
+}

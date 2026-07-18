@@ -17,6 +17,14 @@
 
 CCSwitch 自定义用量脚本的请求结构、`extractor` 返回 JSON 字段和兼容示例见 [USAGE_SCRIPT_FORMAT.md](./USAGE_SCRIPT_FORMAT.md)。
 
+## v1 可选独立余额桥接器
+
+此前单独保存在本机的 Python 余额桥接工程现已一并放入 v1 源码，目录为 [`balance-bridge`](./balance-bridge/README.md)。它为需要 API 适配、Cookie、OAuth 或 WAF 处理的供应商提供固定的 `http://127.0.0.1:17891/v1/balance/{provider-id}` 接口，再生成可粘贴进 CCSwitch 的 v1 `usage_script`。
+
+桥接器是 v1 的可选独立进程，不是 Codex 插件宿主的一部分，也不会随 v1 EXE 自动启动。仓库只提供脱敏配置模板；本机 `providers.json`、provider UUID、API Key、Cookie、Token、日志和浏览器 profile 都不会提交。安装、配置、测试和启停方式见桥接器目录中的说明。
+
+不要让这个 v1 Python 桥接器与 v2 Balance Hub 同时运行，因为二者都使用端口 `17891`。
+
 安装并启动：
 
 ```powershell
