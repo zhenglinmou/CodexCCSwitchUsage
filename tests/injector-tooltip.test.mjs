@@ -182,6 +182,17 @@ test('recent request popover renders at most ten current-provider rows with mode
   assert.match(script, /当前供应商还没有请求记录/);
 });
 
+test('closing recent requests preserves the outgoing mode throughout the exit transition', () => {
+  const script = buildInjectorScript();
+  const renderer = sourceSection(script, 'function render(footers = null, shouldScheduleLayout = true) {', 'function findRightToolbar(');
+
+  assert.match(
+    renderer,
+    /const popoverMode = state\.popoverOpen\s+\? \(state\.popoverMode \|\| 'balance'\)\s+: \(popover\.getAttribute\('data-mode'\) \|\| 'balance'\);/,
+    'a closing request panel must not switch to the default balance mode before its fade-out finishes',
+  );
+});
+
 test('Hub control shares refresh styling and stays inside the responsive content group', () => {
   const source = fs.readFileSync(new URL('../src/injector-script.mjs', import.meta.url), 'utf8');
 

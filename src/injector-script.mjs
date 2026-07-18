@@ -223,7 +223,7 @@ export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = glob
 }
 
 export const PAGE_ACTION_SENTINEL = '\u2063\u2063';
-export const INJECTOR_VERSION = 71;
+export const INJECTOR_VERSION = 72;
 
 function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, selectResponsiveUsageMode, calculateResponsiveMeasurements, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, pageActionSentinel, version) {
   const VERSION = version;
@@ -1006,7 +1006,9 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     const portal = state.popoverShadow || (state.popoverOpen ? ensurePopoverPortal() : null);
     if (portal) {
       const popover = portal.getElementById('popover');
-      const popoverMode = state.popoverMode || 'balance';
+      const popoverMode = state.popoverOpen
+        ? (state.popoverMode || 'balance')
+        : (popover.getAttribute('data-mode') || 'balance');
       popover.classList.toggle('open', state.popoverOpen);
       updateElementAttribute(popover, 'data-mode', popoverMode);
       updateElementAttribute(popover, 'aria-label', popoverMode === 'requests' ? '当前供应商最近请求' : '完整额度');
