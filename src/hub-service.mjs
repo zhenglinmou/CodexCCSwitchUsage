@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { describeProviderQuery, loginConfiguration, providerAliases } from './hub-provider-adapters.mjs';
+import { describeProviderQuery, loginConfiguration, providerAliases, providerKind } from './hub-provider-adapters.mjs';
 
 function safeMessage(error) {
   const message = error instanceof Error ? error.message : String(error || '未知错误');
@@ -231,18 +231,27 @@ export class HubService {
         const result = await this.queryEngine.query(provider);
         if (!isCurrentSnapshot()) return this.items.get(id) || null;
         const usage = safeUsage(result.usage);
-        const current = this.items.get(id);
-        const next = {
-          ...current,
-          status: usage ? (result.degraded ? 'degraded' : 'ok') : (result.loginRequired ? 'login-required' : 'error'),
-          message: usage ? (result.degraded ? 'API 可用性检查未通过，显示本地统计' : '') : safeMessage(result.message || '没有返回可显示的额度数据'),
-          source: String(result.source || ''),
-          sessionSyncRequired: result.sessionSyncRequired === true,
-          websiteLoginRequired: result.websiteLoginRequired === true,
-          usage: usage || current.usage,
-          updatedAt: String(usage?.updatedAt || new Date().toISOString()),
-        };
-        this.items.set(id, next);
+        const targets = usage && providerKind(provider) === 'anyrouter'
+          ? [...this.providers.values()].filter(candidate => providerKind(candidate) === 'anyrouter')
+          : [provider];
+        for (const target of targets) {
+          if (this.providers.get(target.id) !== target || !this.items.has(target.id)) continue;
+          const current = this.items.get(target.id);
+          const targetUsage = usage && target.id !== id && usage.providerName === provider.name
+            ? { ...usage, providerName: target.name }
+            : usage;
+          this.items.set(target.id, {
+            ...current,
+            status: targetUsage ? (result.degraded ? 'degraded' : 'ok') : (result.loginRequired ? 'login-required' : 'error'),
+            message: targetUsage ? (result.degraded ? 'API 可用性检查未通过，显示本地统计' : '') : safeMessage(result.message || '没有返回可显示的额度数据'),
+            source: String(result.source || ''),
+            sessionSyncRequired: result.sessionSyncRequired === true,
+            websiteLoginRequired: result.websiteLoginRequired === true,
+            usage: targetUsage || current.usage,
+            updatedAt: String(targetUsage?.updatedAt || new Date().toISOString()),
+            queryDurationMs: Math.max(0, this.now() - queryStartedAt),
+          });
+        }
       } catch (error) {
         if (!isCurrentSnapshot()) return this.items.get(id) || null;
         const previous = this.items.get(id);

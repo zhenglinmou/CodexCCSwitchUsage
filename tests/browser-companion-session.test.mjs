@@ -221,6 +221,8 @@ test('browser companion refreshes through the extension worker without opening a
   assert.match(query, /fetchFromExtension\(request,/);
   assert.match(query, /identityMissing/);
   assert.match(source, /credentials: 'include'/);
+  assert.match(source, /withAnyRouterAcwRetry\(fetchOnce,/);
+  assert.match(source, /name: 'acw_sc__v2'/);
   assert.doesNotMatch(query, /queryInTemporaryTab|chrome\.tabs\.(?:create|update)/);
   assert.doesNotMatch(source, /tabSessionCandidates/);
   assert.doesNotMatch(source, /if \(value\?\.origin\) await notifySession/);

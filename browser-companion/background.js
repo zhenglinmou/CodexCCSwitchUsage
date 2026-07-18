@@ -9,6 +9,10 @@ import {
   SessionIdentityStore,
   TrailingSingleFlight,
 } from './session-state.js';
+import {
+  isAnyRouterAcwUrl,
+  withAnyRouterAcwRetry,
+} from './anyrouter-waf.js';
 
 const HUB_ORIGIN = 'http://127.0.0.1:17891';
 const POLL_ALARM = 'ccswitch-balance-companion-poll';
@@ -202,7 +206,7 @@ async function fetchFromExtension(request, userId, timeoutMs) {
   const targetUrl = new URL(request.requestPath || '/', request.baseUrl).href;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
+  const fetchOnce = async () => {
     const outgoing = { Accept: 'application/json', ...(request.headers || {}) };
     if (request.userHeader && userId) outgoing[request.userHeader] = userId;
     const response = await fetch(targetUrl, {
@@ -217,6 +221,18 @@ async function fetchFromExtension(request, userId, timeoutMs) {
       url: response.url,
       text: (await response.text()).slice(0, 2_000_000),
     };
+  };
+  try {
+    if (!isAnyRouterAcwUrl(targetUrl)) return await fetchOnce();
+    return await withAnyRouterAcwRetry(fetchOnce, async value => {
+      await chrome.cookies.set({
+        url: new URL('/', targetUrl).href,
+        name: 'acw_sc__v2',
+        value,
+        path: '/',
+        secure: true,
+      });
+    });
   } catch (error) {
     return { status: 0, url: targetUrl, text: '', error: error instanceof Error ? error.message : String(error) };
   } finally {

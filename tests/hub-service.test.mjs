@@ -277,6 +277,51 @@ test('Hub does not rewrite a freshly confirmed login failure during a live provi
   assert.equal(service.getState().providers[0].sessionSyncRequired, true);
 });
 
+test('a successful AnyRouter account query updates both the domestic mirror and foreign provider cards', async () => {
+  const domestic = {
+    ...provider('domestic', 'any的国内镜像'),
+    apiBaseUrl: 'https://domestic-mirror.example/v1',
+  };
+  const foreign = {
+    ...provider('foreign', 'any的国外我自己的'),
+    apiBaseUrl: 'https://anyrouter.top/v1',
+  };
+  const service = new HubService({ getAll: () => [domestic, foreign] }, {
+    async query(item) {
+      if (item.id === domestic.id) {
+        return {
+          source: 'browser_session',
+          loginRequired: true,
+          websiteLoginRequired: true,
+          message: 'Failed to fetch',
+        };
+      }
+      return {
+        source: 'browser_session',
+        usage: {
+          status: 'ok', providerId: item.id, providerName: 'default', used: 42.5, remaining: 507.5, total: 550,
+          unit: 'USD', extra: '', updatedAt: '2026-07-18T00:00:00.000Z', refreshIntervalMinutes: 5,
+        },
+      };
+    },
+  });
+
+  await service.refreshProvider(domestic.id);
+  assert.equal(service.items.get(domestic.id).status, 'login-required');
+
+  await service.refreshProvider(foreign.id);
+  const state = service.getState().providers;
+  const domesticState = state.find(item => item.id === domestic.id);
+  const foreignState = state.find(item => item.id === foreign.id);
+
+  assert.equal(domesticState.status, 'ok');
+  assert.equal(domesticState.websiteLoginRequired, false);
+  assert.equal(domesticState.message, '');
+  assert.deepEqual(domesticState.usage, foreignState.usage);
+  assert.equal(domesticState.usage.remaining, 507.5);
+  assert.equal(service.findProvider(domestic.id).apiBaseUrl, 'https://domestic-mirror.example/v1');
+});
+
 test('Hub one-time browser session sync immediately retries the provider', async () => {
   const item = provider('any', 'any的国外我自己的');
   let queryCalls = 0;
