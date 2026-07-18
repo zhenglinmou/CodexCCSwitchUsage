@@ -39,6 +39,23 @@ test('host owns no browser-wide discovery or long-lived target sessions', () => 
   assert.match(source, /installTargetOnce/);
 });
 
+test('host exits completely when its exact Codex root process exits', () => {
+  const source = hostSource();
+  const shutdown = source.slice(source.indexOf('function shutdown('), source.indexOf("process.on('SIGINT'"));
+
+  assert.match(source, /if \(!isProcessAlive\(args\.codexPid\)\) throw/);
+  assert.match(source, /new ProcessExitMonitor\(\{/);
+  assert.match(source, /processId: args\.codexPid/);
+  assert.match(source, /intervalMs: CODEX_PROCESS_POLL_MS/);
+  assert.match(source, /onExit: \(\) => shutdown\('Codex root process exited'\)/);
+  assert.match(shutdown, /codexProcessMonitor\?\.close\(\)/);
+  assert.match(shutdown, /hubServer\.close\(\)/);
+  assert.match(shutdown, /browserBroker\.close\(\)/);
+  assert.match(shutdown, /repository\.close\(\)/);
+  assert.match(shutdown, /const forceExitTimer = setTimeout\(\(\) => process\.exit\(0\), 750\)/);
+  assert.match(shutdown, /process\.exit\(0\)/);
+});
+
 test('target synchronization uses only HTTP snapshots and one-shot primary-page installs', () => {
   const source = hostSource();
   const sync = source.slice(source.indexOf('async function syncTargets('), source.indexOf('function requestTargetSync('));
@@ -136,7 +153,7 @@ test('host schedules only the current CCSwitch provider and leaves Hub providers
   assert.match(source, /const STATUS_HEARTBEAT_MS = 300_000;/);
   assert.match(loop, /repository\.getChangeToken\(\)/);
   assert.match(loop, /databaseAuditDue/);
-  assert.match(loop, /requestTargetSync\(\{ audit: auditDue \|\| providersChanged \}\)/);
+  assert.match(loop, /requestTargetSync\(\{ audit: auditDue \|\| providersChanged \|\| recentRequestsChanged \}\)/);
   assert.doesNotMatch(source, /provider\.usage\?\.autoQueryInterval/);
   assert.match(source, /hubService\.refreshProvider\(provider\.id\)/);
   assert.match(loop, /providersChanged \? requestCurrentProviderRefresh\(false, true\)/);
@@ -212,6 +229,21 @@ test('database watcher coalesces file bursts with a low-latency debounce', () =>
   assert.ok(Number(debounce[1]) >= 75 && Number(debounce[1]) <= 150, 'debounce should coalesce WAL bursts without visible delay');
   assert.match(watcher, /if \(databaseWatchTimer\) clearTimeout\(databaseWatchTimer\)/);
   assert.match(watcher, /const syncResult = syncHubProviders\(\)/);
+  assert.match(watcher, /const recentRequestsChanged = syncRecentRequests\(\)/);
   assert.match(watcher, /if \(syncResult\.changed\) requestCurrentProviderRefresh\(false, true\)/);
+  assert.match(watcher, /else if \(recentRequestsChanged\) requestTargetSync\(\{ audit: true \}\)/);
   assert.match(watcher, /}, DATABASE_WATCH_DEBOUNCE_MS\);/);
+});
+
+test('request-log changes push a bounded local history without refreshing provider balances', () => {
+  const source = hostSource();
+  const recent = source.slice(source.indexOf('function payloadWithRecentRequests('), source.indexOf('function wakeFallbackPoll('));
+  const watcher = source.slice(source.indexOf('function startDatabaseWatcher()'), source.indexOf('function startControlWatcher()'));
+
+  assert.match(source, /const RECENT_REQUEST_LIMIT = 10/);
+  assert.match(recent, /repository\.getRecentRequests\(providerId, RECENT_REQUEST_LIMIT\)/);
+  assert.match(recent, /recentRequests: providerId && providerId === recentRequestProviderId \? recentRequests : \[\]/);
+  assert.match(watcher, /else if \(recentRequestsChanged\) requestTargetSync\(\{ audit: true \}\)/);
+  assert.doesNotMatch(watcher, /recentRequestsChanged[^\n]*requestCurrentProviderRefresh/);
+  assert.match(source, /delete cachePayload\.recentRequests/);
 });

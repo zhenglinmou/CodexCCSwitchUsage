@@ -39,4 +39,4 @@ Start-Sleep -Milliseconds 350
 if (Test-Path -LiteralPath (Join-Path $runtime 'host.pid')) {
     Remove-Item -LiteralPath (Join-Path $runtime 'host.pid') -Force -ErrorAction SilentlyContinue
 }
-[pscustomobject]@{ stopped = $true; hostCount = @($hosts).Count; guardCount = 0; codexRootCount = $roots.Count } | ConvertTo-Json -Compress
+[pscustomobject]@{ stopped = $true; hostCount = @($hosts).Count; codexRootCount = $roots.Count } | ConvertTo-Json -Compress

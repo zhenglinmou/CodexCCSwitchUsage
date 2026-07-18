@@ -25,6 +25,8 @@ test('EXE launcher preserves the PowerShell flow and starts the host detached', 
   assert.match(source, /CreateProcessW/);
   assert.match(source, /CreateProcessW\(\s*node,/);
   assert.match(source, /false,\s*DETACHED_PROCESS/);
+  assert.match(source, /GetArgumentValue\(args, "--codex-pid", "0"\)/);
+  assert.match(source, /"--codex-pid", codexPid\.ToString\(\)/);
   assert.match(source, /require\('node:sqlite'\)/);
   assert.match(source, /process\.arch!=='x64'/);
 });
@@ -60,7 +62,7 @@ test('repeatable EXE build embeds the current Node runtime and emits a versioned
 
   assert.equal(packageJson.scripts['build:exe'].includes('scripts/build-exe.ps1'), true);
   assert.match(build, /runtime-bin\\node\.exe/);
-  for (const file of ['browser-callback-broker', 'hub-provider-adapters', 'hub-service', 'hub-page', 'hub-server', 'keyed-backoff', 'page-action-channel']) {
+  for (const file of ['browser-callback-broker', 'hub-provider-adapters', 'hub-service', 'hub-page', 'hub-server', 'keyed-backoff', 'page-action-channel', 'process-lifecycle']) {
     assert.match(build, new RegExp(`'src\\\\${file}\\.mjs'`));
     assert.match(install, new RegExp(`'src\\\\${file}\\.mjs'`));
   }
@@ -84,23 +86,13 @@ test('repeatable EXE build embeds the current Node runtime and emits a versioned
   assert.match(build, /CodexCCSwitchUsage-Setup-\$version\.exe/);
 });
 
-test('legacy instance guard and one-time profile migration are not shipped', () => {
+test('one-time profile migration is not shipped', () => {
   const build = read('scripts/build-exe.ps1');
   const install = read('scripts/install.ps1');
   const setup = read('packaging/setup.iss');
-  const status = read('scripts/status.ps1');
-  const stop = read('scripts/stop.ps1');
 
-  assert.equal(fs.existsSync(new URL('../scripts/instance-guard.ps1', import.meta.url)), false);
   assert.equal(fs.existsSync(new URL('../scripts/migrate-default-profile.ps1', import.meta.url)), false);
-  assert.doesNotMatch(build, /'scripts\\instance-guard\.ps1'/);
   assert.doesNotMatch(build, /'scripts\\migrate-default-profile\.ps1'/);
-  assert.match(install, /@\('scripts\\instance-guard\.ps1', 'scripts\\migrate-default-profile\.ps1'\)/);
-  assert.match(install, /Remove-Item -LiteralPath \(Join-Path \$target \$relative\)/);
-  assert.match(setup, /\[InstallDelete\][\s\S]*scripts\\instance-guard\.ps1/);
+  assert.match(install, /Remove-Item -LiteralPath \(Join-Path \$target 'scripts\\migrate-default-profile\.ps1'\)/);
   assert.match(setup, /\[InstallDelete\][\s\S]*scripts\\migrate-default-profile\.ps1/);
-  assert.doesNotMatch(status, /Join-Path \$root 'scripts\\instance-guard\.ps1'/);
-  assert.match(status, /instanceGuardRunning = \$false/);
-  assert.doesNotMatch(stop, /Join-Path \$root 'scripts\\instance-guard\.ps1'/);
-  assert.match(stop, /guardCount = 0/);
 });

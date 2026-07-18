@@ -223,7 +223,7 @@ export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = glob
 }
 
 export const PAGE_ACTION_SENTINEL = '\u2063\u2063';
-export const INJECTOR_VERSION = 69;
+export const INJECTOR_VERSION = 71;
 
 function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, selectResponsiveUsageMode, calculateResponsiveMeasurements, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, pageActionSentinel, version) {
   const VERSION = version;
@@ -273,6 +273,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     layoutFrame: 0,
     composerSyncFrame: 0,
     popoverOpen: false,
+    popoverMode: '',
     loading: false,
     popoverRoot: null,
     popoverShadow: null,
@@ -283,6 +284,8 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     tooltipAnchor: null,
     tooltipTimer: 0,
     popoverPayload: null,
+    recentRequestsPayload: null,
+    recentRequestsAgeMinute: -1,
     eventController,
     usageStyleSheet: null,
     __codexUsageView: null,
@@ -302,6 +305,24 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     if (!Number.isFinite(number)) return '';
     return numberFormatter.format(number);
   };
+
+  const balancePayloadSignature = payload => JSON.stringify([
+    payload?.status,
+    payload?.providerId,
+    payload?.providerName,
+    payload?.websiteUrl,
+    payload?.message,
+    payload?.extra,
+    payload?.periodLabel,
+    payload?.hideTotal,
+    payload?.refreshIntervalMinutes,
+    payload?.used,
+    payload?.remaining,
+    payload?.total,
+    payload?.unit,
+    payload?.updatedAt,
+    payload?.queryError,
+  ]);
 
   function footerParts(footer) {
     const children = footer?.children;
@@ -464,30 +485,45 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       const shadow = host.attachShadow({ mode: 'open' });
       shadow.innerHTML = `<style>
         *{box-sizing:border-box}
-        .popover{position:fixed;z-index:2147483000;width:min(236px,calc(100vw - 16px));padding:12px;border:1px solid var(--color-token-border,var(--color-token-button-border,rgba(127,127,127,.16)));border-radius:14px;background:var(--color-token-dropdown-background,rgb(38,38,38));box-shadow:0 12px 32px rgba(0,0,0,.32);color:var(--color-token-text-primary,currentColor);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:var(--text-sm,13px);font-weight:445;line-height:18px;letter-spacing:normal;opacity:0;visibility:hidden;transform:translateY(4px);transition:opacity .12s ease,transform .12s ease,visibility .12s;pointer-events:none}
+        .popover{position:fixed;z-index:2147483000;width:min(236px,calc(100vw - 16px));max-height:calc(100vh - 16px);padding:12px;border:1px solid var(--color-token-border,var(--color-token-button-border,rgba(127,127,127,.16)));border-radius:14px;background:var(--color-token-dropdown-background,rgb(38,38,38));box-shadow:0 12px 32px rgba(0,0,0,.32);color:var(--color-token-text-primary,currentColor);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:var(--text-sm,13px);font-weight:445;line-height:18px;letter-spacing:normal;display:flex;flex-direction:column;opacity:0;visibility:hidden;transform:translateY(4px);transition:opacity .12s ease,transform .12s ease,visibility .12s;pointer-events:none}
         .popover.open{opacity:1;visibility:visible;transform:translateY(0);pointer-events:auto}
+        .popover[data-mode="requests"]{width:min(420px,calc(100vw - 16px))}
         .popover-head{display:flex;align-items:center;justify-content:space-between;color:var(--color-token-text-tertiary,currentColor);height:24px}
-        .popover-head-title{font:inherit}
+        .popover-head-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:inherit}
         .popover-refresh{appearance:none;display:grid;place-items:center;width:28px;height:28px;margin:-2px -6px -2px 0;padding:0;border:0;border-radius:7px;background:transparent;color:var(--color-token-text-tertiary,currentColor);cursor:pointer}
         .popover-refresh:hover{background:var(--color-background-button-tertiary-hover,rgba(127,127,127,.12));color:var(--color-token-text-primary,currentColor)}
         .popover-refresh:focus-visible{outline:2px solid var(--color-token-text-primary,currentColor);outline-offset:1px}
         .popover-refresh svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
         .popover-refresh[data-loading="true"] svg{animation:popover-refresh-spin .9s linear infinite}
         .popover-grid{display:grid;gap:6px;margin-top:8px}
+        .popover[data-mode="requests"] .popover-grid,.popover[data-mode="requests"] .popover-refresh{display:none}
         .popover-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:30px;padding:0 9px;border-radius:8px;background:var(--color-background-button-tertiary,rgba(127,127,127,.04))}
         .popover-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-token-text-tertiary,currentColor)}
         .popover-value{flex:0 0 auto;color:var(--color-token-text-primary,currentColor);font:inherit}
+        .request-list{display:none;min-height:0;margin-top:8px;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
+        .popover[data-mode="requests"] .request-list{display:block}
+        .request-item{padding:9px 4px;border-bottom:1px solid var(--color-token-border,rgba(127,127,127,.12))}
+        .request-item:last-child{border-bottom:0}
+        .request-main{display:flex;align-items:center;gap:10px;min-width:0}
+        .request-model{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-token-text-primary,currentColor);font-weight:600}
+        .request-age{flex:0 0 auto;margin-left:auto;color:var(--color-token-text-tertiary,currentColor);font-size:12px;white-space:nowrap}
+        .request-meta{display:flex;align-items:center;flex-wrap:wrap;gap:2px 8px;min-width:0;margin-top:3px;color:var(--color-token-text-tertiary,currentColor);font-size:12px;line-height:17px}
+        .request-meta>span:not(.request-cost):not(.request-error){min-width:0;overflow-wrap:anywhere}
+        .request-cost{margin-left:auto;color:var(--color-token-text-primary,currentColor);white-space:nowrap}
+        .request-error{color:var(--color-text-warning,#ff9f43);white-space:nowrap}
+        .request-empty{padding:22px 4px;text-align:center;color:var(--color-token-text-tertiary,currentColor)}
         .hub-open{appearance:none;width:100%;height:34px;margin-top:9px;border:1px solid var(--color-token-border,rgba(127,127,127,.18));border-radius:9px;background:var(--color-background-button-tertiary,rgba(127,127,127,.06));color:var(--color-token-text-primary,currentColor);font:inherit;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px}
         .hub-open:hover{background:var(--color-background-button-tertiary-hover,rgba(127,127,127,.12))}
         .hub-open svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+        .hub-open span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
         .hub-open .external-icon{width:12px;height:12px}
         .tooltip{position:fixed;z-index:2147483001;max-width:min(360px,calc(100vw - 16px));padding:7px 10px;border:1px solid var(--color-token-border,rgba(127,127,127,.18));border-radius:10px;background:var(--color-token-dropdown-background,rgb(38,38,38));box-shadow:0 8px 24px rgba(0,0,0,.28);color:var(--color-token-text-primary,#fff);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:13px;line-height:18px;white-space:normal;opacity:0;visibility:hidden;transform:translateY(3px);transition:opacity .1s ease,transform .1s ease,visibility .1s;pointer-events:none}
         .tooltip.open{opacity:1;visibility:visible;transform:translateY(0)}
         @keyframes popover-refresh-spin{to{transform:rotate(-360deg)}}
         @media (prefers-reduced-motion:reduce){.tooltip{transition:none}.popover-refresh[data-loading="true"] svg{animation:none}}
-      </style><div id="popover" class="popover" role="dialog" aria-label="完整额度">
+      </style><div id="popover" class="popover" data-mode="balance" role="dialog" aria-label="完整额度">
         <div class="popover-head"><span class="popover-head-title">额度</span><button id="popover-refresh" class="popover-refresh" type="button" aria-label="刷新 CCSwitch 用量"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 0-15.22-6.49L3 8"></path><path d="M3 3v5h5"></path><path d="M3 12a9 9 0 0 0 15.22 6.49L21 16"></path><path d="M16 16h5v5"></path></svg></button></div>
-        <div id="popover-grid" class="popover-grid"></div><button id="open-hub" class="hub-open" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1.25"></rect><rect x="14" y="4" width="6" height="6" rx="1.25"></rect><rect x="4" y="14" width="6" height="6" rx="1.25"></rect><rect x="14" y="14" width="6" height="6" rx="1.25"></rect></svg><span>打开 All API Hub</span><svg class="external-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6"></path><path d="M20 4 11 13"></path><path d="M20 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h6"></path></svg></button>
+        <div id="popover-grid" class="popover-grid"></div><div id="recent-requests" class="request-list" role="list"></div><button id="open-hub" class="hub-open" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1.25"></rect><rect x="14" y="4" width="6" height="6" rx="1.25"></rect><rect x="4" y="14" width="6" height="6" rx="1.25"></rect><rect x="14" y="14" width="6" height="6" rx="1.25"></rect></svg><span>打开 All API Hub</span><svg class="external-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6"></path><path d="M20 4 11 13"></path><path d="M20 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h6"></path></svg></button>
       </div><div id="tooltip" class="tooltip" role="tooltip"></div>`;
       shadow.getElementById('open-hub').addEventListener('click', () => openHub());
       shadow.getElementById('popover-refresh').addEventListener('click', event => {
@@ -534,12 +570,44 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     return rows;
   }
 
+  function formatTokenCount(value) {
+    const number = Math.max(0, Number(value) || 0);
+    const compact = (divisor, suffix) => {
+      const scaled = number / divisor;
+      const digits = scaled >= 100 ? 0 : 1;
+      return `${scaled.toFixed(digits).replace(/\.0$/, '')}${suffix}`;
+    };
+    if (number >= 1_000_000) return compact(1_000_000, 'M');
+    if (number >= 1_000) return compact(1_000, 'k');
+    return String(Math.trunc(number));
+  }
+
+  function formatRequestCost(value) {
+    const number = Math.max(0, Number(value) || 0);
+    if (number > 0 && number < 0.0001) return '<$0.0001';
+    if (number === 0) return '$0';
+    return `$${number.toFixed(number < 1 ? 4 : 2)}`;
+  }
+
+  function requestMetadata(item) {
+    const values = [
+      `输入 ${formatTokenCount(item.inputTokens)}`,
+      `输出 ${formatTokenCount(item.outputTokens)}`,
+    ];
+    if (Number(item.cacheReadTokens) > 0) values.push(`缓存 ${formatTokenCount(item.cacheReadTokens)}`);
+    if (Number(item.cacheCreationTokens) > 0) values.push(`写缓存 ${formatTokenCount(item.cacheCreationTokens)}`);
+    if (item.requestModel && item.model && item.requestModel !== item.model) values.push(`请求 ${item.requestModel}`);
+    return values;
+  }
+
   function positionPopover() {
     if (!state.popoverOpen || !state.popoverShadow) return;
     const anchor = state.popoverAnchor?.root?.isConnected
       ? state.popoverAnchor
       : { root: state.root, shadow: state.shadow };
-    const button = anchor.root?.__codexUsageRefreshButton;
+    const button = state.popoverMode === 'requests'
+      ? anchor.root?.__codexUsageHubButton
+      : anchor.root?.__codexUsageRefreshButton;
     const popover = state.popoverShadow.querySelector('.popover');
     if (!button || !popover) return;
     const buttonRect = button.getBoundingClientRect();
@@ -547,6 +615,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     const left = Math.max(8, Math.min(window.innerWidth - popoverRect.width - 8, buttonRect.left + buttonRect.width / 2 - popoverRect.width / 2));
     popover.style.left = `${Math.round(left)}px`;
     popover.style.bottom = `${Math.round(window.innerHeight - buttonRect.top + 10)}px`;
+    popover.style.maxHeight = `${Math.max(160, Math.floor(buttonRect.top - 18))}px`;
   }
 
   function hideUsageTooltip() {
@@ -643,8 +712,20 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
   function openHub() {
     hideUsageTooltip();
     state.popoverOpen = false;
+    state.popoverMode = '';
     state.popoverShadow?.querySelector('.popover')?.classList.remove('open');
     publishPageAction('open-hub');
+  }
+
+  function toggleRequestPopover(instance) {
+    hideUsageTooltip();
+    const samePopover = state.popoverOpen
+      && state.popoverMode === 'requests'
+      && state.popoverAnchor?.root === instance?.root;
+    if (instance?.root?.isConnected) state.popoverAnchor = instance;
+    state.popoverOpen = !samePopover;
+    state.popoverMode = state.popoverOpen ? 'requests' : '';
+    render(null, true);
   }
 
   function requestRefresh(instance, togglePopover = false) {
@@ -654,7 +735,11 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     publishPageAction('refresh');
     state.loading = true;
     if (instance?.root?.isConnected) state.popoverAnchor = instance;
-    if (togglePopover) state.popoverOpen = !state.popoverOpen;
+    if (togglePopover) {
+      const samePopover = state.popoverOpen && state.popoverMode === 'balance';
+      state.popoverOpen = !samePopover;
+      state.popoverMode = state.popoverOpen ? 'balance' : '';
+    }
     render(null, togglePopover);
   }
 
@@ -682,16 +767,16 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       if (state.tooltipTimer) clearTimeout(state.tooltipTimer);
       state.tooltipTimer = setTimeout(() => {
         state.tooltipTimer = 0;
-        showUsageTooltip(instance, '打开 All API Hub', hubButton);
+        showUsageTooltip(instance, '查看当前供应商最近请求', hubButton);
       }, 700);
     });
     hubButton.addEventListener('pointerleave', hideUsageTooltip);
-    hubButton.addEventListener('focus', () => showUsageTooltip(instance, '打开 All API Hub', hubButton));
+    hubButton.addEventListener('focus', () => showUsageTooltip(instance, '查看当前供应商最近请求', hubButton));
     hubButton.addEventListener('blur', hideUsageTooltip);
     hubButton.addEventListener('click', event => {
       event.preventDefault();
       event.stopPropagation();
-      openHub();
+      toggleRequestPopover(instance);
     });
     refreshButton.addEventListener('pointerenter', () => {
       if (state.tooltipTimer) clearTimeout(state.tooltipTimer);
@@ -730,7 +815,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     const hubButton = document.createElement('button');
     hubButton.className = 'toolbar-action hub-trigger';
     hubButton.type = 'button';
-    hubButton.setAttribute('aria-label', '打开 All API Hub');
+    hubButton.setAttribute('aria-label', '查看当前供应商最近请求');
     hubButton.appendChild(createHubIcon());
     const refreshButton = document.createElement('button');
     refreshButton.className = 'toolbar-action refresh';
@@ -811,13 +896,13 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     const refreshButton = usage.__codexUsageRefreshButton;
     const hubButton = usage.__codexUsageHubButton;
     updateElementAttribute(refreshButton, 'data-loading', state.loading ? 'true' : null);
-    if (instance.root.__codexUsagePayload === payload) return;
+    if (instance.root.__codexUsageContentSignature === view.contentSignature) return;
     instance.root.__codexUsageMeasurements = null;
     for (const child of [...usage.children]) {
       if (child.dataset.usageDynamic === 'true') child.remove();
     }
     for (const element of buildUsageElements(payload, balanceLevel)) usage.insertBefore(element, hubButton);
-    instance.root.__codexUsagePayload = payload;
+    instance.root.__codexUsageContentSignature = view.contentSignature;
   }
 
   function renderPopoverRows(portal, payload) {
@@ -839,6 +924,64 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     state.popoverPayload = payload;
   }
 
+  function renderRecentRequests(portal, payload) {
+    const ageMinute = Math.floor(Date.now() / 60_000);
+    if (state.recentRequestsPayload === payload && state.recentRequestsAgeMinute === ageMinute) return;
+    const list = portal.getElementById('recent-requests');
+    const requests = Array.isArray(payload.recentRequests) ? payload.recentRequests.slice(0, 10) : [];
+    if (requests.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'request-empty';
+      empty.textContent = '当前供应商还没有请求记录';
+      list.replaceChildren(empty);
+      state.recentRequestsPayload = payload;
+      state.recentRequestsAgeMinute = ageMinute;
+      return;
+    }
+
+    const rows = requests.map(item => {
+      const row = document.createElement('div');
+      row.className = 'request-item';
+      row.setAttribute('role', 'listitem');
+      const main = document.createElement('div');
+      main.className = 'request-main';
+      const model = document.createElement('span');
+      model.className = 'request-model';
+      model.textContent = item.model || item.requestModel || '未知模型';
+      if (item.requestModel && item.model && item.requestModel !== item.model) {
+        model.title = `请求 ${item.requestModel}，实际 ${item.model}`;
+      }
+      const age = document.createElement('span');
+      age.className = 'request-age';
+      age.textContent = formatUsageAge(item.createdAt);
+      main.append(model, age);
+
+      const metadata = document.createElement('div');
+      metadata.className = 'request-meta';
+      for (const value of requestMetadata(item)) {
+        const part = document.createElement('span');
+        part.textContent = value;
+        metadata.appendChild(part);
+      }
+      const statusCode = Number(item.statusCode) || 0;
+      if (statusCode < 200 || statusCode >= 300) {
+        const status = document.createElement('span');
+        status.className = 'request-error';
+        status.textContent = statusCode ? `HTTP ${statusCode}` : '请求失败';
+        metadata.appendChild(status);
+      }
+      const cost = document.createElement('span');
+      cost.className = 'request-cost';
+      cost.textContent = formatRequestCost(item.totalCostUsd);
+      metadata.appendChild(cost);
+      row.append(main, metadata);
+      return row;
+    });
+    list.replaceChildren(...rows);
+    state.recentRequestsPayload = payload;
+    state.recentRequestsAgeMinute = ageMinute;
+  }
+
   function render(footers = null, shouldScheduleLayout = true) {
     if (!state.shadow) return;
     const payload = state.payload || { status: 'loading', providerName: '' };
@@ -851,7 +994,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
           : null;
         balanceLevel = remainingPercent == null ? 'normal' : remainingPercent < 10 ? 'critical' : remainingPercent <= 20 ? 'warning' : 'normal';
       }
-      view = { payload, balanceLevel, freshness: '', title: '' };
+      view = { payload, balanceLevel, freshness: '', title: '', contentSignature: balancePayloadSignature(payload) };
       state.__codexUsageView = view;
     }
     view.freshness = getUsageFreshness(payload);
@@ -862,10 +1005,18 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     for (const mirror of state.mirrors) renderInstance(mirror, payload, view.balanceLevel);
     const portal = state.popoverShadow || (state.popoverOpen ? ensurePopoverPortal() : null);
     if (portal) {
-      portal.getElementById('popover').classList.toggle('open', state.popoverOpen);
+      const popover = portal.getElementById('popover');
+      const popoverMode = state.popoverMode || 'balance';
+      popover.classList.toggle('open', state.popoverOpen);
+      updateElementAttribute(popover, 'data-mode', popoverMode);
+      updateElementAttribute(popover, 'aria-label', popoverMode === 'requests' ? '当前供应商最近请求' : '完整额度');
+      portal.querySelector('.popover-head-title').textContent = popoverMode === 'requests'
+        ? `${payload.providerName || '当前供应商'} · 最近请求`
+        : '额度';
       const popoverRefreshButton = portal.getElementById('popover-refresh');
       updateElementAttribute(popoverRefreshButton, 'data-loading', state.loading ? 'true' : null);
       renderPopoverRows(portal, payload);
+      renderRecentRequests(portal, payload);
     }
     if (shouldScheduleLayout) scheduleLayout();
   }
@@ -1029,8 +1180,15 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
         { duration: 120, easing: 'cubic-bezier(.2,.8,.2,1)' },
       );
     }
-    if (mode !== 'icon' && state.popoverOpen && state.popoverAnchor?.root === root) {
+    const popoverAnchorUnavailable = state.popoverOpen
+      && state.popoverAnchor?.root === root
+      && (
+        (state.popoverMode === 'balance' && mode !== 'icon')
+        || (state.popoverMode === 'requests' && mode === 'icon')
+      );
+    if (popoverAnchorUnavailable) {
       state.popoverOpen = false;
+      state.popoverMode = '';
       state.popoverShadow?.querySelector('.popover')?.classList.remove('open');
     }
   }
@@ -1185,9 +1343,15 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
   }
 
   state.update = payload => {
+    const balanceChanged = balancePayloadSignature(state.payload) !== balancePayloadSignature(payload);
     state.payload = payload;
     state.loading = false;
-    mount();
+    if (state.footer?.isConnected && state.root?.isConnected) {
+      render(null, balanceChanged);
+      if (state.popoverOpen && !balanceChanged) positionPopover();
+    } else {
+      mount();
+    }
     return true;
   };
   state.mount = mount;
@@ -1195,6 +1359,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
   state.getRefreshRequest = () => ({ token: state.refreshToken, requestedAt: state.refreshRequestedAt });
   state.setPopoverOpen = open => {
     state.popoverOpen = Boolean(open);
+    state.popoverMode = state.popoverOpen ? (state.popoverMode || 'balance') : '';
     if (!state.popoverAnchor) state.popoverAnchor = { root: state.root, shadow: state.shadow };
     render();
     return state.popoverOpen;
@@ -1216,11 +1381,13 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     const insideUsage = path.includes(state.root) || state.mirrors.some(mirror => path.includes(mirror.root));
     if (!state.popoverOpen || insideUsage || path.includes(state.popoverRoot)) return;
     state.popoverOpen = false;
+    state.popoverMode = '';
     render();
   }, { capture: true, signal: state.eventController.signal });
   document.addEventListener('keydown', event => {
     if (event.key !== 'Escape' || !state.popoverOpen) return;
     state.popoverOpen = false;
+    state.popoverMode = '';
     render();
   }, { signal: state.eventController.signal });
   document.fonts?.addEventListener?.('loadingdone', invalidateResponsiveMeasurements, { signal: state.eventController.signal });

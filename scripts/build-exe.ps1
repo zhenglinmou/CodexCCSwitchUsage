@@ -45,7 +45,7 @@ $payloadFiles = @(
     'src\usage-client.mjs', 'src\cdp-client.mjs', 'src\injector-script.mjs',
     'src\browser-callback-broker.mjs', 'src\hub-provider-adapters.mjs', 'src\hub-service.mjs',
     'src\hub-page.mjs', 'src\hub-server.mjs',
-    'src\keyed-backoff.mjs', 'src\page-action-channel.mjs', 'src\target-session.mjs', 'src\host.mjs',
+    'src\keyed-backoff.mjs', 'src\page-action-channel.mjs', 'src\process-lifecycle.mjs', 'src\target-session.mjs', 'src\host.mjs',
     'scripts\install.ps1', 'scripts\launch.ps1', 'scripts\stop.ps1',
     'scripts\stop-host.ps1', 'scripts\check-current.mjs',
     'scripts\status.ps1', 'scripts\uninstall.ps1',

@@ -113,3 +113,54 @@ test('provider repository change token includes sqlite sidecar files', () => {
   assert.notEqual(first, second);
   assert.match(first, /missing$/);
 });
+
+test('provider repository returns only safe fields for the latest provider requests', () => {
+  let source = '';
+  let boundValues = null;
+  const repository = new ProviderRepository('fake.db', {
+    databaseFactory: () => ({
+      prepare(value) {
+        source = value;
+        return {
+          all(...values) {
+            boundValues = values;
+            return [{
+              request_id: 'must-not-leave-the-repository',
+              session_id: 'must-not-leave-the-repository',
+              error_message: 'Bearer private-token',
+              model: 'gpt-5.6-sol',
+              request_model: 'gpt-5.6-sol',
+              input_tokens: 77_180,
+              output_tokens: 1_200,
+              cache_read_tokens: 73_344,
+              cache_creation_tokens: 0,
+              total_cost_usd: '0.091852',
+              status_code: 200,
+              created_at: 1_784_340_308,
+            }];
+          },
+        };
+      },
+      close() {},
+    }),
+    statSync: () => ({ dev: 1, ino: 1, birthtimeMs: 1 }),
+  });
+
+  const rows = repository.getRecentRequests('provider-1', 500);
+
+  assert.match(source, /WHERE app_type = 'codex' AND provider_id = \?/);
+  assert.match(source, /ORDER BY created_at DESC, request_id DESC/);
+  assert.deepEqual(boundValues, ['provider-1', 50], 'the repository must cap caller-controlled result sizes');
+  assert.deepEqual(rows, [{
+    model: 'gpt-5.6-sol',
+    requestModel: 'gpt-5.6-sol',
+    inputTokens: 77_180,
+    outputTokens: 1_200,
+    cacheReadTokens: 73_344,
+    cacheCreationTokens: 0,
+    totalCostUsd: 0.091852,
+    statusCode: 200,
+    createdAt: '2026-07-18T02:05:08.000Z',
+  }]);
+  assert.doesNotMatch(JSON.stringify(rows), /request_id|session_id|private-token/);
+});

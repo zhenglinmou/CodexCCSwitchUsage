@@ -171,6 +171,18 @@ while ([DateTime]::UtcNow -lt $deadline) {
 }
 if (-not $ready) { throw 'Codex 已启动，但本地调试接口未就绪。' }
 
+if ($codexRoot) {
+    $liveCodexRoot = Get-Process -Id $codexRoot.ProcessId -ErrorAction SilentlyContinue
+    if (-not $liveCodexRoot) { $codexRoot = $null }
+}
+if (-not $codexRoot) {
+    $codexRoot = Get-CodexRoots | Where-Object {
+        $_.CommandLine -match "--remote-debugging-port=$Port(?:\s|$)"
+    } | Select-Object -First 1
+}
+if (-not $codexRoot) { throw 'Codex 调试接口已就绪，但没有找到对应的根进程。' }
+[int]$codexProcessId = $codexRoot.ProcessId
+
 $hostPath = Join-Path $root 'src\host.mjs'
 $pidPath = Join-Path $runtime 'host.pid'
 $databasePath = Join-Path $env:USERPROFILE '.cc-switch\cc-switch.db'
@@ -179,7 +191,14 @@ if (Test-Path -LiteralPath $pidPath) {
     [void][int]::TryParse((Get-Content -LiteralPath $pidPath -Raw).Trim(), [ref]$hostProcessId)
 }
 $hostProcess = if ($hostProcessId -gt 0) { Get-CimInstance Win32_Process -Filter "ProcessId=$hostProcessId" -ErrorAction SilentlyContinue } else { $null }
-if (-not $hostProcess -or -not $hostProcess.CommandLine -or $hostProcess.CommandLine.IndexOf($hostPath, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+$hostMatchesSource = [bool]($hostProcess -and $hostProcess.CommandLine -and $hostProcess.CommandLine.IndexOf($hostPath, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+$hostMatchesCodex = [bool]($hostMatchesSource -and $hostProcess.CommandLine -match "(?:^|\s)--codex-pid(?:\s+|=)$codexProcessId(?:\s|$)")
+if ($hostMatchesSource -and -not $hostMatchesCodex) {
+    Stop-Process -Id $hostProcess.ProcessId -Force -ErrorAction Stop
+    Wait-Process -Id $hostProcess.ProcessId -Timeout 5 -ErrorAction SilentlyContinue
+    $hostProcess = $null
+}
+if (-not $hostMatchesSource -or -not $hostMatchesCodex) {
     $packagedLauncher = Join-Path $root 'CodexCCSwitchUsage.exe'
     if (Test-Path -LiteralPath $packagedLauncher -PathType Leaf) {
         $launcherError = Join-Path $runtime 'launcher-error.log'
@@ -189,6 +208,7 @@ if (-not $hostProcess -or -not $hostProcess.CommandLine -or $hostProcess.Command
         $hostStart = Start-Process -FilePath $packagedLauncher -ArgumentList @(
             '--start-host',
             '--port', $Port,
+            '--codex-pid', $codexProcessId,
             '--runtime-dir', ('"' + $runtime + '"'),
             '--database', ('"' + $databasePath + '"')
         ) -WorkingDirectory $root -WindowStyle Hidden -PassThru
@@ -207,6 +227,7 @@ if (-not $hostProcess -or -not $hostProcess.CommandLine -or $hostProcess.Command
             '--no-warnings', '--experimental-sqlite',
             ('"' + $hostPath + '"'),
             '--port', $Port,
+            '--codex-pid', $codexProcessId,
             '--runtime-dir', ('"' + $runtime + '"'),
             '--database', ('"' + $databasePath + '"')
         ) -WorkingDirectory $root -WindowStyle Hidden `
@@ -215,15 +236,6 @@ if (-not $hostProcess -or -not $hostProcess.CommandLine -or $hostProcess.Command
     }
 }
 
-if ($codexRoot) {
-    $liveCodexRoot = Get-Process -Id $codexRoot.ProcessId -ErrorAction SilentlyContinue
-    if (-not $liveCodexRoot) { $codexRoot = $null }
-}
-if (-not $codexRoot) {
-    $codexRoot = Get-CodexRoots | Where-Object {
-        $_.CommandLine -match "--remote-debugging-port=$Port(?:\s|$)"
-    } | Select-Object -First 1
-}
 $windowActivated = if ($codexRoot) { Show-CodexWindow -CodexProcessId $codexRoot.ProcessId } else { $false }
 
 Set-Content -LiteralPath (Join-Path $runtime 'remount.request') -Value ([DateTime]::UtcNow.ToString('o')) -Encoding ASCII
@@ -231,8 +243,8 @@ Set-Content -LiteralPath (Join-Path $runtime 'remount.request') -Value ([DateTim
 [pscustomobject]@{
     launched = $true
     port = $Port
+    codexProcessId = $codexProcessId
     profile = 'default'
     installRoot = $root
     windowActivated = $windowActivated
-    instanceGuard = $false
 } | ConvertTo-Json -Compress

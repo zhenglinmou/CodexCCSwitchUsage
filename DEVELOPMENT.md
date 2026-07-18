@@ -53,6 +53,7 @@ The installer preserves the stable `runtime` directory during an upgrade. A real
 | `src\target-session.mjs` | One-shot injector installation, hot replacement, and payload delivery |
 | `src\keyed-backoff.mjs` | Target-keyed bounded retry state for failed one-shot injector installations |
 | `src\page-action-channel.mjs` | Invisible, bounded page-title action markers for refresh and Hub clicks |
+| `src\process-lifecycle.mjs` | Exact Codex root-process liveness monitor; no CDP session ownership |
 | `scripts\launch.ps1` | Finds/starts Codex with CDP, starts the host, activates the window |
 | `scripts\stop-host.ps1` | Stops plugin hosts without stopping Codex |
 | `scripts\stop.ps1` | Stops plugin hosts and the Codex process tree; not for normal development reloads |
@@ -113,6 +114,7 @@ Expected fields include:
 ```json
 {
   "running": true,
+  "codexProcessId": 46300,
   "eventDrivenTargets": false,
   "databaseWatch": true,
   "targetInstallFailures": 0,
@@ -129,6 +131,8 @@ The injected refresh and Hub buttons append a bounded invisible action marker (`
 The CCSwitch database uses `fs.watch` for immediate changes. While the watcher is healthy, the three SQLite files are audited only every 60,000 ms; the 1,000 ms retry is used only when a watcher is unavailable. SQLite/WAL activity that leaves the cached provider snapshot unchanged does not rebuild Hub state, increment its revision, or request a current-provider refresh. The Hub page loads state once and polls only while a user-started refresh operation is in progress. Only the current CCSwitch provider owns a fixed 300,000 ms balance timer.
 
 CDP target isolation is fail-closed. The host connects only to a `page` target whose URL is exactly the canonical Codex main document, `app://-/index.html`, with no query or fragment. Every eligible target WebSocket exists only for the inspection/injection/update call and is closed in `finally`; a socket whose handshake times out or fails is closed before ownership can transfer to a client. Deferred audits remain pending but never accelerate the maintenance loop beyond the 1,000 ms page-action cadence. A persistent one-shot installation failure uses a target-keyed `1,000 / 2,000 / 5,000 / 10,000 / 30,000 ms` retry sequence; a replacement target or new page action bypasses the old target's delay. The host never calls browser-wide `Target.setDiscoverTargets`, never keeps a target session, and never calls `Runtime.enable` or `Runtime.addBinding`. Empty URLs, `about:blank`, external pages, Browser Use WebViews, MCP App guests, and auxiliary `initialRoute` windows are never connected. If any auxiliary `page`, `webview`, or `iframe` target is active, all injector connections are deferred until it disappears.
+
+The launcher resolves the exact root `ChatGPT.exe` PID after CDP becomes ready and passes it to both the source-mode Node host and the packaged detached launcher. The host checks only that Windows process identity every 250 ms; it does not keep a CDP WebSocket open for lifecycle detection. When the root PID exits, the host runs its full shutdown path, closes the Hub listener, browser broker, file/database resources, removes `host.pid`, writes stopped status, and forces the Node process to exit after a bounded 750 ms cleanup window. Stopping or hot-reloading the host remains one-way and never stops ChatGPT.
 
 Hub full refresh keeps its existing total concurrency bound while reserving a serial lane for providers that require the browser companion, so a slow browser callback cannot occupy every direct-API worker. Hub state records `queryDurationMs` per provider and `lastFullRefreshDurationMs` for the complete operation; these fields contain timing only and never credentials.
 
@@ -150,7 +154,7 @@ Do not reintroduce a fixed root `max-width` or an icon-mode `flex: 0 0 28px` roo
 
 ### Codex App interaction layout performance baseline
 
-The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current injector version is `69`; its title-action transport, mounted root, Codex layout, ChatGPT Work layout, and ChatGPT Chat multiline/compressed layout were smoke-tested on Codex Desktop `26.715.2305.0`. Update the exhaustive interaction baseline only after completing the corresponding full live regression.
+The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current injector version is `71`; the exhaustive interaction baseline below was established with injector `69` on Codex Desktop `26.715.2305.0`. Update that baseline only after completing the corresponding full live regression.
 
 | Codex interaction | Expected injector geometry work |
 |---|---|

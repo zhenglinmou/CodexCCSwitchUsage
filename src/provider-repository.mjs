@@ -63,6 +63,36 @@ function fileChangeIdentity(filename, statSync) {
   }
 }
 
+function nonNegativeInteger(value) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : 0;
+}
+
+function nonNegativeNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : 0;
+}
+
+export function parseRequestLogRow(row) {
+  if (!row) return null;
+  const createdAtSeconds = Number(row.created_at);
+  const createdAt = new Date(createdAtSeconds * 1_000);
+  const cleanText = value => String(value || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+  return {
+    model: cleanText(row.model),
+    requestModel: cleanText(row.request_model),
+    inputTokens: nonNegativeInteger(row.input_tokens),
+    outputTokens: nonNegativeInteger(row.output_tokens),
+    cacheReadTokens: nonNegativeInteger(row.cache_read_tokens),
+    cacheCreationTokens: nonNegativeInteger(row.cache_creation_tokens),
+    totalCostUsd: nonNegativeNumber(row.total_cost_usd),
+    statusCode: nonNegativeInteger(row.status_code),
+    createdAt: Number.isFinite(createdAtSeconds) && createdAtSeconds > 0 && Number.isFinite(createdAt.getTime())
+      ? createdAt.toISOString()
+      : '',
+  };
+}
+
 export class ProviderRepository {
   constructor(databasePath = path.join(process.env.USERPROFILE, '.cc-switch', 'cc-switch.db'), options = {}) {
     this.databasePath = databasePath;
@@ -75,6 +105,7 @@ export class ProviderRepository {
     this.byIdStatement = null;
     this.allStatement = null;
     this.localUsageStatement = null;
+    this.recentRequestsStatement = null;
     this.currentCache = null;
     this.byNameCache = new Map();
     this.byIdCache = new Map();
@@ -174,6 +205,26 @@ export class ProviderRepository {
     };
   }
 
+  getRecentRequests(providerId, limit = 10) {
+    const db = this.ensureDatabase();
+    if (!this.recentRequestsStatement) {
+      this.recentRequestsStatement = db.prepare(`
+        SELECT model, request_model, input_tokens, output_tokens,
+               cache_read_tokens, cache_creation_tokens, total_cost_usd,
+               status_code, created_at
+        FROM proxy_request_logs
+        WHERE app_type = 'codex' AND provider_id = ?
+        ORDER BY created_at DESC, request_id DESC
+        LIMIT ?
+      `);
+    }
+    const boundedLimit = Math.max(1, Math.min(50, Math.trunc(Number(limit) || 10)));
+    return this.recentRequestsStatement
+      .all(String(providerId), boundedLimit)
+      .map(parseRequestLogRow)
+      .filter(Boolean);
+  }
+
   getChangeToken() {
     return [this.databasePath, `${this.databasePath}-wal`, `${this.databasePath}-shm`]
       .map(filename => fileChangeIdentity(filename, this.statSync))
@@ -203,6 +254,7 @@ export class ProviderRepository {
     this.byIdStatement = null;
     this.allStatement = null;
     this.localUsageStatement = null;
+    this.recentRequestsStatement = null;
     this.currentCache = null;
     this.byNameCache.clear();
     this.byIdCache.clear();

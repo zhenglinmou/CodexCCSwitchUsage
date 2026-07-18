@@ -10,6 +10,7 @@ import { hubItemToUsagePayload, HubService } from './hub-service.mjs';
 import { buildInjectorScript, INJECTOR_VERSION, UPDATE_GLOBAL } from './injector-script.mjs';
 import { KeyedBackoff } from './keyed-backoff.mjs';
 import { decodePageActionMarker } from './page-action-channel.mjs';
+import { isProcessAlive, ProcessExitMonitor } from './process-lifecycle.mjs';
 import { acknowledgePageAction, installTargetOnce, settleTargetOperations } from './target-session.mjs';
 
 const DATABASE_WATCH_DEBOUNCE_MS = 100;
@@ -20,19 +21,24 @@ const DATABASE_AUDIT_MS = 60_000;
 const INJECTOR_AUDIT_MS = 300_000;
 const STATUS_HEARTBEAT_MS = 300_000;
 const HUB_RETRY_MS = 5_000;
+const RECENT_REQUEST_LIMIT = 10;
+const CODEX_PROCESS_POLL_MS = 250;
 
 function parseArgs(argv) {
-  const result = { port: 9334, database: path.join(process.env.USERPROFILE, '.cc-switch', 'cc-switch.db'), runtimeDir: path.join(process.cwd(), 'runtime') };
+  const result = { port: 9334, database: path.join(process.env.USERPROFILE, '.cc-switch', 'cc-switch.db'), runtimeDir: path.join(process.cwd(), 'runtime'), codexPid: 0 };
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index + 1];
     if (argv[index] === '--port') result.port = Number(value);
     if (argv[index] === '--database') result.database = value;
     if (argv[index] === '--runtime-dir') result.runtimeDir = value;
+    if (argv[index] === '--codex-pid') result.codexPid = Number(value);
   }
+  if (!Number.isInteger(result.codexPid) || result.codexPid <= 0) throw new Error('A live Codex root PID is required.');
   return result;
 }
 
 const args = parseArgs(process.argv.slice(2));
+if (!isProcessAlive(args.codexPid)) throw new Error(`Codex root process ${args.codexPid} is not running.`);
 fs.mkdirSync(args.runtimeDir, { recursive: true });
 const statusPath = path.join(args.runtimeDir, 'status.json');
 const pidPath = path.join(args.runtimeDir, 'host.pid');
@@ -59,7 +65,9 @@ function readUsageCache() {
 
 function writeUsageCache(payload, providerSignature = '') {
   const temporary = `${cachePath}.tmp`;
-  fs.writeFileSync(temporary, JSON.stringify({ ...payload, providerSignature }), 'utf8');
+  const cachePayload = { ...payload };
+  delete cachePayload.recentRequests;
+  fs.writeFileSync(temporary, JSON.stringify({ ...cachePayload, providerSignature }), 'utf8');
   fs.renameSync(temporary, cachePath);
 }
 
@@ -96,6 +104,10 @@ let targetSyncPending = false;
 let targetAuditPending = false;
 let fallbackWake = null;
 let lastHubStartAttemptAt = 0;
+let recentRequestProviderId = '';
+let recentRequests = [];
+let recentRequestsSignature = '';
+let codexProcessMonitor = null;
 
 fs.writeFileSync(pidPath, String(process.pid), 'utf8');
 
@@ -104,6 +116,7 @@ function writeStatus(extra = {}) {
   const status = {
     running: true,
     pid: process.pid,
+    codexProcessId: args.codexPid,
     port: args.port,
     provider: lastPayload.providerName || '',
     usageStatus: lastPayload.status || 'loading',
@@ -152,6 +165,44 @@ function providerRefreshSignature(provider) {
   return crypto.createHash('sha256').update(material).digest('base64url');
 }
 
+function payloadWithRecentRequests(payload) {
+  const providerId = String(payload?.providerId || '');
+  return {
+    ...payload,
+    recentRequests: providerId && providerId === recentRequestProviderId ? recentRequests : [],
+  };
+}
+
+function syncRecentRequests(providerOverride = undefined) {
+  try {
+    const provider = providerOverride === undefined ? repository.getCurrent() : providerOverride;
+    const providerId = String(provider?.id || '');
+    const nextRequests = providerId ? repository.getRecentRequests(providerId, RECENT_REQUEST_LIMIT) : [];
+    const nextSignature = JSON.stringify([providerId, nextRequests]);
+    if (nextSignature === recentRequestsSignature) return false;
+    recentRequestProviderId = providerId;
+    recentRequests = nextRequests;
+    recentRequestsSignature = nextSignature;
+
+    if (providerId && String(lastPayload?.providerId || '') === providerId) {
+      lastPayload = payloadWithRecentRequests(lastPayload);
+      return true;
+    }
+    if (providerId && !lastPayload?.providerId && lastPayload?.status === 'loading') {
+      lastPayload = payloadWithRecentRequests({
+        ...lastPayload,
+        providerId,
+        providerName: provider.name,
+        websiteUrl: provider.websiteUrl,
+      });
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function wakeFallbackPoll() {
   fallbackWake?.();
 }
@@ -190,13 +241,16 @@ async function refreshCurrentProvider(force = false) {
   }
 
   if (!provider) {
+    syncRecentRequests(null);
     lastProviderId = '';
     lastProviderSignature = '';
-    lastPayload = { status: 'error', providerName: 'CCSwitch', message: '没有找到当前 Codex 供应商' };
+    lastPayload = payloadWithRecentRequests({ status: 'error', providerName: 'CCSwitch', message: '没有找到当前 Codex 供应商' });
     writeStatus({ error: lastPayload.message });
     scheduleCurrentProviderRefresh(60_000);
     return true;
   }
+
+  syncRecentRequests(provider);
 
   const providerChanged = provider.id !== lastProviderId;
   const providerSignature = providerRefreshSignature(provider);
@@ -223,7 +277,7 @@ async function refreshCurrentProvider(force = false) {
     lastProviderSignature = providerSignature;
     const item = await hubService.refreshProvider(provider.id);
     if (!item) throw new Error('当前供应商在额度刷新期间已变更');
-    lastPayload = hubItemToUsagePayload(provider, item);
+    lastPayload = payloadWithRecentRequests(hubItemToUsagePayload(provider, item));
     if (lastPayload.status === 'ok') writeUsageCache(lastPayload, providerSignature);
     lastQueryAt = Date.now();
     const failed = ['error', 'login-required'].includes(item.status);
@@ -236,14 +290,14 @@ async function refreshCurrentProvider(force = false) {
     if (lastPayload.status === 'ok' && lastPayload.providerId === provider.id) {
       lastPayload = { ...lastPayload, queryError: message };
     } else {
-      lastPayload = {
+      lastPayload = payloadWithRecentRequests({
         status: 'error',
         providerId: provider.id,
         providerName: provider.name,
         websiteUrl: provider.websiteUrl,
         message,
         updatedAt: new Date().toISOString(),
-      };
+      });
     }
     writeStatus({ error: message });
     scheduleCurrentProviderRefresh(configurationReady ? intervalMs : 60_000);
@@ -456,7 +510,9 @@ function startDatabaseWatcher() {
         }
         databaseChangeToken = nextDatabaseChangeToken;
         lastDatabaseAuditAt = Date.now();
+        const recentRequestsChanged = syncRecentRequests();
         if (syncResult.changed) requestCurrentProviderRefresh(false, true);
+        else if (recentRequestsChanged) requestTargetSync({ audit: true });
       }, DATABASE_WATCH_DEBOUNCE_MS);
     });
     databaseWatcher.on('error', () => {
@@ -509,6 +565,7 @@ function nextMaintenanceDelay() {
 
 async function loop() {
   await ensureHubServer(true);
+  syncRecentRequests();
   await requestTargetSync({ audit: true });
   startDatabaseWatcher();
   startControlWatcher();
@@ -520,6 +577,7 @@ async function loop() {
     const now = Date.now();
     const databaseAuditDue = !databaseWatcher || now - lastDatabaseAuditAt >= DATABASE_AUDIT_MS;
     let providersChanged = false;
+    let recentRequestsChanged = false;
     if (databaseAuditDue) {
       const currentDatabaseChangeToken = repository.getChangeToken();
       if (currentDatabaseChangeToken !== databaseChangeToken) {
@@ -528,6 +586,7 @@ async function loop() {
           databaseChangeToken = currentDatabaseChangeToken;
           lastDatabaseAuditAt = now;
           providersChanged = syncResult.changed;
+          recentRequestsChanged = syncRecentRequests();
         } else {
           lastDatabaseAuditAt = now - DATABASE_AUDIT_MS + WATCHER_RETRY_MS;
           writeStatus({ error: safeMessage(syncResult.error) });
@@ -542,7 +601,7 @@ async function loop() {
     await Promise.allSettled([
       ensureHubServer(),
       providersChanged ? requestCurrentProviderRefresh(false, true) : Promise.resolve(),
-      requestTargetSync({ audit: auditDue || providersChanged }),
+      requestTargetSync({ audit: auditDue || providersChanged || recentRequestsChanged }),
     ]);
     if (Date.now() - lastStatusWriteAt >= STATUS_HEARTBEAT_MS) {
       writeStatus({ connectedPages: mountedPages, connectionError: lastConnectionError });
@@ -554,7 +613,9 @@ function shutdown(reason = null) {
   if (stopped) return;
   stopReason = reason;
   stopped = true;
+  const forceExitTimer = setTimeout(() => process.exit(0), 750);
   wakeFallbackPoll();
+  codexProcessMonitor?.close();
   databaseWatcher?.close();
   controlWatcher?.close();
   const auxiliaryShutdown = Promise.allSettled([hubServer.close()]);
@@ -564,10 +625,10 @@ function shutdown(reason = null) {
   repository.close();
   try { fs.rmSync(pidPath, { force: true }); } catch {}
   try { writeStatus({ running: false, connectedPages: 0 }); } catch {}
-  Promise.race([
-    auxiliaryShutdown,
-    new Promise(resolve => setTimeout(resolve, 750)),
-  ]).finally(() => process.exit(0));
+  auxiliaryShutdown.finally(() => {
+    clearTimeout(forceExitTimer);
+    process.exit(0);
+  });
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'));
@@ -579,5 +640,13 @@ process.on('unhandledRejection', error => {
   shutdown(`unhandledRejection: ${safeMessage(error)}`);
 });
 
-writeStatus({ connectedPages: 0 });
-await loop();
+codexProcessMonitor = new ProcessExitMonitor({
+  processId: args.codexPid,
+  intervalMs: CODEX_PROCESS_POLL_MS,
+  onExit: () => shutdown('Codex root process exited'),
+});
+codexProcessMonitor.start();
+if (!stopped) {
+  writeStatus({ connectedPages: 0 });
+  await loop();
+}

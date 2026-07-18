@@ -148,17 +148,38 @@ test('icon popover exposes a refresh button that refreshes without closing the p
   assert.match(script, /updateElementAttribute\(popoverRefreshButton, 'data-loading', state\.loading \? 'true' : null\)/);
 });
 
-test('only dedicated Hub controls publish the v2 Balance Hub title action', () => {
+test('the grid control opens recent requests while only the popover footer publishes the Hub action', () => {
   const script = buildInjectorScript();
   const eventSource = sourceSection(script, 'function bindUsageEvents(instance, usage, hubButton, refreshButton) {', 'function ensureUsageElement(instance) {');
+  const portalSource = sourceSection(script, 'function ensurePopoverPortal() {', 'function usageTitle(');
   assert.match(script, /publishPageAction\('open-hub'/);
   assert.doesNotMatch(script, /window\[hubBinding\]|Runtime\.addBinding/);
   assert.match(script, /id="open-hub"/);
   assert.match(script, /hubButton\.className = 'toolbar-action hub-trigger'/);
   assert.match(eventSource, /hubButton\.addEventListener\('click'/);
+  assert.match(eventSource, /toggleRequestPopover\(instance\)/);
+  assert.doesNotMatch(eventSource, /openHub\(\)|publishPageAction\('open-hub'/);
+  assert.match(portalSource, /getElementById\('open-hub'\)\.addEventListener\('click', \(\) => openHub\(\)\)/);
   assert.doesNotMatch(eventSource, /usage\.addEventListener\('click'/);
   assert.doesNotMatch(eventSource, /usage\.addEventListener\('keydown'/);
   assert.match(script, /打开 All API Hub/);
+});
+
+test('recent request popover renders at most ten current-provider rows with model and token usage', () => {
+  const script = buildInjectorScript();
+  const renderer = sourceSection(script, 'function renderRecentRequests(portal, payload) {', 'function render(footers = null');
+
+  assert.match(script, /id="recent-requests" class="request-list" role="list"/);
+  assert.match(script, /\.popover\[data-mode="requests"\]\{width:min\(420px,calc\(100vw - 16px\)\)\}/);
+  assert.match(renderer, /payload\.recentRequests\.slice\(0, 10\)/);
+  assert.match(renderer, /const ageMinute = Math\.floor\(Date\.now\(\) \/ 60_000\)/);
+  assert.match(renderer, /state\.recentRequestsPayload === payload && state\.recentRequestsAgeMinute === ageMinute/);
+  assert.match(renderer, /item\.model \|\| item\.requestModel \|\| '未知模型'/);
+  assert.match(renderer, /requestMetadata\(item\)/);
+  assert.match(script, /`输入 \$\{formatTokenCount\(item\.inputTokens\)\}`/);
+  assert.match(script, /`输出 \$\{formatTokenCount\(item\.outputTokens\)\}`/);
+  assert.match(script, /formatRequestCost\(item\.totalCostUsd\)/);
+  assert.match(script, /当前供应商还没有请求记录/);
 });
 
 test('Hub control shares refresh styling and stays inside the responsive content group', () => {
@@ -578,10 +599,21 @@ test('refresh loading state skips geometry work unless icon mode toggles the pop
     'function ensureUsageElement(instance) {',
   );
 
-  assert.match(refreshHandler, /if \(togglePopover\) state\.popoverOpen = !state\.popoverOpen;/);
+  assert.match(refreshHandler, /if \(togglePopover\) \{[\s\S]*state\.popoverMode = state\.popoverOpen \? 'balance' : '';[\s\S]*\}/);
   assert.match(refreshHandler, /render\(null, togglePopover\);/);
   assert.match(refreshHandler, /requestRefresh\(instance, instance\.root\.dataset\.mode === 'icon'\);/);
   assert.doesNotMatch(refreshHandler, /\n\s*render\(\);/);
+});
+
+test('request-only payload updates skip balance DOM reconstruction and layout work', () => {
+  const script = buildInjectorScript();
+  const update = sourceSection(script, 'state.update = payload => {', 'state.mount = mount;');
+
+  assert.match(script, /balancePayloadSignature/);
+  assert.match(script, /__codexUsageContentSignature === view\.contentSignature/);
+  assert.match(update, /const balanceChanged = balancePayloadSignature\(state\.payload\) !== balancePayloadSignature\(payload\)/);
+  assert.match(update, /render\(null, balanceChanged\)/);
+  assert.match(update, /if \(state\.popoverOpen && !balanceChanged\) positionPopover\(\)/);
 });
 
 test('toolbar flow cache is reused only while its DOM placement remains valid', () => {

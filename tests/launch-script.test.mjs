@@ -16,6 +16,7 @@ test('launcher automatically restarts an ordinary Codex before enabling the exte
 test('launcher starts the host before foreground window activation work', () => {
   const source = fs.readFileSync(new URL('../scripts/launch.ps1', import.meta.url), 'utf8');
   assert.ok(source.indexOf("$hostPath = Join-Path $root 'src\\host.mjs'") < source.indexOf('$windowActivated ='));
+  assert.ok(source.indexOf('[int]$codexProcessId = $codexRoot.ProcessId') < source.indexOf("$hostPath = Join-Path $root 'src\\host.mjs'"));
 });
 
 test('launcher activates packaged Codex through its AppUserModelId', () => {
@@ -32,6 +33,9 @@ test('packaged launcher starts Node detached while source mode keeps its fallbac
 
   assert.match(source, /\$packagedLauncher = Join-Path \$root 'CodexCCSwitchUsage\.exe'/);
   assert.match(source, /'--start-host'/);
+  assert.equal((source.match(/'--codex-pid', \$codexProcessId/g) || []).length, 2);
+  assert.match(source, /\$hostMatchesCodex/);
+  assert.match(source, /Stop-Process -Id \$hostProcess\.ProcessId/);
   assert.match(source, /-WindowStyle Hidden -PassThru\s+\$hostStart\.WaitForExit\(\)/);
   assert.doesNotMatch(source, /-WindowStyle Hidden -Wait -PassThru/);
   assert.match(source, /else \{\s*\$node = \(Get-Command node\.exe/);
