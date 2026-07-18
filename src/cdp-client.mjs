@@ -1,3 +1,5 @@
+import http from 'node:http';
+
 export class CdpClient {
   constructor(socket) {
     this.socket = socket;
@@ -13,17 +15,34 @@ export class CdpClient {
 
   static async connect(url, timeoutMs = 3_000) {
     const socket = new WebSocket(url);
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('连接 Codex 调试接口超时')), timeoutMs);
-      socket.addEventListener('open', () => {
-        clearTimeout(timer);
-        resolve();
-      }, { once: true });
-      socket.addEventListener('error', () => {
-        clearTimeout(timer);
-        reject(new Error('无法连接 Codex 调试接口'));
-      }, { once: true });
-    });
+    try {
+      await new Promise((resolve, reject) => {
+        let timer;
+        const cleanup = () => {
+          clearTimeout(timer);
+          socket.removeEventListener('open', handleOpen);
+          socket.removeEventListener('error', handleError);
+        };
+        const handleOpen = () => {
+          cleanup();
+          resolve();
+        };
+        const handleError = () => {
+          cleanup();
+          reject(new Error('无法连接 Codex 调试接口'));
+        };
+
+        timer = setTimeout(() => {
+          cleanup();
+          reject(new Error('连接 Codex 调试接口超时'));
+        }, timeoutMs);
+        socket.addEventListener('open', handleOpen);
+        socket.addEventListener('error', handleError);
+      });
+    } catch (error) {
+      try { socket.close(); } catch {}
+      throw error;
+    }
     return new CdpClient(socket);
   }
 
@@ -110,51 +129,76 @@ export class CdpClient {
   }
 }
 
-function isCodexPageTarget(target) {
+function codexAppTargetUrl(target) {
   if (target?.type !== 'page') return false;
-  const url = String(target.url || '').toLowerCase();
-  return url === '' || url === 'about:blank' || url.startsWith('app://');
-}
-
-export function isCodexAuxiliaryTarget(target) {
-  if (!isCodexPageTarget(target)) return false;
   const rawUrl = String(target.url || '');
-  if (!rawUrl.toLowerCase().startsWith('app://')) return false;
+  if (!rawUrl.toLowerCase().startsWith('app://')) return null;
   try {
-    const initialRoute = new URL(rawUrl).searchParams.get('initialRoute');
-    return String(initialRoute || '').toLowerCase() === '/avatar-overlay';
-  } catch {}
-  return false;
+    const url = new URL(rawUrl);
+    if (url.protocol !== 'app:' || url.hostname !== '-' || url.pathname !== '/index.html') return null;
+    return url;
+  } catch {
+    return null;
+  }
 }
 
 export function isCodexTargetCandidate(target) {
-  return isCodexPageTarget(target) && !isCodexAuxiliaryTarget(target);
+  const url = codexAppTargetUrl(target);
+  return Boolean(url && url.search === '' && url.hash === '');
 }
 
-export async function listCodexTargets(port, { includeAuxiliary = false } = {}) {
-  let response;
-  try {
-    response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1_500) });
-  } catch {
-    response = await fetch(`http://[::1]:${port}/json/list`, { signal: AbortSignal.timeout(1_500) });
-  }
-  if (!response.ok) throw new Error(`Codex 调试接口返回 HTTP ${response.status}`);
-  const targets = await response.json();
-  return targets.filter(target => (
-    (includeAuxiliary ? isCodexPageTarget(target) : isCodexTargetCandidate(target))
-    && target.webSocketDebuggerUrl
-  ));
+function readJson(port, pathname, hostname) {
+  return new Promise((resolve, reject) => {
+    const request = http.get({
+      hostname,
+      port,
+      path: pathname,
+      agent: false,
+      headers: { connection: 'close' },
+    }, response => {
+      const chunks = [];
+      let size = 0;
+      response.on('data', chunk => {
+        size += chunk.length;
+        if (size > 2_000_000) {
+          request.destroy(new Error('Codex 调试接口响应过大'));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on('end', () => {
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          reject(new Error(`Codex 调试接口返回 HTTP ${response.statusCode}`));
+          return;
+        }
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+        catch { reject(new Error('Codex 调试接口返回无效 JSON')); }
+      });
+    });
+    request.setTimeout(1_500, () => request.destroy(new Error('连接 Codex 调试接口超时')));
+    request.on('error', reject);
+  });
 }
 
-export async function getBrowserWebSocketUrl(port) {
-  let response;
+export async function listCdpTargets(port) {
+  let targets;
   try {
-    response = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(1_500) });
+    targets = await readJson(port, '/json/list', '127.0.0.1');
   } catch {
-    response = await fetch(`http://[::1]:${port}/json/version`, { signal: AbortSignal.timeout(1_500) });
+    targets = await readJson(port, '/json/list', '::1');
   }
-  if (!response.ok) throw new Error(`Codex 浏览器调试接口返回 HTTP ${response.status}`);
-  const version = await response.json();
-  if (!version.webSocketDebuggerUrl) throw new Error('Codex 浏览器调试接口缺少 WebSocket 地址');
-  return version.webSocketDebuggerUrl;
+  if (!Array.isArray(targets)) throw new Error('Codex 调试接口目标列表无效');
+  return targets;
+}
+
+export async function listCodexTargets(port) {
+  const targets = await listCdpTargets(port);
+  return targets.filter(target => isCodexTargetCandidate(target) && target.webSocketDebuggerUrl);
+}
+
+export function hasAuxiliaryPageTargets(targets) {
+  return (targets || []).some(target => {
+    const type = String(target?.type || '').toLowerCase();
+    return ['page', 'webview', 'iframe'].includes(type) && !isCodexTargetCandidate(target);
+  });
 }

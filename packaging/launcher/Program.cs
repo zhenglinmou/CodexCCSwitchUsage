@@ -153,6 +153,11 @@ internal static class Program
         {
             throw new ArgumentException("Invalid CDP port.");
         }
+        int codexPid;
+        if (!int.TryParse(GetArgumentValue(args, "--codex-pid", "0"), out codexPid) || codexPid <= 0)
+        {
+            throw new ArgumentException("Invalid Codex root PID.");
+        }
 
         RequireFile(node, "bundled node.exe");
         RequireFile(host, "host.mjs");
@@ -164,6 +169,7 @@ internal static class Program
             "--experimental-sqlite",
             host,
             "--port", port.ToString(),
+            "--codex-pid", codexPid.ToString(),
             "--runtime-dir", runtime,
             "--database", database
         };

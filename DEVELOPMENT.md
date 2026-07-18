@@ -1,4 +1,6 @@
-# Development and EXE packaging workflow
+# v2 development and EXE packaging workflow
+
+> 本文只适用于 `v2` 分支。v1 的使用范围与安装方式见 [docs/V1.md](./docs/V1.md)；v2 用户说明见 [docs/V2.md](./docs/V2.md)。
 
 This document is the operational guide for developing, testing, running, packaging, upgrading, and rolling back CodexCCSwitchUsage on this computer.
 
@@ -36,20 +38,42 @@ The installer preserves the stable `runtime` directory during an upgrade. A real
 
 | File | Responsibility |
 |---|---|
-| `src\host.mjs` | Long-running host, quota refresh scheduling, database and target watchers |
+| `src\host.mjs` | Long-running host, quota refresh scheduling, database watcher, and HTTP-only target audits |
 | `src\injector-script.mjs` | Composer footer DOM, styles, responsive layout, tooltips, refresh UI |
 | `src\provider-repository.mjs` | Read-only CCSwitch SQLite access |
-| `src\usage-client.mjs` | Provider quota HTTP request and normalized usage result |
+| `src\usage-client.mjs` | Legacy `usage_script` compatibility utilities; not used by the v2 Hub runtime |
+| `src\hub-provider-adapters.mjs` | v2 provider routing and built-in balance adapters |
+| `src\hub-service.mjs` | Safe multi-provider Hub state, cache, refresh concurrency, and login actions |
+| `src\hub-server.mjs` / `src\hub-page.mjs` | Loopback-only Balance Hub API and page |
+| `src\browser-callback-broker.mjs` | Same-port job queue and callbacks for the user's existing browser profile |
+| `browser-companion\` | MV3 companion loaded into the user's normal Edge/Chrome profile |
 | `src\evaluator.mjs` | Worker lifecycle and timeout handling for provider scripts |
 | `src\evaluator-worker.mjs` | Sandboxed `node:vm` execution of `usage_script` |
-| `src\cdp-client.mjs` | CDP HTTP/WebSocket client |
-| `src\target-session.mjs` | Injector installation, hot replacement, payload delivery |
+| `src\cdp-client.mjs` | Short-lived CDP HTTP/WebSocket client and strict target filtering |
+| `src\target-session.mjs` | One-shot injector installation, hot replacement, and payload delivery |
+| `src\keyed-backoff.mjs` | Target-keyed bounded retry state for failed one-shot injector installations |
+| `src\page-action-channel.mjs` | Invisible, bounded page-title action markers for refresh and Hub clicks |
+| `src\process-lifecycle.mjs` | Exact Codex root-process liveness monitor; no CDP session ownership |
 | `scripts\launch.ps1` | Finds/starts Codex with CDP, starts the host, activates the window |
 | `scripts\stop-host.ps1` | Stops plugin hosts without stopping Codex |
 | `scripts\stop.ps1` | Stops plugin hosts and the Codex process tree; not for normal development reloads |
 | `packaging\launcher\Program.cs` | Hidden Windows EXE wrapper that launches the existing PowerShell flow |
 | `packaging\setup.iss` | Inno Setup installer definition |
 | `scripts\build-exe.ps1` | Repeatable launcher/installer build |
+
+### v2 single balance center
+
+The v2 host is the only balance-query center. The Codex footer, Hub page, and loopback balance API all call `HubService`; none executes the CCSwitch `usage_script` or calls the retired Python bridge.
+
+The stable gateway listens on `127.0.0.1:17891` and exposes `/v1/balance/{provider}`, `/v1/balances`, `/v1/providers`, `/v1/health`, plus the legacy-compatible `/usage/{provider}` path. CCSwitch remains read-only and its existing scripts are not rewritten during v2 development.
+
+Provider adapters first use the CCSwitch API Key and configured Base URL when the third-party site supports a balance endpoint. Sites whose model API keys cannot access dashboard balances use the MV3 browser companion after one-time pairing with the Hub token. The companion runs requests inside the user's existing Edge/Chrome profile, keeps Cookie values in that browser, and returns only request results through the same port. Hub opening never triggers refresh. A balance query never creates or activates a website tab; session synchronization and login pages require an explicit user action.
+
+Every provider with a built-in HTTPS login configuration always exposes that sanitized official login URL in Hub state. The card renders it independently from query status, cached usage, CCSwitch `website_url`, companion connectivity, and WAF classification. `sessionSyncRequired` controls only the separate session-sync action; it must never hide the official login link.
+
+The companion stores its pairing token, stable client id, allowlisted validated origins, and the numeric New API user id required beside browser cookies in `chrome.storage.local`; it never stores Cookie values, Token values, or localStorage source text. Each startup or reconnect begins with one session heartbeat; subsequent long polls carry only client identity and wait for explicit jobs. Ordinary loopback callbacks have a 10,000 ms client timeout, 25,000 ms server long polls have a 30,000 ms client timeout, and each 120-poll batch hands off immediately instead of waiting for the next one-minute alarm. Browser queries reserve 5,000 ms of their job budget for an existing-tab fallback after an extension-context request. A polling iteration reuses one configuration snapshot, repeated status/session values are not rewritten, and event-driven heartbeats are coalesced as a single-flight 350 ms trailing update. New API sites such as AnyRouter and AgentRouter are never restored from arbitrary Cookie presence alone. The provider response is authoritative: successful responses retain the hint, while an explicit authentication failure removes it; ordinary provider or WAF failures preserve the last validated hint. A connected companion may attempt the real same-origin query even before a hint is restored, so a host restart cannot be misclassified as logout. Each Hub provider card exposes a safe “查看” dialog for the actual request URL, method, authentication category, executor, browser/WAF dependency, and current normalized source; credentials are never included.
+
+The old standalone Python bridge must not run alongside v2 because both use port `17891`.
 
 ## 3. Enter development mode
 
@@ -90,8 +114,11 @@ Expected fields include:
 ```json
 {
   "running": true,
-  "eventDrivenTargets": true,
+  "codexProcessId": 46300,
+  "eventDrivenTargets": false,
   "databaseWatch": true,
+  "targetInstallFailures": 0,
+  "targetInstallRetryMs": 0,
   "connectedPages": 1,
   "connectionError": null
 }
@@ -99,9 +126,17 @@ Expected fields include:
 
 ### Host background performance baseline
 
-When target discovery, the CCSwitch database watcher, and the runtime control watcher are all healthy, the host uses a 300,000 ms fallback audit and status heartbeat. If any watcher is unavailable, the fallback audit returns to 30,000 ms, and watcher error events wake the audit immediately so recovery does not wait for the healthy interval.
+The injected refresh and Hub buttons append a bounded invisible action marker (`refresh` or `open-hub`) to `document.title`. The host reads the short-lived `/json/list` HTTP snapshot every 1,000 ms and acknowledges an exact marker through an isolated one-shot CDP operation before dispatching it. Marker acknowledgement never updates the quota payload, never waits for provider network I/O, and does not require a second target snapshot. Refreshes are coalesced as one active request plus at most one trailing request; only the final queued result is injected, while Hub actions remain responsive during the query. A newer title marker cannot be cleared by acknowledgement of an older click. This title channel carries no provider data or credential and avoids a persistent CDP WebSocket. Each CDP HTTP request uses `Connection: close`; full injector audits remain limited to 300,000 ms and are deferred while the current-provider query is active.
 
-The fixed `initialRoute=/avatar-overlay` helper page is not retained as a target session. During a hot upgrade, the host connects to that auxiliary page once to remove an injector left by an older version, then closes the CDP connection. Initializing `about:blank` child windows remain eligible until their final route is known.
+The CCSwitch database uses `fs.watch` for immediate changes. While the watcher is healthy, the three SQLite files are audited only every 60,000 ms; the 1,000 ms retry is used only when a watcher is unavailable. SQLite/WAL activity that leaves the cached provider snapshot unchanged does not rebuild Hub state, increment its revision, or request a current-provider refresh. The Hub page loads state once and polls only while a user-started refresh operation is in progress. Only the current CCSwitch provider owns a fixed 300,000 ms balance timer.
+
+CDP target isolation is fail-closed. The host connects only to a `page` target whose URL is exactly the canonical Codex main document, `app://-/index.html`, with no query or fragment. Every eligible target WebSocket exists only for the inspection/injection/update call and is closed in `finally`; a socket whose handshake times out or fails is closed before ownership can transfer to a client. Deferred audits remain pending but never accelerate the maintenance loop beyond the 1,000 ms page-action cadence. A persistent one-shot installation failure uses a target-keyed `1,000 / 2,000 / 5,000 / 10,000 / 30,000 ms` retry sequence; a replacement target or new page action bypasses the old target's delay. The host never calls browser-wide `Target.setDiscoverTargets`, never keeps a target session, and never calls `Runtime.enable` or `Runtime.addBinding`. Empty URLs, `about:blank`, external pages, Browser Use WebViews, MCP App guests, and auxiliary `initialRoute` windows are never connected. If any auxiliary `page`, `webview`, or `iframe` target is active, all injector connections are deferred until it disappears.
+
+The launcher resolves the exact root `ChatGPT.exe` PID after CDP becomes ready and passes it to both the source-mode Node host and the packaged detached launcher. The host checks only that Windows process identity every 250 ms; it does not keep a CDP WebSocket open for lifecycle detection. When the root PID exits, the host runs its full shutdown path, closes the Hub listener, browser broker, file/database resources, removes `host.pid`, writes stopped status, and forces the Node process to exit after a bounded 750 ms cleanup window. Stopping or hot-reloading the host remains one-way and never stops ChatGPT.
+
+Hub full refresh keeps its existing total concurrency bound while reserving a serial lane for providers that require the browser companion, so a slow browser callback cannot occupy every direct-API worker. Hub state records `queryDurationMs` per provider and `lastFullRefreshDurationMs` for the complete operation; these fields contain timing only and never credentials.
+
+OpenAI WHAM queries keep the direct Node transport as the fast path. When the browser companion is connected, the browser path starts only if the direct probe has not completed after 400 ms; the first usable result wins and cancels the losing transport. The direct probe remains bounded by 5,000 ms, and a successful browser result suppresses repeated direct probes for 300,000 ms. A failed browser fallback does not open that backoff, and companion-offline queries retain the direct retry policy. All ordinary provider HTTP retries share one 40,000 ms total budget instead of resetting it for every attempt, and a complete provider query has a 45,000 ms global deadline. Concurrent and 30,000 ms recent successful WHAM results are shared by the SHA-256 hash of account id plus access token, allowing overlapping OpenAI and CPA providers to avoid duplicate requests without caching credential text; failures are never cached.
 
 ### Balance positioning invariant
 
@@ -119,7 +154,7 @@ Do not reintroduce a fixed root `max-width` or an icon-mode `flex: 0 0 28px` roo
 
 ### Codex App interaction layout performance baseline
 
-The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current verified environment is Codex `26.707.9564.0` with injector version `57`.
+The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current injector version is `71`; the exhaustive interaction baseline below was established with injector `69` on Codex Desktop `26.715.2305.0`. Update that baseline only after completing the corresponding full live regression.
 
 | Codex interaction | Expected injector geometry work |
 |---|---|

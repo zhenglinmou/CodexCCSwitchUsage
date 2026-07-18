@@ -11,10 +11,12 @@ import {
   findUsageTooltipTarget,
   getUsageFreshness,
   INJECTOR_VERSION,
+  isComposerFooterCandidate,
   isNativeFlowCacheValid,
   isUsageTooltipBoundaryCrossing,
   mutationNeedsComposerSync,
-  REFRESH_BINDING,
+  PAGE_ACTION_SENTINEL,
+  resolveNativeFlowPlacement,
   selectResponsiveUsageMode,
   stabilizeResponsiveUsageMode,
   updateElementAttribute,
@@ -41,10 +43,55 @@ test('injector script carries an exported version for hot replacement', () => {
   assert.match(buildInjectorScript(), new RegExp(`,${INJECTOR_VERSION}\\)$`));
 });
 
-test('injector caches hot-path usage and refresh DOM references on each root', () => {
+test('composer footer detection accepts the embedded-editor grid and rejects its wrapper', () => {
+  const editor = {};
+  const actionPart = {
+    contains: () => false,
+    querySelector: () => ({}),
+  };
+  const editorPart = {
+    contains: node => node === editor,
+    querySelector: () => null,
+  };
+  const decorativePart = {
+    contains: () => false,
+    querySelector: () => null,
+  };
+  const embeddedFooter = { children: [actionPart, editorPart, actionPart] };
+  const outerWrapper = {
+    children: [
+      decorativePart,
+      { contains: node => node === editor, querySelector: () => ({}) },
+      decorativePart,
+    ],
+  };
+  const currentFooterRect = { width: 736, height: 76, top: 920 };
+  const currentEditorRect = { bottom: 964 };
+
+  assert.equal(
+    isComposerFooterCandidate(embeddedFooter, editor, currentFooterRect, currentEditorRect),
+    true,
+  );
+  assert.equal(
+    isComposerFooterCandidate(outerWrapper, editor, { width: 736, height: 98, top: 906 }, currentEditorRect),
+    false,
+  );
+  assert.equal(
+    isComposerFooterCandidate(
+      { children: [decorativePart, decorativePart, actionPart] },
+      editor,
+      { width: 736, height: 28, top: 968 },
+      currentEditorRect,
+    ),
+    true,
+  );
+});
+
+test('injector caches hot-path usage and toolbar DOM references on each root', () => {
   const source = fs.readFileSync(new URL('../src/injector-script.mjs', import.meta.url), 'utf8');
 
   assert.match(source, /root\.__codexUsageElement/);
+  assert.match(source, /root\.__codexUsageHubButton/);
   assert.match(source, /root\.__codexUsageRefreshButton/);
   assert.match(source, /const usage = root\.__codexUsageElement/);
   assert.match(source, /const refresh = root\.__codexUsageRefreshButton/);
@@ -84,8 +131,72 @@ test('hot replacement clears a pending tooltip delay', () => {
   assert.match(teardown, /if \(existing\.tooltipTimer\) clearTimeout\(existing\.tooltipTimer\)/);
 });
 
-test('refresh button notifies the host through the exported CDP binding', () => {
-  assert.match(buildInjectorScript(), new RegExp(REFRESH_BINDING));
+test('refresh button publishes an invisible title action without a Runtime binding', () => {
+  const script = buildInjectorScript();
+  assert.match(script, new RegExp(PAGE_ACTION_SENTINEL));
+  assert.match(script, /publishPageAction\('refresh'/);
+  assert.doesNotMatch(script, /window\[refreshBinding\]|Runtime\.addBinding/);
+});
+
+test('icon popover exposes a refresh button that refreshes without closing the panel', () => {
+  const script = buildInjectorScript();
+  const portalSource = sourceSection(script, 'function ensurePopoverPortal() {', 'function usageTitle(');
+
+  assert.match(portalSource, /<button id="popover-refresh" class="popover-refresh" type="button" aria-label="刷新 CCSwitch 用量">/);
+  assert.match(portalSource, /getElementById\('popover-refresh'\)\.addEventListener\('click', event => \{/);
+  assert.match(portalSource, /requestRefresh\(state\.popoverAnchor, false\)/);
+  assert.match(script, /updateElementAttribute\(popoverRefreshButton, 'data-loading', state\.loading \? 'true' : null\)/);
+});
+
+test('the grid control opens recent requests while only the popover footer publishes the Hub action', () => {
+  const script = buildInjectorScript();
+  const eventSource = sourceSection(script, 'function bindUsageEvents(instance, usage, hubButton, refreshButton) {', 'function ensureUsageElement(instance) {');
+  const portalSource = sourceSection(script, 'function ensurePopoverPortal() {', 'function usageTitle(');
+  assert.match(script, /publishPageAction\('open-hub'/);
+  assert.doesNotMatch(script, /window\[hubBinding\]|Runtime\.addBinding/);
+  assert.match(script, /id="open-hub"/);
+  assert.match(script, /hubButton\.className = 'toolbar-action hub-trigger'/);
+  assert.match(eventSource, /hubButton\.addEventListener\('click'/);
+  assert.match(eventSource, /toggleRequestPopover\(instance\)/);
+  assert.doesNotMatch(eventSource, /openHub\(\)|publishPageAction\('open-hub'/);
+  assert.match(portalSource, /getElementById\('open-hub'\)\.addEventListener\('click', \(\) => openHub\(\)\)/);
+  assert.doesNotMatch(eventSource, /usage\.addEventListener\('click'/);
+  assert.doesNotMatch(eventSource, /usage\.addEventListener\('keydown'/);
+  assert.match(script, /打开 All API Hub/);
+});
+
+test('recent request popover renders at most ten current-provider rows with model and token usage', () => {
+  const script = buildInjectorScript();
+  const renderer = sourceSection(script, 'function renderRecentRequests(portal, payload) {', 'function render(footers = null');
+
+  assert.match(script, /id="recent-requests" class="request-list" role="list"/);
+  assert.match(script, /\.popover\[data-mode="requests"\]\{width:min\(420px,calc\(100vw - 16px\)\)\}/);
+  assert.match(renderer, /payload\.recentRequests\.slice\(0, 10\)/);
+  assert.match(renderer, /const ageMinute = Math\.floor\(Date\.now\(\) \/ 60_000\)/);
+  assert.match(renderer, /state\.recentRequestsPayload === payload && state\.recentRequestsAgeMinute === ageMinute/);
+  assert.match(renderer, /item\.model \|\| item\.requestModel \|\| '未知模型'/);
+  assert.match(renderer, /requestMetadata\(item\)/);
+  assert.match(script, /`输入 \$\{formatTokenCount\(item\.inputTokens\)\}`/);
+  assert.match(script, /`输出 \$\{formatTokenCount\(item\.outputTokens\)\}`/);
+  assert.match(script, /formatRequestCost\(item\.totalCostUsd\)/);
+  assert.match(script, /当前供应商还没有请求记录/);
+});
+
+test('Hub control shares refresh styling and stays inside the responsive content group', () => {
+  const source = fs.readFileSync(new URL('../src/injector-script.mjs', import.meta.url), 'utf8');
+
+  assert.match(source, /\.toolbar-action\{[^}]*width:28px[^}]*height:28px/);
+  assert.match(source, /refreshButton\.className = 'toolbar-action refresh'/);
+  assert.match(source, /usage\.append\(dot, hubButton, refreshButton\)/);
+  assert.match(source, /usage\.insertBefore\(element, hubButton\)/);
+  assert.match(source, /:host\(\[data-mode="icon"\]\)[^{]*\.hub-trigger\{display:none\}/);
+});
+
+test('refresh loading animation follows the counter-clockwise arrow direction', () => {
+  const source = fs.readFileSync(new URL('../src/injector-script.mjs', import.meta.url), 'utf8');
+
+  assert.match(source, /@keyframes codex-usage-spin\{to\{transform:rotate\(-360deg\)\}\}/);
+  assert.doesNotMatch(source, /@keyframes codex-usage-spin\{to\{transform:rotate\(360deg\)\}\}/);
 });
 
 test('hot payload rendering does not replace usage or popover innerHTML', () => {
@@ -178,12 +289,20 @@ test('mutation classifier mounts only for composer lifecycle changes', () => {
   const footerChild = {};
   const footerWithChildren = { isConnected: true, contains: node => node === footerChild };
   const detachedRoot = { ...root, isConnected: false };
+  const stableRemovedLeaf = {
+    nodeType: 1,
+    childElementCount: 0,
+    contains: () => { throw new Error('stable mounts must skip detached-root containment checks'); },
+    matches: () => false,
+    querySelector: () => { throw new Error('leaf mutations must not scan descendants'); },
+  };
 
   assert.equal(classifyComposerMutations([{ addedNodes: [textNode, unrelatedElement], removedNodes: [] }], footer, root), 'ignore');
   assert.equal(classifyComposerMutations([{ addedNodes: [editorElement], removedNodes: [] }], footer, root), 'mount');
   assert.equal(classifyComposerMutations([{ target: footerChild, addedNodes: [unrelatedElement], removedNodes: [] }], footerWithChildren, root), 'ignore');
   assert.equal(classifyComposerMutations([{ addedNodes: [unrelatedElement], removedNodes: [] }], footer, detachedRoot), 'ignore');
   assert.equal(classifyComposerMutations([{ addedNodes: [], removedNodes: [detachedRoot] }], footer, detachedRoot), 'mount');
+  assert.equal(classifyComposerMutations([{ addedNodes: [], removedNodes: [stableRemovedLeaf] }], footer, root), 'ignore');
   assert.equal(mutationNeedsComposerSync([{ addedNodes: [textNode, unrelatedElement], removedNodes: [] }], footer, root), false);
   assert.equal(mutationNeedsComposerSync([{ addedNodes: [editorElement], removedNodes: [] }], footer, root), true);
   assert.equal(mutationNeedsComposerSync([{ target: footerChild, addedNodes: [unrelatedElement], removedNodes: [] }], footerWithChildren, root), false);
@@ -221,7 +340,7 @@ test('a collapsed observed composer enters immediate recovery', () => {
   );
 });
 
-test('root resize schedules layout only when the responsive mode must change', () => {
+test('root resize schedules layout only for a responsive-mode or native-flow change', () => {
   const script = buildInjectorScript();
   const resizeHelpers = sourceSection(
     script,
@@ -240,8 +359,9 @@ test('root resize schedules layout only when the responsive mode must change', (
   assert.match(resizeHelpers, /const selected = selectResponsiveUsageMode\(measurements, previousMode\);/);
   assert.match(resizeHelpers, /return selected !== previousMode;/);
   assert.match(resizeObserver, /const rootChanged = hasMeaningfulRootResize\(entries, roots\);/);
-  assert.match(resizeObserver, /if \(!rootChanged\) return;/);
-  assert.match(resizeObserver, /if \(roots\.some\(rootResizeNeedsLayout\)\) scheduleLayout\(\);/);
+  assert.match(resizeObserver, /const nativeFlowChanged = roots\.some\(root => \{/);
+  assert.match(resizeObserver, /if \(!rootChanged && !nativeFlowChanged\) return;/);
+  assert.match(resizeObserver, /if \(nativeFlowChanged \|\| roots\.some\(rootResizeNeedsLayout\)\) scheduleLayout\(\);/);
   assert.doesNotMatch(resizeObserver, /scheduleRootResizeBurst/);
 });
 
@@ -303,7 +423,7 @@ test('balance tooltip only targets usage text', () => {
   assert.equal(findUsageTooltipTarget(target({ '.metric,.meter,.message': meter })), meter);
   assert.equal(findUsageTooltipTarget(target({ '.metric,.meter,.message': message })), message);
   assert.equal(findUsageTooltipTarget(target()), null, 'blank usage area must not trigger the balance tooltip');
-  assert.equal(findUsageTooltipTarget(target({ '.refresh': {} })), null, 'refresh button must not trigger the balance tooltip');
+  assert.equal(findUsageTooltipTarget(target({ '.refresh,.hub-trigger,.hub-open': {} })), null, 'toolbar buttons must not trigger the balance tooltip');
 });
 
 test('moving inside the usage content group does not cross its hover boundary', () => {
@@ -475,26 +595,123 @@ test('refresh loading state skips geometry work unless icon mode toggles the pop
   const script = buildInjectorScript();
   const refreshHandler = sourceSection(
     script,
-    "refreshButton.addEventListener('click', event => {",
+    'function requestRefresh(instance, togglePopover = false) {',
     'function ensureUsageElement(instance) {',
   );
 
-  assert.match(refreshHandler, /const shouldScheduleLayout = instance\.root\.dataset\.mode === 'icon';/);
-  assert.match(refreshHandler, /if \(shouldScheduleLayout\) state\.popoverOpen = !state\.popoverOpen;/);
-  assert.match(refreshHandler, /render\(null, shouldScheduleLayout\);/);
+  assert.match(refreshHandler, /if \(togglePopover\) \{[\s\S]*state\.popoverMode = state\.popoverOpen \? 'balance' : '';[\s\S]*\}/);
+  assert.match(refreshHandler, /render\(null, togglePopover\);/);
+  assert.match(refreshHandler, /requestRefresh\(instance, instance\.root\.dataset\.mode === 'icon'\);/);
   assert.doesNotMatch(refreshHandler, /\n\s*render\(\);/);
+});
+
+test('request-only payload updates skip balance DOM reconstruction and layout work', () => {
+  const script = buildInjectorScript();
+  const update = sourceSection(script, 'state.update = payload => {', 'state.mount = mount;');
+
+  assert.match(script, /balancePayloadSignature/);
+  assert.match(script, /__codexUsageContentSignature === view\.contentSignature/);
+  assert.match(update, /const balanceChanged = balancePayloadSignature\(state\.payload\) !== balancePayloadSignature\(payload\)/);
+  assert.match(update, /render\(null, balanceChanged\)/);
+  assert.match(update, /if \(state\.popoverOpen && !balanceChanged\) positionPopover\(\)/);
 });
 
 test('toolbar flow cache is reused only while its DOM placement remains valid', () => {
   const right = {};
   const before = { isConnected: true };
-  const lane = { isConnected: true };
+  const laneParent = {};
+  const lane = { isConnected: true, parentElement: laneParent };
   const root = { parentElement: lane, nextElementSibling: before };
-  const cache = { right, lane, before };
+  const styles = new Map([
+    [lane, { display: 'flex', flexGrow: '1', flexShrink: '1' }],
+    [laneParent, { display: 'flex', flexGrow: '0', flexShrink: '1' }],
+  ]);
+  const getStyle = element => styles.get(element) || { display: 'block', flexGrow: '0', flexShrink: '1' };
+  const cache = { right, lane, before, signature: 'flex:1:1|flex:0:1' };
 
-  assert.equal(isNativeFlowCacheValid(cache, root, right), true);
-  assert.equal(isNativeFlowCacheValid(cache, { ...root, nextElementSibling: null }, right), false);
-  assert.equal(isNativeFlowCacheValid({ ...cache, before: { isConnected: false } }, root, right), false);
+  assert.equal(isNativeFlowCacheValid(cache, root, right, getStyle), true);
+  assert.equal(isNativeFlowCacheValid(cache, { ...root, nextElementSibling: null }, right, getStyle), false);
+  assert.equal(isNativeFlowCacheValid({ ...cache, before: { isConnected: false } }, root, right, getStyle), false);
+  styles.set(laneParent, { display: 'flex', flexGrow: '0', flexShrink: '0' });
+  assert.equal(isNativeFlowCacheValid(cache, root, right, getStyle), false);
+});
+
+test('toolbar fallback preserves the Codex model lane and unwraps the ChatGPT contents layer', () => {
+  const root = {};
+  const modelGroup = {};
+  const modelLane = {
+    children: [modelGroup],
+    firstElementChild: modelGroup,
+  };
+  const fixedActions = {};
+  const outerToolbar = {
+    children: [root, modelLane, fixedActions],
+    firstElementChild: root,
+  };
+  const right = {
+    children: [outerToolbar],
+    firstElementChild: outerToolbar,
+    contains: element => [outerToolbar, modelLane, modelGroup, fixedActions].includes(element),
+  };
+  modelGroup.parentElement = modelLane;
+  root.nextElementSibling = modelLane;
+
+  const styles = new Map([
+    [right, { display: 'block', flexGrow: '0' }],
+    [outerToolbar, { display: 'flex', flexGrow: '0' }],
+    [modelLane, { display: 'flex', flexGrow: '1' }],
+    [fixedActions, { display: 'flex', flexGrow: '0' }],
+  ]);
+  const getStyle = element => styles.get(element) || { display: 'block', flexGrow: '0' };
+
+  assert.deepEqual(
+    resolveNativeFlowPlacement(right, root, null, getStyle),
+    { lane: modelLane, before: modelGroup },
+  );
+  assert.deepEqual(
+    resolveNativeFlowPlacement(right, root, modelGroup, getStyle),
+    { lane: modelLane, before: modelGroup },
+  );
+
+  const chatgptActions = {};
+  const chatgptToolbar = {
+    children: [chatgptActions],
+    firstElementChild: chatgptActions,
+  };
+  const contents = {
+    children: [chatgptToolbar],
+    firstElementChild: chatgptToolbar,
+  };
+  const chatgptRight = {
+    children: [contents],
+    firstElementChild: contents,
+    contains: element => [contents, chatgptToolbar, chatgptActions].includes(element),
+  };
+  styles.set(chatgptRight, { display: 'block', flexGrow: '0' });
+  styles.set(contents, { display: 'contents', flexGrow: '0' });
+  styles.set(chatgptToolbar, { display: 'flex', flexGrow: '0' });
+  styles.set(chatgptActions, { display: 'flex', flexGrow: '0' });
+
+  assert.deepEqual(
+    resolveNativeFlowPlacement(chatgptRight, root, null, getStyle),
+    { lane: chatgptToolbar, before: chatgptActions },
+  );
+
+  const chatgptModelGroup = { parentElement: chatgptActions };
+  chatgptActions.parentElement = chatgptToolbar;
+  styles.set(chatgptToolbar, { display: 'flex', flexGrow: '0', flexShrink: '0' });
+  assert.deepEqual(
+    resolveNativeFlowPlacement(chatgptRight, root, chatgptModelGroup, getStyle),
+    { lane: chatgptActions, before: chatgptModelGroup },
+    'single-line Chat keeps the accepted inline placement',
+  );
+
+  styles.set(chatgptToolbar, { display: 'flex', flexGrow: '0', flexShrink: '1' });
+  assert.deepEqual(
+    resolveNativeFlowPlacement(chatgptRight, root, chatgptModelGroup, getStyle),
+    { lane: chatgptToolbar, before: chatgptActions },
+    'multiline Chat promotes the root into the full free lane',
+  );
 });
 
 test('usage root spans the entire free toolbar lane in every responsive mode', () => {

@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "CCSwitch Balance Browser Companion",
+  "version": "0.1.10",
+  "description": "Use the current browser profile and its existing website sessions for CCSwitch Balance Hub callbacks.",
+  "permissions": [
+    "alarms",
+    "cookies",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:17891/*",
+    "https://agentrouter.org/*",
+    "https://anyrouter.top/*",
+    "https://chatgpt.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "CCSwitch Balance Companion",
+    "default_popup": "popup.html"
+  }
+}

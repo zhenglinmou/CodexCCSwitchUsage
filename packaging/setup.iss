@@ -51,7 +51,6 @@ Source: "{#PackageRoot}\runtime-bin\node.exe"; DestDir: "{app}\runtime-bin"
 Source: "{#PackageRoot}\scripts\stop-host.ps1"; Flags: dontcopy
 
 [InstallDelete]
-Type: files; Name: "{app}\scripts\instance-guard.ps1"
 Type: files; Name: "{app}\scripts\migrate-default-profile.ps1"
 
 [Dirs]

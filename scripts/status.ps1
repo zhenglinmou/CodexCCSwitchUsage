@@ -15,11 +15,14 @@ $hostProcess = Get-CimInstance Win32_Process | Where-Object {
     installed = Test-Path -LiteralPath (Join-Path $root 'package.json')
     running = [bool]$hostProcess
     processId = if ($hostProcess) { $hostProcess.ProcessId } else { $null }
-    instanceGuardRunning = $false
-    instanceGuardProcessId = $null
+    codexProcessId = $status.codexProcessId
     provider = $status.provider
     usageStatus = $status.usageStatus
+    hubRunning = $status.hubRunning
+    hubPort = $status.hubPort
+    hubProviders = $status.hubProviders
+    browserCompanion = $status.browserCompanion
     connectedPages = $status.connectedPages
     updatedAt = $status.updatedAt
-    error = if ($status.error) { $status.error } elseif ($status.connectionError) { $status.connectionError } else { $null }
+    error = if ($status.error) { $status.error } elseif ($status.connectionError) { $status.connectionError } elseif ($status.hubError) { $status.hubError } else { $null }
 } | ConvertTo-Json -Compress

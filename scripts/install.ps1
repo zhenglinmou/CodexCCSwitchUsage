@@ -18,9 +18,14 @@ if (Test-Path -LiteralPath $target) {
 $files = @(
     'package.json', '.gitignore', 'README.md',
     'src\provider-repository.mjs', 'src\evaluator-worker.mjs', 'src\evaluator.mjs',
-    'src\usage-client.mjs', 'src\cdp-client.mjs', 'src\injector-script.mjs', 'src\target-session.mjs', 'src\target-discovery.mjs', 'src\host.mjs',
+    'src\usage-client.mjs', 'src\cdp-client.mjs', 'src\browser-callback-broker.mjs', 'src\hub-provider-adapters.mjs',
+    'src\hub-service.mjs', 'src\hub-page.mjs', 'src\hub-server.mjs',
+    'src\injector-script.mjs', 'src\keyed-backoff.mjs', 'src\page-action-channel.mjs', 'src\process-lifecycle.mjs', 'src\target-session.mjs', 'src\host.mjs',
     'scripts\install.ps1', 'scripts\launch.ps1', 'scripts\stop.ps1', 'scripts\check-current.mjs',
-    'scripts\status.ps1', 'scripts\uninstall.ps1'
+    'scripts\status.ps1', 'scripts\uninstall.ps1',
+    'browser-companion\manifest.json', 'browser-companion\background.js', 'browser-companion\session-state.js',
+    'browser-companion\anyrouter-waf.js',
+    'browser-companion\popup.html', 'browser-companion\popup.js', 'browser-companion\README.md'
 )
 foreach ($relative in $files) {
     $from = Join-Path $source $relative
@@ -30,9 +35,7 @@ foreach ($relative in $files) {
     Copy-Item -LiteralPath $from -Destination $to -Force
 }
 
-foreach ($relative in @('scripts\instance-guard.ps1', 'scripts\migrate-default-profile.ps1')) {
-    Remove-Item -LiteralPath (Join-Path $target $relative) -Force -ErrorAction SilentlyContinue
-}
+Remove-Item -LiteralPath (Join-Path $target 'scripts\migrate-default-profile.ps1') -Force -ErrorAction SilentlyContinue
 
 function Find-CodexExecutable {
     $running = Get-Process ChatGPT -ErrorAction SilentlyContinue |

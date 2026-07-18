@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CCSwitch Balance Companion</title>
+  <style>
+    :root{color-scheme:dark;font-family:"Segoe UI","Microsoft YaHei",sans-serif;background:#111318;color:#f4f5f7}*{box-sizing:border-box}body{width:330px;margin:0;padding:18px}h1{font-size:16px;margin:0 0 7px}p{font-size:12px;line-height:1.55;color:#9ca3af;margin:0 0 14px}label{display:block;font-size:12px;color:#c7cbd2;margin-bottom:6px}input{width:100%;height:36px;padding:0 10px;border:1px solid #303540;border-radius:9px;background:#181b21;color:#fff;outline:none}input:focus{border-color:#6aa9ff}button{height:34px;padding:0 12px;border:1px solid #343a46;border-radius:9px;background:#20242c;color:#fff;cursor:pointer}button.primary{border:0;background:#f4f5f7;color:#111318;font-weight:650}.actions{display:flex;gap:8px;margin-top:10px}.status{margin-top:14px;padding:10px;border-radius:9px;background:#181b21;color:#9ca3af;font-size:12px;line-height:1.5}.status.ok{color:#64d995;background:rgba(80,200,130,.1)}.status.error{color:#ff8b8b;background:rgba(255,100,100,.1)}
+  </style>
+</head>
+<body>
+  <h1>CCSwitch 余额伴侣</h1>
+  <p>使用当前浏览器已有的登录 Cookie，为本机 Balance Hub 执行同源余额请求。连接码保存一次后会自动后台重连，平时无需打开此弹窗；Cookie 不会离开浏览器。</p>
+  <label for="token">Hub 连接码</label>
+  <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="从 Balance Hub 复制">
+  <div class="actions"><button id="save" class="primary" type="button">保存并连接</button><button id="open-hub" type="button">打开 Hub</button></div>
+  <div id="status" class="status">尚未配置</div>
+  <script src="popup.js"></script>
+</body>
+</html>

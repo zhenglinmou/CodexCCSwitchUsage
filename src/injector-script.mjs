@@ -1,5 +1,5 @@
 export function findUsageTooltipTarget(target) {
-  if (!target?.closest || target.closest('.refresh')) return null;
+  if (!target?.closest || target.closest('.refresh,.hub-trigger,.hub-open')) return null;
   return target.closest('.metric,.meter,.message');
 }
 
@@ -103,6 +103,7 @@ export function findMutationObserverTarget(footer, documentNode = globalThis.doc
 
 export function classifyComposerMutations(records, footer, root) {
   const selector = '.ProseMirror[contenteditable="true"],[contenteditable="true"].ProseMirror,[contenteditable="true"][role="textbox"],[contenteditable="true"][data-lexical-editor="true"],.composer-surface-chrome,[data-composer-surface],[data-composer-footer],[class*="_footer_"]';
+  const stableMount = Boolean(footer?.isConnected && root?.isConnected);
   for (let recordIndex = 0; recordIndex < records.length; recordIndex += 1) {
     const record = records[recordIndex];
     for (let listIndex = 0; listIndex < 2; listIndex += 1) {
@@ -111,14 +112,14 @@ export function classifyComposerMutations(records, footer, root) {
         const node = nodes[nodeIndex];
         if (node?.nodeType !== 1) continue;
         if (
-          (listIndex === 1 && (
+          (listIndex === 1 && !stableMount && (
             node === footer
             || node === root
             || node.contains?.(footer)
             || node.contains?.(root)
           ))
           || node.matches?.(selector)
-          || node.querySelector?.(selector)
+          || (node.childElementCount !== 0 && node.querySelector?.(selector))
         ) return 'mount';
       }
     }
@@ -144,7 +145,30 @@ export function updateElementAttribute(element, name, value) {
   return true;
 }
 
-export function isNativeFlowCacheValid(cache, root, right) {
+export function isComposerFooterCandidate(element, editor, rect, editorRect) {
+  const children = Array.from(element?.children || []);
+  if (!editor || children.length < 3 || !rect || !editorRect) return false;
+  if (rect.width <= 0 || rect.height < 20) return false;
+
+  const editorPart = children.find(child => child === editor || child.contains?.(editor));
+  const embeddedEditorLayout = Boolean(editorPart && children.filter(child => (
+    child !== editorPart
+    && child.querySelector?.('button,[role="button"],[aria-label]')
+  )).length >= 2);
+
+  if (embeddedEditorLayout) return true;
+  return rect.height <= 52 && rect.top >= editorRect.bottom - 24;
+}
+
+export function isNativeFlowCacheValid(cache, root, right, getStyle = globalThis.getComputedStyle) {
+  const flowSignature = lane => {
+    const signature = element => {
+      if (!element) return '';
+      const style = getStyle(element);
+      return [style.display || '', style.flexGrow || '', style.flexShrink || ''].join(':');
+    };
+    return `${signature(lane)}|${signature(lane?.parentElement)}`;
+  };
   return Boolean(
     cache
     && cache.right === right
@@ -152,21 +176,63 @@ export function isNativeFlowCacheValid(cache, root, right) {
     && (cache.before == null || cache.before.isConnected)
     && root?.parentElement === cache.lane
     && root?.nextElementSibling === cache.before
+    && cache.signature === flowSignature(cache.lane)
   );
 }
 
-export const REFRESH_BINDING = '__CODEX_CCSWITCH_USAGE_REFRESH__';
-export const INJECTOR_VERSION = 57;
+export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = globalThis.getComputedStyle) {
+  const toolbarParent = toolbar?.parentElement;
+  if (toolbarParent && right?.contains?.(toolbarParent) && getStyle(toolbarParent).display === 'flex') {
+    const outerToolbar = toolbarParent.parentElement;
+    const toolbarParentStyle = getStyle(toolbarParent);
+    const outerToolbarStyle = outerToolbar ? getStyle(outerToolbar) : null;
+    if (
+      Number.parseFloat(toolbarParentStyle.flexGrow) <= 0
+      && outerToolbar
+      && outerToolbar !== right
+      && right.contains?.(outerToolbar)
+      && outerToolbarStyle?.display === 'flex'
+      && Number.parseFloat(outerToolbarStyle.flexShrink) > 0
+    ) {
+      return { lane: outerToolbar, before: toolbarParent };
+    }
+    return { lane: toolbarParent, before: toolbar };
+  }
 
-function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, selectResponsiveUsageMode, calculateResponsiveMeasurements, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isNativeFlowCacheValid, refreshBinding, version) {
+  const findFlexContainer = container => {
+    for (const element of Array.from(container?.children || [])) {
+      if (element === root) continue;
+      const display = getStyle(element).display;
+      if (display === 'flex') return element;
+      if (display === 'contents') {
+        const nested = findFlexContainer(element);
+        if (nested) return nested;
+      }
+    }
+    return null;
+  };
+  const outerToolbar = findFlexContainer(right) || right;
+  const flexibleLane = Array.from(outerToolbar?.children || []).find(element => (
+    element !== root
+    && getStyle(element).display === 'flex'
+    && Number.parseFloat(getStyle(element).flexGrow) > 0
+  ));
+  const lane = flexibleLane || (getStyle(outerToolbar).display === 'flex' ? outerToolbar : right);
+  const candidateBefore = lane?.firstElementChild || null;
+  return { lane, before: candidateBefore === root ? root.nextElementSibling : candidateBefore };
+}
+
+export const PAGE_ACTION_SENTINEL = '\u2063\u2063';
+export const INJECTOR_VERSION = 71;
+
+function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, selectResponsiveUsageMode, calculateResponsiveMeasurements, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, pageActionSentinel, version) {
   const VERSION = version;
   const GLOBAL = '__CODEX_CCSWITCH_USAGE__';
   const ROOT_ID = 'codex-ccswitch-usage-root';
   const POPOVER_ID = 'codex-ccswitch-usage-popover';
   const existing = window[GLOBAL];
   if (existing?.version === VERSION) {
-    existing.mount();
-    return true;
+    return existing.mount() === true;
   }
   const eventController = createInjectorEventController(existing);
   if (existing) {
@@ -198,6 +264,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     footer: null,
     refreshToken: 0,
     refreshRequestedAt: 0,
+    actionToken: 0,
     observer: null,
     observerTarget: null,
     themeObserver: null,
@@ -206,6 +273,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     layoutFrame: 0,
     composerSyncFrame: 0,
     popoverOpen: false,
+    popoverMode: '',
     loading: false,
     popoverRoot: null,
     popoverShadow: null,
@@ -216,6 +284,8 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     tooltipAnchor: null,
     tooltipTimer: 0,
     popoverPayload: null,
+    recentRequestsPayload: null,
+    recentRequestsAgeMinute: -1,
     eventController,
     usageStyleSheet: null,
     __codexUsageView: null,
@@ -236,6 +306,24 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     return numberFormatter.format(number);
   };
 
+  const balancePayloadSignature = payload => JSON.stringify([
+    payload?.status,
+    payload?.providerId,
+    payload?.providerName,
+    payload?.websiteUrl,
+    payload?.message,
+    payload?.extra,
+    payload?.periodLabel,
+    payload?.hideTotal,
+    payload?.refreshIntervalMinutes,
+    payload?.used,
+    payload?.remaining,
+    payload?.total,
+    payload?.unit,
+    payload?.updatedAt,
+    payload?.queryError,
+  ]);
+
   function footerParts(footer) {
     const children = footer?.children;
     if (!children || children.length < 3) return null;
@@ -255,8 +343,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       const parts = footerParts(element);
       if (!parts) continue;
       const rect = element.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height < 20 || rect.height > 52) continue;
-      if (rect.top < editorRect.bottom - 24) continue;
+      if (!isComposerFooterCandidate(element, editor, rect, editorRect)) continue;
       const className = String(element.className || '');
       let score = 0;
       if (element.hasAttribute('data-composer-footer')) score += 8;
@@ -312,19 +399,19 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     .meter[data-balance-level="critical"]>i{background:var(--color-text-danger,#ef4444)}
     .usage[data-balance-level="warning"] .remaining-value{color:var(--color-text-warning,#ff9f43)}
     .usage[data-balance-level="critical"] .remaining-value{color:var(--color-text-danger,#ef4444)}
-    .refresh{appearance:none;border:0;background:transparent;color:inherit;width:28px;height:28px;padding:6px;display:grid;place-items:center;border-radius:9999px;cursor:pointer;flex:0 0 auto;font:inherit;line-height:18px}
-    .refresh:hover{background:var(--color-background-button-tertiary-hover,rgba(127,127,127,.08))}
-    .refresh svg{display:block;width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+    .toolbar-action{appearance:none;border:0;background:transparent;color:inherit;width:28px;height:28px;padding:6px;display:grid;place-items:center;border-radius:9999px;cursor:pointer;flex:0 0 auto;font:inherit;line-height:18px}
+    .toolbar-action:hover{background:var(--color-background-button-tertiary-hover,rgba(127,127,127,.08))}
+    .toolbar-action svg{display:block;width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
     .refresh[data-loading="true"] svg{animation:codex-usage-spin .8s linear infinite}
     .message{overflow:hidden;text-overflow:ellipsis;color:inherit;font:inherit}
-    @keyframes codex-usage-spin{to{transform:rotate(360deg)}}
+    @keyframes codex-usage-spin{to{transform:rotate(-360deg)}}
     @media (prefers-reduced-motion:reduce){:host{transition:none}.refresh svg{animation:none!important}}
     :host([data-mode="compact"]) .extra-secondary{display:none}
     :host([data-mode="no-extra"]) .extra{display:none}
     :host([data-mode="no-used"]) .extra,:host([data-mode="no-used"]) .used{display:none}
     :host([data-mode="no-meter"]) .extra,:host([data-mode="no-meter"]) .used,:host([data-mode="no-meter"]) .meter{display:none}
     :host([data-mode="no-dot"]) .extra,:host([data-mode="no-dot"]) .used,:host([data-mode="no-dot"]) .meter,:host([data-mode="no-dot"]) .status-dot{display:none}
-    :host([data-mode="icon"]) .status-dot,:host([data-mode="icon"]) .metric,:host([data-mode="icon"]) .meter,:host([data-mode="icon"]) .message{display:none}
+    :host([data-mode="icon"]) .status-dot,:host([data-mode="icon"]) .metric,:host([data-mode="icon"]) .meter,:host([data-mode="icon"]) .message,:host([data-mode="icon"]) .hub-trigger{display:none}
     :host([data-mode="icon"]) .usage{justify-content:center;gap:0}
     :host([data-mode="hidden"]){opacity:0!important;visibility:hidden!important;pointer-events:none!important}
   `;
@@ -398,22 +485,52 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       const shadow = host.attachShadow({ mode: 'open' });
       shadow.innerHTML = `<style>
         *{box-sizing:border-box}
-        .popover{position:fixed;z-index:2147483000;width:min(236px,calc(100vw - 16px));padding:12px;border:1px solid var(--color-token-border,var(--color-token-button-border,rgba(127,127,127,.16)));border-radius:14px;background:var(--color-token-dropdown-background,rgb(38,38,38));box-shadow:0 12px 32px rgba(0,0,0,.32);color:var(--color-token-text-primary,currentColor);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:var(--text-sm,13px);font-weight:445;line-height:18px;letter-spacing:normal;opacity:0;visibility:hidden;transform:translateY(4px);transition:opacity .12s ease,transform .12s ease,visibility .12s;pointer-events:none}
+        .popover{position:fixed;z-index:2147483000;width:min(236px,calc(100vw - 16px));max-height:calc(100vh - 16px);padding:12px;border:1px solid var(--color-token-border,var(--color-token-button-border,rgba(127,127,127,.16)));border-radius:14px;background:var(--color-token-dropdown-background,rgb(38,38,38));box-shadow:0 12px 32px rgba(0,0,0,.32);color:var(--color-token-text-primary,currentColor);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:var(--text-sm,13px);font-weight:445;line-height:18px;letter-spacing:normal;display:flex;flex-direction:column;opacity:0;visibility:hidden;transform:translateY(4px);transition:opacity .12s ease,transform .12s ease,visibility .12s;pointer-events:none}
         .popover.open{opacity:1;visibility:visible;transform:translateY(0);pointer-events:auto}
-        .popover-head{display:flex;align-items:center;justify-content:space-between;color:var(--color-token-text-tertiary,currentColor);height:20px}
-        .popover-head-title{font:inherit}
-        .popover-head-icon{width:16px;height:16px;color:var(--color-token-text-tertiary,currentColor);fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+        .popover[data-mode="requests"]{width:min(420px,calc(100vw - 16px))}
+        .popover-head{display:flex;align-items:center;justify-content:space-between;color:var(--color-token-text-tertiary,currentColor);height:24px}
+        .popover-head-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:inherit}
+        .popover-refresh{appearance:none;display:grid;place-items:center;width:28px;height:28px;margin:-2px -6px -2px 0;padding:0;border:0;border-radius:7px;background:transparent;color:var(--color-token-text-tertiary,currentColor);cursor:pointer}
+        .popover-refresh:hover{background:var(--color-background-button-tertiary-hover,rgba(127,127,127,.12));color:var(--color-token-text-primary,currentColor)}
+        .popover-refresh:focus-visible{outline:2px solid var(--color-token-text-primary,currentColor);outline-offset:1px}
+        .popover-refresh svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+        .popover-refresh[data-loading="true"] svg{animation:popover-refresh-spin .9s linear infinite}
         .popover-grid{display:grid;gap:6px;margin-top:8px}
+        .popover[data-mode="requests"] .popover-grid,.popover[data-mode="requests"] .popover-refresh{display:none}
         .popover-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:30px;padding:0 9px;border-radius:8px;background:var(--color-background-button-tertiary,rgba(127,127,127,.04))}
         .popover-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-token-text-tertiary,currentColor)}
         .popover-value{flex:0 0 auto;color:var(--color-token-text-primary,currentColor);font:inherit}
+        .request-list{display:none;min-height:0;margin-top:8px;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
+        .popover[data-mode="requests"] .request-list{display:block}
+        .request-item{padding:9px 4px;border-bottom:1px solid var(--color-token-border,rgba(127,127,127,.12))}
+        .request-item:last-child{border-bottom:0}
+        .request-main{display:flex;align-items:center;gap:10px;min-width:0}
+        .request-model{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-token-text-primary,currentColor);font-weight:600}
+        .request-age{flex:0 0 auto;margin-left:auto;color:var(--color-token-text-tertiary,currentColor);font-size:12px;white-space:nowrap}
+        .request-meta{display:flex;align-items:center;flex-wrap:wrap;gap:2px 8px;min-width:0;margin-top:3px;color:var(--color-token-text-tertiary,currentColor);font-size:12px;line-height:17px}
+        .request-meta>span:not(.request-cost):not(.request-error){min-width:0;overflow-wrap:anywhere}
+        .request-cost{margin-left:auto;color:var(--color-token-text-primary,currentColor);white-space:nowrap}
+        .request-error{color:var(--color-text-warning,#ff9f43);white-space:nowrap}
+        .request-empty{padding:22px 4px;text-align:center;color:var(--color-token-text-tertiary,currentColor)}
+        .hub-open{appearance:none;width:100%;height:34px;margin-top:9px;border:1px solid var(--color-token-border,rgba(127,127,127,.18));border-radius:9px;background:var(--color-background-button-tertiary,rgba(127,127,127,.06));color:var(--color-token-text-primary,currentColor);font:inherit;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px}
+        .hub-open:hover{background:var(--color-background-button-tertiary-hover,rgba(127,127,127,.12))}
+        .hub-open svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+        .hub-open span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .hub-open .external-icon{width:12px;height:12px}
         .tooltip{position:fixed;z-index:2147483001;max-width:min(360px,calc(100vw - 16px));padding:7px 10px;border:1px solid var(--color-token-border,rgba(127,127,127,.18));border-radius:10px;background:var(--color-token-dropdown-background,rgb(38,38,38));box-shadow:0 8px 24px rgba(0,0,0,.28);color:var(--color-token-text-primary,#fff);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:13px;line-height:18px;white-space:normal;opacity:0;visibility:hidden;transform:translateY(3px);transition:opacity .1s ease,transform .1s ease,visibility .1s;pointer-events:none}
         .tooltip.open{opacity:1;visibility:visible;transform:translateY(0)}
-        @media (prefers-reduced-motion:reduce){.tooltip{transition:none}}
-      </style><div id="popover" class="popover" role="dialog" aria-label="完整额度">
-        <div class="popover-head"><span class="popover-head-title">额度</span><svg class="popover-head-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 0-15.22-6.49L3 8"></path><path d="M3 3v5h5"></path><path d="M3 12a9 9 0 0 0 15.22 6.49L21 16"></path><path d="M16 16h5v5"></path></svg></div>
-        <div id="popover-grid" class="popover-grid"></div>
+        @keyframes popover-refresh-spin{to{transform:rotate(-360deg)}}
+        @media (prefers-reduced-motion:reduce){.tooltip{transition:none}.popover-refresh[data-loading="true"] svg{animation:none}}
+      </style><div id="popover" class="popover" data-mode="balance" role="dialog" aria-label="完整额度">
+        <div class="popover-head"><span class="popover-head-title">额度</span><button id="popover-refresh" class="popover-refresh" type="button" aria-label="刷新 CCSwitch 用量"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 0-15.22-6.49L3 8"></path><path d="M3 3v5h5"></path><path d="M3 12a9 9 0 0 0 15.22 6.49L21 16"></path><path d="M16 16h5v5"></path></svg></button></div>
+        <div id="popover-grid" class="popover-grid"></div><div id="recent-requests" class="request-list" role="list"></div><button id="open-hub" class="hub-open" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1.25"></rect><rect x="14" y="4" width="6" height="6" rx="1.25"></rect><rect x="4" y="14" width="6" height="6" rx="1.25"></rect><rect x="14" y="14" width="6" height="6" rx="1.25"></rect></svg><span>打开 All API Hub</span><svg class="external-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6"></path><path d="M20 4 11 13"></path><path d="M20 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h6"></path></svg></button>
       </div><div id="tooltip" class="tooltip" role="tooltip"></div>`;
+      shadow.getElementById('open-hub').addEventListener('click', () => openHub());
+      shadow.getElementById('popover-refresh').addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        requestRefresh(state.popoverAnchor, false);
+      });
     }
     state.popoverRoot = host;
     state.popoverShadow = host.shadowRoot;
@@ -453,12 +570,44 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     return rows;
   }
 
+  function formatTokenCount(value) {
+    const number = Math.max(0, Number(value) || 0);
+    const compact = (divisor, suffix) => {
+      const scaled = number / divisor;
+      const digits = scaled >= 100 ? 0 : 1;
+      return `${scaled.toFixed(digits).replace(/\.0$/, '')}${suffix}`;
+    };
+    if (number >= 1_000_000) return compact(1_000_000, 'M');
+    if (number >= 1_000) return compact(1_000, 'k');
+    return String(Math.trunc(number));
+  }
+
+  function formatRequestCost(value) {
+    const number = Math.max(0, Number(value) || 0);
+    if (number > 0 && number < 0.0001) return '<$0.0001';
+    if (number === 0) return '$0';
+    return `$${number.toFixed(number < 1 ? 4 : 2)}`;
+  }
+
+  function requestMetadata(item) {
+    const values = [
+      `输入 ${formatTokenCount(item.inputTokens)}`,
+      `输出 ${formatTokenCount(item.outputTokens)}`,
+    ];
+    if (Number(item.cacheReadTokens) > 0) values.push(`缓存 ${formatTokenCount(item.cacheReadTokens)}`);
+    if (Number(item.cacheCreationTokens) > 0) values.push(`写缓存 ${formatTokenCount(item.cacheCreationTokens)}`);
+    if (item.requestModel && item.model && item.requestModel !== item.model) values.push(`请求 ${item.requestModel}`);
+    return values;
+  }
+
   function positionPopover() {
     if (!state.popoverOpen || !state.popoverShadow) return;
     const anchor = state.popoverAnchor?.root?.isConnected
       ? state.popoverAnchor
       : { root: state.root, shadow: state.shadow };
-    const button = anchor.root?.__codexUsageRefreshButton;
+    const button = state.popoverMode === 'requests'
+      ? anchor.root?.__codexUsageHubButton
+      : anchor.root?.__codexUsageRefreshButton;
     const popover = state.popoverShadow.querySelector('.popover');
     if (!button || !popover) return;
     const buttonRect = button.getBoundingClientRect();
@@ -466,6 +615,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     const left = Math.max(8, Math.min(window.innerWidth - popoverRect.width - 8, buttonRect.left + buttonRect.width / 2 - popoverRect.width / 2));
     popover.style.left = `${Math.round(left)}px`;
     popover.style.bottom = `${Math.round(window.innerHeight - buttonRect.top + 10)}px`;
+    popover.style.maxHeight = `${Math.max(160, Math.floor(buttonRect.top - 18))}px`;
   }
 
   function hideUsageTooltip() {
@@ -529,7 +679,71 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     return svg;
   }
 
-  function bindUsageEvents(instance, usage, refreshButton) {
+  function createHubIcon() {
+    const namespace = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(namespace, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('aria-hidden', 'true');
+    for (const [x, y] of [[4, 4], [14, 4], [4, 14], [14, 14]]) {
+      const rect = document.createElementNS(namespace, 'rect');
+      rect.setAttribute('x', x);
+      rect.setAttribute('y', y);
+      rect.setAttribute('width', '6');
+      rect.setAttribute('height', '6');
+      rect.setAttribute('rx', '1.25');
+      svg.appendChild(rect);
+    }
+    return svg;
+  }
+
+  function publishPageAction(action) {
+    state.actionToken += 1;
+    const value = `${action}|${state.actionToken}|${Date.now()}`;
+    const bytes = new TextEncoder().encode(value);
+    let marker = '';
+    for (const byte of bytes) {
+      marker += byte.toString(2).padStart(8, '0').replaceAll('0', '\u200b').replaceAll('1', '\u200c');
+    }
+    const markerIndex = document.title.lastIndexOf(pageActionSentinel);
+    const baseTitle = markerIndex < 0 ? document.title : document.title.slice(0, markerIndex);
+    document.title = `${baseTitle}${pageActionSentinel}${marker}`;
+  }
+
+  function openHub() {
+    hideUsageTooltip();
+    state.popoverOpen = false;
+    state.popoverMode = '';
+    state.popoverShadow?.querySelector('.popover')?.classList.remove('open');
+    publishPageAction('open-hub');
+  }
+
+  function toggleRequestPopover(instance) {
+    hideUsageTooltip();
+    const samePopover = state.popoverOpen
+      && state.popoverMode === 'requests'
+      && state.popoverAnchor?.root === instance?.root;
+    if (instance?.root?.isConnected) state.popoverAnchor = instance;
+    state.popoverOpen = !samePopover;
+    state.popoverMode = state.popoverOpen ? 'requests' : '';
+    render(null, true);
+  }
+
+  function requestRefresh(instance, togglePopover = false) {
+    hideUsageTooltip();
+    state.refreshToken += 1;
+    state.refreshRequestedAt = Date.now();
+    publishPageAction('refresh');
+    state.loading = true;
+    if (instance?.root?.isConnected) state.popoverAnchor = instance;
+    if (togglePopover) {
+      const samePopover = state.popoverOpen && state.popoverMode === 'balance';
+      state.popoverOpen = !samePopover;
+      state.popoverMode = state.popoverOpen ? 'balance' : '';
+    }
+    render(null, togglePopover);
+  }
+
+  function bindUsageEvents(instance, usage, hubButton, refreshButton) {
     usage.addEventListener('pointerover', event => {
       const tooltipTarget = findUsageTooltipTarget(event.target);
       if (!tooltipTarget || !isUsageTooltipBoundaryCrossing(event.target, event.relatedTarget, findUsageTooltipTarget)) return;
@@ -549,6 +763,21 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       if (tooltipTarget) showUsageTooltip(instance, usage.getAttribute('aria-label') || '', tooltipTarget);
     });
     usage.addEventListener('focusout', hideUsageTooltip);
+    hubButton.addEventListener('pointerenter', () => {
+      if (state.tooltipTimer) clearTimeout(state.tooltipTimer);
+      state.tooltipTimer = setTimeout(() => {
+        state.tooltipTimer = 0;
+        showUsageTooltip(instance, '查看当前供应商最近请求', hubButton);
+      }, 700);
+    });
+    hubButton.addEventListener('pointerleave', hideUsageTooltip);
+    hubButton.addEventListener('focus', () => showUsageTooltip(instance, '查看当前供应商最近请求', hubButton));
+    hubButton.addEventListener('blur', hideUsageTooltip);
+    hubButton.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      toggleRequestPopover(instance);
+    });
     refreshButton.addEventListener('pointerenter', () => {
       if (state.tooltipTimer) clearTimeout(state.tooltipTimer);
       state.tooltipTimer = setTimeout(() => {
@@ -562,16 +791,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     refreshButton.addEventListener('click', event => {
       event.preventDefault();
       event.stopPropagation();
-      state.refreshToken += 1;
-      state.refreshRequestedAt = Date.now();
-      try {
-        window[refreshBinding]?.(JSON.stringify({ token: state.refreshToken, requestedAt: state.refreshRequestedAt }));
-      } catch {}
-      state.loading = true;
-      state.popoverAnchor = instance;
-      const shouldScheduleLayout = instance.root.dataset.mode === 'icon';
-      if (shouldScheduleLayout) state.popoverOpen = !state.popoverOpen;
-      render(null, shouldScheduleLayout);
+      requestRefresh(instance, instance.root.dataset.mode === 'icon');
     });
   }
 
@@ -580,28 +800,36 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     if (usage && usage.getRootNode() !== instance.shadow) usage = null;
     if (!usage) usage = instance.shadow.querySelector('.usage');
     if (usage) {
+      if (!usage.__codexUsageHubButton) usage.__codexUsageHubButton = usage.querySelector('.hub-trigger');
       if (!usage.__codexUsageRefreshButton) usage.__codexUsageRefreshButton = usage.querySelector('.refresh');
       instance.root.__codexUsageElement = usage;
+      instance.root.__codexUsageHubButton = usage.__codexUsageHubButton;
       instance.root.__codexUsageRefreshButton = usage.__codexUsageRefreshButton;
       return usage;
     }
     usage = document.createElement('div');
     usage.className = 'usage';
-    usage.tabIndex = 0;
     const dot = document.createElement('span');
     dot.className = 'status-dot';
     dot.setAttribute('aria-hidden', 'true');
+    const hubButton = document.createElement('button');
+    hubButton.className = 'toolbar-action hub-trigger';
+    hubButton.type = 'button';
+    hubButton.setAttribute('aria-label', '查看当前供应商最近请求');
+    hubButton.appendChild(createHubIcon());
     const refreshButton = document.createElement('button');
-    refreshButton.className = 'refresh';
+    refreshButton.className = 'toolbar-action refresh';
     refreshButton.type = 'button';
     refreshButton.setAttribute('aria-label', '刷新 CCSwitch 用量');
     refreshButton.appendChild(createRefreshIcon());
-    usage.append(dot, refreshButton);
+    usage.append(dot, hubButton, refreshButton);
+    usage.__codexUsageHubButton = hubButton;
     usage.__codexUsageRefreshButton = refreshButton;
     instance.root.__codexUsageElement = usage;
+    instance.root.__codexUsageHubButton = hubButton;
     instance.root.__codexUsageRefreshButton = refreshButton;
     instance.shadow.getElementById('content').replaceChildren(usage);
-    bindUsageEvents(instance, usage, refreshButton);
+    bindUsageEvents(instance, usage, hubButton, refreshButton);
     return usage;
   }
 
@@ -666,14 +894,15 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     updateElementAttribute(usage, 'data-balance-level', balanceLevel);
     updateElementAttribute(usage, 'aria-label', view.title);
     const refreshButton = usage.__codexUsageRefreshButton;
+    const hubButton = usage.__codexUsageHubButton;
     updateElementAttribute(refreshButton, 'data-loading', state.loading ? 'true' : null);
-    if (instance.root.__codexUsagePayload === payload) return;
+    if (instance.root.__codexUsageContentSignature === view.contentSignature) return;
     instance.root.__codexUsageMeasurements = null;
     for (const child of [...usage.children]) {
       if (child.dataset.usageDynamic === 'true') child.remove();
     }
-    for (const element of buildUsageElements(payload, balanceLevel)) usage.insertBefore(element, refreshButton);
-    instance.root.__codexUsagePayload = payload;
+    for (const element of buildUsageElements(payload, balanceLevel)) usage.insertBefore(element, hubButton);
+    instance.root.__codexUsageContentSignature = view.contentSignature;
   }
 
   function renderPopoverRows(portal, payload) {
@@ -695,6 +924,64 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     state.popoverPayload = payload;
   }
 
+  function renderRecentRequests(portal, payload) {
+    const ageMinute = Math.floor(Date.now() / 60_000);
+    if (state.recentRequestsPayload === payload && state.recentRequestsAgeMinute === ageMinute) return;
+    const list = portal.getElementById('recent-requests');
+    const requests = Array.isArray(payload.recentRequests) ? payload.recentRequests.slice(0, 10) : [];
+    if (requests.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'request-empty';
+      empty.textContent = '当前供应商还没有请求记录';
+      list.replaceChildren(empty);
+      state.recentRequestsPayload = payload;
+      state.recentRequestsAgeMinute = ageMinute;
+      return;
+    }
+
+    const rows = requests.map(item => {
+      const row = document.createElement('div');
+      row.className = 'request-item';
+      row.setAttribute('role', 'listitem');
+      const main = document.createElement('div');
+      main.className = 'request-main';
+      const model = document.createElement('span');
+      model.className = 'request-model';
+      model.textContent = item.model || item.requestModel || '未知模型';
+      if (item.requestModel && item.model && item.requestModel !== item.model) {
+        model.title = `请求 ${item.requestModel}，实际 ${item.model}`;
+      }
+      const age = document.createElement('span');
+      age.className = 'request-age';
+      age.textContent = formatUsageAge(item.createdAt);
+      main.append(model, age);
+
+      const metadata = document.createElement('div');
+      metadata.className = 'request-meta';
+      for (const value of requestMetadata(item)) {
+        const part = document.createElement('span');
+        part.textContent = value;
+        metadata.appendChild(part);
+      }
+      const statusCode = Number(item.statusCode) || 0;
+      if (statusCode < 200 || statusCode >= 300) {
+        const status = document.createElement('span');
+        status.className = 'request-error';
+        status.textContent = statusCode ? `HTTP ${statusCode}` : '请求失败';
+        metadata.appendChild(status);
+      }
+      const cost = document.createElement('span');
+      cost.className = 'request-cost';
+      cost.textContent = formatRequestCost(item.totalCostUsd);
+      metadata.appendChild(cost);
+      row.append(main, metadata);
+      return row;
+    });
+    list.replaceChildren(...rows);
+    state.recentRequestsPayload = payload;
+    state.recentRequestsAgeMinute = ageMinute;
+  }
+
   function render(footers = null, shouldScheduleLayout = true) {
     if (!state.shadow) return;
     const payload = state.payload || { status: 'loading', providerName: '' };
@@ -707,7 +994,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
           : null;
         balanceLevel = remainingPercent == null ? 'normal' : remainingPercent < 10 ? 'critical' : remainingPercent <= 20 ? 'warning' : 'normal';
       }
-      view = { payload, balanceLevel, freshness: '', title: '' };
+      view = { payload, balanceLevel, freshness: '', title: '', contentSignature: balancePayloadSignature(payload) };
       state.__codexUsageView = view;
     }
     view.freshness = getUsageFreshness(payload);
@@ -718,8 +1005,18 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     for (const mirror of state.mirrors) renderInstance(mirror, payload, view.balanceLevel);
     const portal = state.popoverShadow || (state.popoverOpen ? ensurePopoverPortal() : null);
     if (portal) {
-      portal.getElementById('popover').classList.toggle('open', state.popoverOpen);
+      const popover = portal.getElementById('popover');
+      const popoverMode = state.popoverMode || 'balance';
+      popover.classList.toggle('open', state.popoverOpen);
+      updateElementAttribute(popover, 'data-mode', popoverMode);
+      updateElementAttribute(popover, 'aria-label', popoverMode === 'requests' ? '当前供应商最近请求' : '完整额度');
+      portal.querySelector('.popover-head-title').textContent = popoverMode === 'requests'
+        ? `${payload.providerName || '当前供应商'} · 最近请求`
+        : '额度';
+      const popoverRefreshButton = portal.getElementById('popover-refresh');
+      updateElementAttribute(popoverRefreshButton, 'data-loading', state.loading ? 'true' : null);
       renderPopoverRows(portal, payload);
+      renderRecentRequests(portal, payload);
     }
     if (shouldScheduleLayout) scheduleLayout();
   }
@@ -731,7 +1028,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       current = current.parentElement;
       if (current.tagName === 'DIV' && getComputedStyle(current).display === 'flex') return current;
     }
-    return right.firstElementChild?.firstElementChild || right;
+    return null;
   }
 
   function setStyleIfChanged(style, property, value) {
@@ -745,15 +1042,15 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
 
   function placeInNativeFlow(root, right) {
     let flow = root.__codexUsageNativeFlow;
-    if (!isNativeFlowCacheValid(flow, root, right)) {
+    if (!isNativeFlowCacheValid(flow, root, right, getComputedStyle)) {
       const toolbar = findRightToolbar(right);
-      const toolbarParent = toolbar?.parentElement;
-      const lane = toolbarParent && right.contains(toolbarParent) && getComputedStyle(toolbarParent).display === 'flex'
-        ? toolbarParent
-        : right;
-      const candidateBefore = lane === toolbarParent ? toolbar : lane.firstElementChild;
-      const before = candidateBefore === root ? root.nextElementSibling : candidateBefore;
-      flow = { right, lane, before };
+      const { lane, before } = resolveNativeFlowPlacement(right, root, toolbar, getComputedStyle);
+      const signature = element => {
+        if (!element) return '';
+        const style = getComputedStyle(element);
+        return [style.display || '', style.flexGrow || '', style.flexShrink || ''].join(':');
+      };
+      flow = { right, lane, before, signature: `${signature(lane)}|${signature(lane?.parentElement)}` };
       root.__codexUsageNativeFlow = flow;
     }
     const { lane, before } = flow;
@@ -883,8 +1180,15 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
         { duration: 120, easing: 'cubic-bezier(.2,.8,.2,1)' },
       );
     }
-    if (mode !== 'icon' && state.popoverOpen && state.popoverAnchor?.root === root) {
+    const popoverAnchorUnavailable = state.popoverOpen
+      && state.popoverAnchor?.root === root
+      && (
+        (state.popoverMode === 'balance' && mode !== 'icon')
+        || (state.popoverMode === 'requests' && mode === 'icon')
+      );
+    if (popoverAnchorUnavailable) {
       state.popoverOpen = false;
+      state.popoverMode = '';
       state.popoverShadow?.querySelector('.popover')?.classList.remove('open');
     }
   }
@@ -971,6 +1275,10 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     if (!state.resizeObserver) state.resizeObserver = new ResizeObserver(entries => {
       const roots = [state.root, ...state.mirrors.map(mirror => mirror.root)].filter(Boolean);
       const rootChanged = hasMeaningfulRootResize(entries, roots);
+      const nativeFlowChanged = roots.some(root => {
+        const flow = root.__codexUsageNativeFlow;
+        return flow && !isNativeFlowCacheValid(flow, root, flow.right, getComputedStyle);
+      });
       const collapsed = entries.some(entry => (
         (entry.target === state.footer || entry.target === state.root || state.mirrors.some(mirror => entry.target === mirror.footer || entry.target === mirror.root))
         && (entry.contentRect.width <= 0 || entry.contentRect.height <= 0)
@@ -980,8 +1288,8 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
         if (recovered) scheduleLayout();
         return;
       }
-      if (!rootChanged) return;
-      if (roots.some(rootResizeNeedsLayout)) scheduleLayout();
+      if (!rootChanged && !nativeFlowChanged) return;
+      if (nativeFlowChanged || roots.some(rootResizeNeedsLayout)) scheduleLayout();
     });
     state.resizeObservedElements = uniqueElements;
     seedRootResizeSizes(roots);
@@ -1035,9 +1343,15 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
   }
 
   state.update = payload => {
+    const balanceChanged = balancePayloadSignature(state.payload) !== balancePayloadSignature(payload);
     state.payload = payload;
     state.loading = false;
-    mount();
+    if (state.footer?.isConnected && state.root?.isConnected) {
+      render(null, balanceChanged);
+      if (state.popoverOpen && !balanceChanged) positionPopover();
+    } else {
+      mount();
+    }
     return true;
   };
   state.mount = mount;
@@ -1045,6 +1359,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
   state.getRefreshRequest = () => ({ token: state.refreshToken, requestedAt: state.refreshRequestedAt });
   state.setPopoverOpen = open => {
     state.popoverOpen = Boolean(open);
+    state.popoverMode = state.popoverOpen ? (state.popoverMode || 'balance') : '';
     if (!state.popoverAnchor) state.popoverAnchor = { root: state.root, shadow: state.shadow };
     render();
     return state.popoverOpen;
@@ -1066,11 +1381,13 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     const insideUsage = path.includes(state.root) || state.mirrors.some(mirror => path.includes(mirror.root));
     if (!state.popoverOpen || insideUsage || path.includes(state.popoverRoot)) return;
     state.popoverOpen = false;
+    state.popoverMode = '';
     render();
   }, { capture: true, signal: state.eventController.signal });
   document.addEventListener('keydown', event => {
     if (event.key !== 'Escape' || !state.popoverOpen) return;
     state.popoverOpen = false;
+    state.popoverMode = '';
     render();
   }, { signal: state.eventController.signal });
   document.fonts?.addEventListener?.('loadingdone', invalidateResponsiveMeasurements, { signal: state.eventController.signal });
@@ -1087,12 +1404,11 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     if (document.visibilityState === 'visible') recoverOnActivation();
   }, { signal: state.eventController.signal });
   window[GLOBAL] = state;
-  mount();
-  return true;
+  return mount();
 }
 
 export function buildInjectorScript() {
-  return `(${installCodexUsageExtension.toString()})(${findUsageTooltipTarget.toString()},${isUsageTooltipBoundaryCrossing.toString()},${getUsageFreshness.toString()},${formatUsageAge.toString()},${selectResponsiveUsageMode.toString()},${calculateResponsiveMeasurements.toString()},${stabilizeResponsiveUsageMode.toString()},${findMutationObserverTarget.toString()},${classifyComposerMutations.toString()},${createInjectorEventController.toString()},${updateElementAttribute.toString()},${isNativeFlowCacheValid.toString()},${JSON.stringify(REFRESH_BINDING)},${INJECTOR_VERSION})`;
+  return `(${installCodexUsageExtension.toString()})(${findUsageTooltipTarget.toString()},${isUsageTooltipBoundaryCrossing.toString()},${getUsageFreshness.toString()},${formatUsageAge.toString()},${selectResponsiveUsageMode.toString()},${calculateResponsiveMeasurements.toString()},${stabilizeResponsiveUsageMode.toString()},${findMutationObserverTarget.toString()},${classifyComposerMutations.toString()},${createInjectorEventController.toString()},${updateElementAttribute.toString()},${isComposerFooterCandidate.toString()},${isNativeFlowCacheValid.toString()},${resolveNativeFlowPlacement.toString()},${JSON.stringify(PAGE_ACTION_SENTINEL)},${INJECTOR_VERSION})`;
 }
 
 export const UPDATE_GLOBAL = '__CODEX_CCSWITCH_USAGE__';
