@@ -9,6 +9,33 @@ test('browser callback JSON parsing rejects WAF HTML and oversized responses', (
   assert.equal(parseBrowserJson('x'.repeat(2_000_001)), null);
 });
 
+test('provider HTTP parsing stops an oversized stream instead of buffering the full response', async () => {
+  const chunks = [new Uint8Array(1_100_000), new Uint8Array(1_100_000), new Uint8Array(1_100_000)];
+  let reads = 0;
+  let cancelled = false;
+  const response = {
+    status: 200,
+    headers: { get: () => null },
+    body: {
+      getReader() {
+        return {
+          async read() {
+            const value = chunks[reads];
+            reads += 1;
+            return value ? { done: false, value } : { done: true, value: undefined };
+          },
+          async cancel() { cancelled = true; },
+          releaseLock() {},
+        };
+      },
+    },
+  };
+
+  await assert.rejects(fetchJson(async () => response, 'https://offline.invalid', {}, 1_000, 1), /响应过大/);
+  assert.equal(reads, 2);
+  assert.equal(cancelled, true);
+});
+
 test('Hub provider routing recognizes the current CCSwitch Codex provider families', () => {
   assert.equal(providerKind({ name: 'any的国外我自己的' }), 'anyrouter');
   assert.equal(providerKind({ name: 'agentrouter' }), 'agentrouter');
@@ -533,6 +560,7 @@ test('only a valid WHAM quota payload can produce OpenAI usage', async () => {
 
 test('provider HTTP retries share one total deadline instead of resetting it per attempt', async () => {
   const attemptDurations = [];
+  const totalTimeoutMs = 300;
   const startedAt = Date.now();
   await assert.rejects(fetchJson(async (_url, options) => {
     const attemptStartedAt = Date.now();
@@ -544,11 +572,11 @@ test('provider HTTP retries share one total deadline instead of resetting it per
       if (options.signal.aborted) abort();
       else options.signal.addEventListener('abort', abort, { once: true });
     });
-  }, 'https://example.invalid/balance', {}, 60, 2, null, 1));
+  }, 'https://example.invalid/balance', {}, totalTimeoutMs, 2, null, 1));
 
   assert.equal(attemptDurations.length, 2);
-  assert.ok(attemptDurations.every(duration => duration < 50), `attempts must split the total deadline: ${attemptDurations}`);
-  assert.ok(Date.now() - startedAt < 110, 'the two attempts must not each receive the full deadline');
+  assert.ok(attemptDurations.every(duration => duration < 250), `attempts must split the total deadline: ${attemptDurations}`);
+  assert.ok(Date.now() - startedAt < 450, 'the two attempts must not each receive the full deadline');
 });
 
 test('provider queries enforce one global deadline even when a transport ignores abort', async () => {

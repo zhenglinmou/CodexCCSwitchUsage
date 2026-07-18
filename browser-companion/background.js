@@ -2,7 +2,9 @@ import {
   browserJobTimeout,
   browserSessionOutcome,
   browserSessionUserId,
+  MAX_BROWSER_RESPONSE_BYTES,
   normalizeSessionOrigins,
+  readLimitedResponseText,
   selectReadySessionTab,
   SESSION_ORIGINS,
   SessionHintStore,
@@ -160,11 +162,51 @@ async function fetchInsideTab(tabId, request, timeoutMs) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     world: 'ISOLATED',
-    args: [{ targetUrl, headers: request.headers || {}, userHeader: request.userHeader || '', timeoutMs }],
+    args: [{ targetUrl, headers: request.headers || {}, userHeader: request.userHeader || '', timeoutMs, maximumBytes: MAX_BROWSER_RESPONSE_BYTES }],
     func: async settings => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), settings.timeoutMs);
       let identityFound = false;
+      const readText = async response => {
+        const contentLength = Number(response.headers?.get?.('content-length'));
+        if (Number.isFinite(contentLength) && contentLength > settings.maximumBytes) throw new Error('第三方网站响应过大');
+        if (!response.body || typeof response.body.getReader !== 'function') {
+          const text = await response.text();
+          if (new TextEncoder().encode(text).byteLength > settings.maximumBytes) throw new Error('第三方网站响应过大');
+          return text;
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        const chunks = [];
+        let receivedBytes = 0;
+        let cancelled = false;
+        const cancel = reason => {
+          if (cancelled) return;
+          cancelled = true;
+          try { reader.cancel(reason)?.catch?.(() => {}); } catch {}
+        };
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+            receivedBytes += bytes.byteLength;
+            if (receivedBytes > settings.maximumBytes) {
+              const error = new Error('第三方网站响应过大');
+              cancel(error);
+              throw error;
+            }
+            chunks.push(decoder.decode(bytes, { stream: true }));
+          }
+          chunks.push(decoder.decode());
+          return chunks.join('');
+        } catch (error) {
+          cancel(error);
+          throw error;
+        } finally {
+          try { reader.releaseLock(); } catch {}
+        }
+      };
       try {
         const outgoing = { Accept: 'application/json', ...settings.headers };
         if (settings.userHeader && !outgoing[settings.userHeader]) {
@@ -185,7 +227,7 @@ async function fetchInsideTab(tabId, request, timeoutMs) {
         return {
           status: response.status,
           url: response.url,
-          text: (await response.text()).slice(0, 2_000_000),
+          text: await readText(response),
           identityFound,
         };
       } catch (error) {
@@ -219,7 +261,7 @@ async function fetchFromExtension(request, userId, timeoutMs) {
     return {
       status: response.status,
       url: response.url,
-      text: (await response.text()).slice(0, 2_000_000),
+      text: await readLimitedResponseText(response),
     };
   };
   try {

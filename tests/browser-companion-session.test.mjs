@@ -6,6 +6,7 @@ import {
   browserSessionOutcome,
   browserSessionUserId,
   normalizeSessionOrigins,
+  readLimitedResponseText,
   selectReadySessionTab,
   SessionHintStore,
   SessionIdentityStore,
@@ -251,7 +252,43 @@ test('browser companion bounds a whole provider job and the in-page fetch', () =
   assert.match(source, /await withTimeout\(executeJob\(job, deadline\), timeoutMs \+ 1_000/);
   assert.match(source, /const controller = new AbortController\(\);/);
   assert.match(source, /signal: controller\.signal/);
+  assert.match(source, /maximumBytes: MAX_BROWSER_RESPONSE_BYTES/);
+  assert.match(source, /text: await readText\(response\)/);
+  assert.match(source, /text: await readLimitedResponseText\(response\)/);
+  assert.doesNotMatch(source, /response\.text\(\)\)\.slice\(0, 2_000_000\)/);
   assert.match(source, /scheduleHeartbeat\(\);/);
+});
+
+test('browser response reading rejects early and cancels an oversized byte stream', async () => {
+  let textRead = false;
+  await assert.rejects(readLimitedResponseText({
+    headers: { get: name => name === 'content-length' ? '2000001' : null },
+    async text() { textRead = true; return 'never'; },
+  }), /响应过大/);
+  assert.equal(textRead, false);
+
+  const chunks = [new Uint8Array(700_000), new Uint8Array(700_000), new Uint8Array(700_000)];
+  let reads = 0;
+  let cancelled = false;
+  const response = {
+    headers: { get: () => null },
+    body: {
+      getReader() {
+        return {
+          async read() {
+            const value = chunks[reads];
+            reads += 1;
+            return value ? { done: false, value } : { done: true, value: undefined };
+          },
+          async cancel() { cancelled = true; },
+          releaseLock() {},
+        };
+      },
+    },
+  };
+  await assert.rejects(readLimitedResponseText(response, 1_000_000), /响应过大/);
+  assert.equal(reads, 2);
+  assert.equal(cancelled, true);
 });
 
 test('browser companion bounds loopback traffic and reserves time for tab fallback', () => {

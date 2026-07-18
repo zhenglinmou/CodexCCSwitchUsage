@@ -1,4 +1,51 @@
+import { Buffer } from 'node:buffer';
 import { createUsageEvaluator } from './evaluator.mjs';
+
+export const MAX_USAGE_RESPONSE_BYTES = 2_000_000;
+
+export async function readResponseTextLimited(response, maximumBytes = MAX_USAGE_RESPONSE_BYTES) {
+  const limit = Math.max(1, Math.trunc(Number(maximumBytes) || MAX_USAGE_RESPONSE_BYTES));
+  const contentLength = Number(response?.headers?.get?.('content-length'));
+  if (Number.isFinite(contentLength) && contentLength > limit) throw new Error('额度接口响应过大');
+
+  if (!response?.body || typeof response.body.getReader !== 'function') {
+    const text = await response.text();
+    if (Buffer.byteLength(text, 'utf8') > limit) throw new Error('额度接口响应过大');
+    return text;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks = [];
+  let receivedBytes = 0;
+  let cancelled = false;
+  const cancel = reason => {
+    if (cancelled) return;
+    cancelled = true;
+    try { reader.cancel(reason)?.catch?.(() => {}); } catch {}
+  };
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+      receivedBytes += bytes.byteLength;
+      if (receivedBytes > limit) {
+        const error = new Error('额度接口响应过大');
+        cancel(error);
+        throw error;
+      }
+      chunks.push(decoder.decode(bytes, { stream: true }));
+    }
+    chunks.push(decoder.decode());
+    return chunks.join('');
+  } catch (error) {
+    cancel(error);
+    throw error;
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+}
 
 function replacePlaceholders(value, variables) {
   if (typeof value === 'string') {
@@ -82,8 +129,7 @@ export async function queryUsage(provider, options = {}) {
         redirect: 'follow',
       });
       if (!response.ok) throw new Error(`额度接口返回 HTTP ${response.status}`);
-      const text = await response.text();
-      if (text.length > 2_000_000) throw new Error('额度接口响应过大');
+      const text = await readResponseTextLimited(response);
       let payload;
       try {
         payload = JSON.parse(text);

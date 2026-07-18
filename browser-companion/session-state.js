@@ -7,6 +7,51 @@ export const SESSION_ORIGINS = Object.freeze([
 const SESSION_ORIGIN_SET = new Set(SESSION_ORIGINS);
 const DEFAULT_STORAGE_KEY = 'validatedSessionOrigins';
 const DEFAULT_IDENTITY_STORAGE_KEY = 'sessionUserIds';
+export const MAX_BROWSER_RESPONSE_BYTES = 2_000_000;
+
+export async function readLimitedResponseText(response, maximumBytes = MAX_BROWSER_RESPONSE_BYTES) {
+  const limit = Math.max(1, Math.trunc(Number(maximumBytes) || MAX_BROWSER_RESPONSE_BYTES));
+  const contentLength = Number(response?.headers?.get?.('content-length'));
+  if (Number.isFinite(contentLength) && contentLength > limit) throw new Error('第三方网站响应过大');
+
+  if (!response?.body || typeof response.body.getReader !== 'function') {
+    const text = await response.text();
+    if (new TextEncoder().encode(text).byteLength > limit) throw new Error('第三方网站响应过大');
+    return text;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks = [];
+  let receivedBytes = 0;
+  let cancelled = false;
+  const cancel = reason => {
+    if (cancelled) return;
+    cancelled = true;
+    try { reader.cancel(reason)?.catch?.(() => {}); } catch {}
+  };
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+      receivedBytes += bytes.byteLength;
+      if (receivedBytes > limit) {
+        const error = new Error('第三方网站响应过大');
+        cancel(error);
+        throw error;
+      }
+      chunks.push(decoder.decode(bytes, { stream: true }));
+    }
+    chunks.push(decoder.decode());
+    return chunks.join('');
+  } catch (error) {
+    cancel(error);
+    throw error;
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+}
 
 function normalizeSessionOrigin(value) {
   try {

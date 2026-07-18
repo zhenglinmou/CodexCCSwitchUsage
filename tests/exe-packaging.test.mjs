@@ -1,8 +1,27 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 
 const read = relative => fs.readFileSync(new URL(`../${relative}`, import.meta.url), 'utf8');
+
+function collectRelativeModuleGraph(entry) {
+  const visited = new Set();
+  const visit = relative => {
+    if (visited.has(relative)) return;
+    visited.add(relative);
+    const source = read(relative);
+    const specifiers = [
+      ...[...source.matchAll(/\bfrom\s*['"](\.[^'"]+)['"]/g)].map(match => match[1]),
+      ...[...source.matchAll(/\bimport\s*['"](\.[^'"]+)['"]/g)].map(match => match[1]),
+    ];
+    for (const specifier of specifiers) {
+      visit(path.posix.normalize(path.posix.join(path.posix.dirname(relative), specifier)));
+    }
+  };
+  visit(entry);
+  return [...visited].sort();
+}
 
 test('EXE launcher preserves the PowerShell flow and starts the host detached', () => {
   const source = read('packaging/launcher/Program.cs');
@@ -66,7 +85,7 @@ test('repeatable EXE build embeds the current Node runtime and emits a versioned
     assert.match(build, new RegExp(`'src\\\\${file}\\.mjs'`));
     assert.match(install, new RegExp(`'src\\\\${file}\\.mjs'`));
   }
-  for (const file of ['manifest.json', 'background.js', 'session-state.js', 'popup.html', 'popup.js', 'README.md']) {
+  for (const file of ['manifest.json', 'background.js', 'session-state.js', 'anyrouter-waf.js', 'popup.html', 'popup.js', 'README.md']) {
     const escaped = file.replaceAll('.', '\\.');
     assert.match(build, new RegExp(`'browser-companion\\\\${escaped}'`));
     assert.match(install, new RegExp(`'browser-companion\\\\${escaped}'`));
@@ -84,6 +103,21 @@ test('repeatable EXE build embeds the current Node runtime and emits a versioned
   assert.doesNotMatch(read('packaging/launcher/Program.cs'), /AssemblyFileVersion\("1\.0\.0\.0"\)/);
   assert.match(build, /ISCC\.exe/);
   assert.match(build, /CodexCCSwitchUsage-Setup-\$version\.exe/);
+});
+
+test('every transitive browser companion module is included in each packaging manifest', () => {
+  const build = read('scripts/build-exe.ps1');
+  const install = read('scripts/install.ps1');
+  const modules = [...new Set([
+    ...collectRelativeModuleGraph('browser-companion/background.js'),
+    ...collectRelativeModuleGraph('browser-companion/popup.js'),
+  ])].sort();
+
+  for (const module of modules) {
+    const packagedPath = module.replaceAll('/', '\\');
+    assert.equal(build.includes(`'${packagedPath}'`), true, `${module} is missing from the EXE payload`);
+    assert.equal(install.includes(`'${packagedPath}'`), true, `${module} is missing from the source installer payload`);
+  }
 });
 
 test('one-time profile migration is not shipped', () => {

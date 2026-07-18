@@ -24,6 +24,7 @@ $files = @(
     'scripts\install.ps1', 'scripts\launch.ps1', 'scripts\stop.ps1', 'scripts\check-current.mjs',
     'scripts\status.ps1', 'scripts\uninstall.ps1',
     'browser-companion\manifest.json', 'browser-companion\background.js', 'browser-companion\session-state.js',
+    'browser-companion\anyrouter-waf.js',
     'browser-companion\popup.html', 'browser-companion\popup.js', 'browser-companion\README.md'
 )
 foreach ($relative in $files) {

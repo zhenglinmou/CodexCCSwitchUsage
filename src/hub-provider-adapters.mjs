@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { normalizeUsage } from './usage-client.mjs';
+import { normalizeUsage, readResponseTextLimited } from './usage-client.mjs';
 
 const WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage';
 const QUOTA_PER_USD = 500_000;
@@ -95,8 +95,7 @@ function usageResult(provider, values) {
 }
 
 async function readJsonResponse(response) {
-  const text = await response.text();
-  if (text.length > 2_000_000) throw new Error('额度接口响应过大');
+  const text = await readResponseTextLimited(response);
   const payload = parseBrowserJson(text);
   return { status: response.status, payload, text };
 }

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { hubItemToUsagePayload, HubService } from '../src/hub-service.mjs';
+import { hubItemToUsagePayload, HubService, safeHubMessage, sanitizeHubUsage } from '../src/hub-service.mjs';
 
 function provider(id, name, current = false) {
   return { id, name, websiteUrl: 'https://example.com', isCurrent: current, usage: null, auth: {}, apiKey: '', apiBaseUrl: '', baseUrl: '' };
@@ -223,6 +223,38 @@ test('Hub errors redact bearer tokens and preserve the last successful usage', a
   assert.equal(state.usage.remaining, 8);
   assert.doesNotMatch(state.message, /secret-value/);
   assert.match(state.message, /\[redacted\]/);
+});
+
+test('Hub message sanitization is bounded, linear, and covers common credential labels', () => {
+  const secret = 'pk_live_OFFLINE_TEST_1234567890';
+  const jwt = `${'a'.repeat(18)}.${'b'.repeat(18)}.${'c'.repeat(18)}`;
+  const messages = [
+    `api_key=${secret}`,
+    `OPENAI_API_KEY: ${secret}`,
+    `X-Api-Key=${secret}`,
+    `access_token=${secret}`,
+    `token=${secret}`,
+    `Authorization: Bearer ${secret}`,
+    `standalone ${jwt}`,
+  ];
+
+  for (const message of messages) {
+    const sanitized = safeHubMessage(message);
+    assert.doesNotMatch(sanitized, new RegExp(secret));
+    assert.doesNotMatch(sanitized, new RegExp(jwt.replaceAll('.', '\\.')));
+    assert.match(sanitized, /\[redacted(?:-jwt)?\]/);
+  }
+
+  const bounded = safeHubMessage('x'.repeat(320_000));
+  assert.ok(bounded.length < 8_250);
+  assert.match(bounded, /\[truncated\]$/);
+
+  const usage = sanitizeHubUsage({
+    status: 'ok', providerName: 'Offline', extra: `api_key=${secret}`,
+    used: 1, remaining: 2, total: 3, unit: 'USD',
+  });
+  assert.doesNotMatch(usage.extra, new RegExp(secret));
+  assert.match(usage.extra, /\[redacted\]/);
 });
 
 test('Hub restores cached browser failures as degraded usage instead of stale login state', t => {

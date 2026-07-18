@@ -1,13 +1,61 @@
 import fs from 'node:fs';
 import { describeProviderQuery, loginConfiguration, providerAliases, providerKind } from './hub-provider-adapters.mjs';
 
+const MAX_SAFE_MESSAGE_CHARS = 8_192;
+const LABELED_CREDENTIAL_PATTERN = /(["']?)(openai[_-]api[_-]key|api[_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|cookie|authorization|secret)\1(\s*[=:]\s*)(?:Bearer\s+)?(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\]]+)/gi;
+
+function isJwtRunCharacter(character) {
+  const code = character.charCodeAt(0);
+  return (code >= 48 && code <= 57)
+    || (code >= 65 && code <= 90)
+    || (code >= 97 && code <= 122)
+    || character === '_'
+    || character === '-'
+    || character === '.';
+}
+
+function redactJwtLikeTokens(value) {
+  const chunks = [];
+  let index = 0;
+  while (index < value.length) {
+    if (!isJwtRunCharacter(value[index])) {
+      chunks.push(value[index]);
+      index += 1;
+      continue;
+    }
+    let end = index + 1;
+    while (end < value.length && isJwtRunCharacter(value[end])) end += 1;
+    const parts = value.slice(index, end).split('.');
+    const redacted = [];
+    for (let part = 0; part < parts.length;) {
+      if (
+        part + 2 < parts.length
+        && parts[part].length >= 18
+        && parts[part + 1].length >= 18
+        && parts[part + 2].length >= 18
+      ) {
+        redacted.push('[redacted-jwt]');
+        part += 3;
+      } else {
+        redacted.push(parts[part]);
+        part += 1;
+      }
+    }
+    chunks.push(redacted.join('.'));
+    index = end;
+  }
+  return chunks.join('');
+}
+
 function safeMessage(error) {
-  const message = error instanceof Error ? error.message : String(error || '未知错误');
-  return message
-    .replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
-    .replace(/sk-[A-Za-z0-9_-]+/g, '[redacted]')
-    .replace(/[A-Za-z0-9_-]{18,}\.[A-Za-z0-9_-]{18,}\.[A-Za-z0-9_-]{18,}/g, '[redacted-jwt]')
-    .replace(/(?:access[_-]?token|cookie|authorization)\s*[=:]\s*[^\s,;]+/gi, '$1=[redacted]');
+  const rawMessage = error instanceof Error ? error.message : String(error || '未知错误');
+  const truncated = rawMessage.length > MAX_SAFE_MESSAGE_CHARS;
+  const message = rawMessage.slice(0, MAX_SAFE_MESSAGE_CHARS)
+    .replace(LABELED_CREDENTIAL_PATTERN, '$1$2$1$3[redacted]')
+    .replace(/Bearer\s+[^\s,;]+/gi, 'Bearer [redacted]')
+    .replace(/sk-[A-Za-z0-9_-]+/g, '[redacted]');
+  const redacted = redactJwtLikeTokens(message);
+  return truncated ? `${redacted}… [truncated]` : redacted;
 }
 
 function safeWebsiteUrl(value) {

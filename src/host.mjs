@@ -6,7 +6,7 @@ import { hasAuxiliaryPageTargets, isCodexTargetCandidate, listCdpTargets } from 
 import { ProviderRepository } from './provider-repository.mjs';
 import { HubServer } from './hub-server.mjs';
 import { ProviderQueryEngine } from './hub-provider-adapters.mjs';
-import { hubItemToUsagePayload, HubService } from './hub-service.mjs';
+import { hubItemToUsagePayload, HubService, safeHubMessage } from './hub-service.mjs';
 import { buildInjectorScript, INJECTOR_VERSION, UPDATE_GLOBAL } from './injector-script.mjs';
 import { KeyedBackoff } from './keyed-backoff.mjs';
 import { decodePageActionMarker } from './page-action-channel.mjs';
@@ -146,8 +146,7 @@ function writeStatus(extra = {}) {
 }
 
 function safeMessage(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]').replace(/sk-[A-Za-z0-9_-]+/g, '[redacted]');
+  return safeHubMessage(error);
 }
 
 function providerRefreshSignature(provider) {
