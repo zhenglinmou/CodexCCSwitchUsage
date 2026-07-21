@@ -1,5 +1,6 @@
 import {
   browserJobTimeout,
+  companionPollFailurePolicy,
   browserSessionOutcome,
   browserSessionUserId,
   MAX_BROWSER_RESPONSE_BYTES,
@@ -15,13 +16,17 @@ import {
   isAnyRouterAcwUrl,
   withAnyRouterAcwRetry,
 } from './anyrouter-waf.js';
+import {
+  assertHostJobCompatibility,
+  BROWSER_TAB_FALLBACK_RESERVE_MS,
+  companionHandshake,
+} from './protocol.js';
 
 const HUB_ORIGIN = 'http://127.0.0.1:17891';
 const POLL_ALARM = 'ccswitch-balance-companion-poll';
 const HEARTBEAT_DEBOUNCE_MS = 350;
 const HUB_REQUEST_TIMEOUT_MS = 10_000;
 const HUB_POLL_TIMEOUT_MS = 30_000;
-const TAB_FALLBACK_RESERVE_MS = 5_000;
 const POLL_BATCH_SIZE = 120;
 const manifest = chrome.runtime.getManifest();
 const sessionHints = new SessionHintStore(chrome.storage.local);
@@ -124,7 +129,7 @@ async function post(token, path, body) {
     body: JSON.stringify(body),
     cache: 'no-store',
   });
-  if (!response.ok) throw new Error(`Balance Hub callback returned HTTP ${response.status}`);
+  if (!response.ok) throw new Error(String(payload?.message || `Balance Hub callback returned HTTP ${response.status}`));
   return payload;
 }
 
@@ -136,6 +141,7 @@ async function performHeartbeat(current) {
     instanceId,
     browser: browserName(),
     version: manifest.version,
+    ...companionHandshake(),
     sessions: await knownSessions(),
   };
   const result = await post(resolved.token, '/companion/heartbeat', payload);
@@ -323,7 +329,7 @@ async function focusLoginPage(request) {
 async function queryThroughCurrentBrowser(request, deadline) {
   const origin = new URL(request.baseUrl).origin;
   const userId = await sessionIdentities.get(origin);
-  const direct = await fetchFromExtension(request, userId, remainingJobTime(deadline, TAB_FALLBACK_RESERVE_MS));
+  const direct = await fetchFromExtension(request, userId, remainingJobTime(deadline, BROWSER_TAB_FALLBACK_RESERVE_MS));
   const directOutcome = browserSessionOutcome(request, direct);
   if (isJsonText(direct.text) && (!request.userHeader || directOutcome === 'valid')) return direct;
 
@@ -352,16 +358,25 @@ async function executeJob(job, deadline) {
 
 async function pollOnce(current) {
   if (!current.token) return false;
-  const query = new URLSearchParams({ clientId: current.clientId, instanceId, browser: browserName(), version: manifest.version });
+  const handshake = companionHandshake();
+  const query = new URLSearchParams({
+    clientId: current.clientId,
+    instanceId,
+    browser: browserName(),
+    version: manifest.version,
+    protocolVersion: String(handshake.protocolVersion),
+  });
+  for (const capability of handshake.capabilities) query.append('capability', capability);
   const { response, payload } = await requestHub(
     apiUrl(current.token, `/companion/job?${query}`),
     { cache: 'no-store' },
     HUB_POLL_TIMEOUT_MS,
   );
   if (response.status === 204) return true;
-  if (!response.ok) throw new Error(`Balance Hub job poll returned HTTP ${response.status}`);
+  if (!response.ok) throw new Error(String(payload?.message || `Balance Hub job poll returned HTTP ${response.status}`));
   const job = payload.job;
-  const timeoutMs = browserJobTimeout(job.request);
+  assertHostJobCompatibility(job);
+  const timeoutMs = browserJobTimeout(job);
   const deadline = Date.now() + timeoutMs;
   try {
     const value = await withTimeout(executeJob(job, deadline), timeoutMs + 1_000, '第三方网站余额查询超时');
@@ -394,6 +409,7 @@ async function startPolling(initialConfig = null, sessionsAnnounced = false) {
   let nextConfig = initialConfig;
   let announceSessions = !sessionsAnnounced;
   let continuePolling = false;
+  let consecutiveFailures = 0;
   try {
     for (let iteration = 0; iteration < POLL_BATCH_SIZE; iteration += 1) {
       const current = nextConfig || await config();
@@ -406,10 +422,14 @@ async function startPolling(initialConfig = null, sessionsAnnounced = false) {
         }
         await pollOnce(current);
         await updateStatus({ lastError: '' });
+        consecutiveFailures = 0;
       } catch (error) {
         announceSessions = true;
+        consecutiveFailures += 1;
         await updateStatus({ lastError: error instanceof Error ? error.message : String(error) });
-        await delay(2_000);
+        const policy = companionPollFailurePolicy(consecutiveFailures);
+        if (policy.stop) return;
+        await delay(policy.delayMs);
       }
     }
     continuePolling = true;

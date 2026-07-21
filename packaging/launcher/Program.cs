@@ -84,7 +84,8 @@ internal static class Program
             "-ExecutionPolicy", "Bypass",
             "-WindowStyle", "Hidden",
             "-File", script,
-            "-InstallRoot", root
+            "-InstallRoot", root,
+            "-AllowCodexRestart"
         });
         startInfo.WorkingDirectory = root;
         startInfo.UseShellExecute = false;

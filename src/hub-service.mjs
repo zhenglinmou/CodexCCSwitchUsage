@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { describeProviderQuery, loginConfiguration, providerAliases, providerKind } from './hub-provider-adapters.mjs';
 
 const MAX_SAFE_MESSAGE_CHARS = 8_192;
@@ -72,12 +73,27 @@ function safeWebsiteUrl(value) {
   }
 }
 
+export function providerConfigurationFingerprint(provider) {
+  if (!provider) return '';
+  const material = JSON.stringify([
+    provider.id,
+    provider.name,
+    provider.websiteUrl,
+    provider.apiKey,
+    provider.apiBaseUrl,
+    provider.baseUrl,
+    provider.auth,
+    provider.usage,
+  ]);
+  return crypto.createHash('sha256').update(material).digest('base64url');
+}
+
 function safeUsage(payload) {
   if (!payload || payload.status !== 'ok') return null;
   const numberOrNull = value => value == null || value === '' || !Number.isFinite(Number(value)) ? null : Number(value);
   return {
     providerName: String(payload.providerName || ''),
-    extra: safeMessage(payload.extra || ''),
+    extra: payload.extra ? safeMessage(payload.extra) : '',
     periodLabel: String(payload.periodLabel || ''),
     hideTotal: payload.hideTotal === true,
     refreshIntervalMinutes: Math.max(1, Number(payload.refreshIntervalMinutes) || 5),
@@ -163,7 +179,12 @@ export class HubService {
       this.providers.set(provider.id, provider);
       const loginConfig = loginConfiguration(provider);
       const livePrevious = this.items.get(provider.id);
-      const previous = livePrevious || this.cachedItems[provider.id] || {};
+      const savedPrevious = livePrevious || this.cachedItems[provider.id] || {};
+      const providerFingerprint = providerConfigurationFingerprint(provider);
+      const hasSavedState = Boolean(savedPrevious.id || savedPrevious.usage || savedPrevious.status);
+      const configurationChanged = hasSavedState
+        && String(savedPrevious.providerFingerprint || '') !== providerFingerprint;
+      const previous = configurationChanged ? {} : savedPrevious;
       const obsoleteSource = ['legacy_bridge', 'usage_script', 'ccswitch_cookie'].includes(String(previous.source || ''))
         || (Boolean(loginConfig?.userHeader) && previous.source === 'api_key_probe');
       const staleBrowserFailure = !livePrevious
@@ -182,13 +203,18 @@ export class HubService {
         !websiteLoginRequired
         && (previous.sessionSyncRequired || (restoredBrowserFailure && loginConfig?.userHeader))
       );
+      const lastSuccessAt = String(previous.lastSuccessAt || previous.usage?.updatedAt || (previous.usage ? previous.updatedAt : '') || '');
+      const lastAttemptAt = String(previous.lastAttemptAt || previous.updatedAt || '');
       this.items.set(provider.id, {
         id: provider.id,
+        providerFingerprint,
         name: provider.name,
         websiteUrl: safeWebsiteUrl(provider.websiteUrl),
         current: provider.isCurrent,
-        status: previous.status === 'loading' || obsoleteSource ? 'idle' : (staleBrowserFailure ? 'degraded' : (previous.status || 'idle')),
-        message: obsoleteSource
+        status: configurationChanged || previous.status === 'loading' || obsoleteSource ? 'idle' : (staleBrowserFailure ? 'degraded' : (previous.status || 'idle')),
+        message: configurationChanged
+          ? '供应商配置已变更，等待重新查询'
+          : obsoleteSource
           ? '等待 v2 独立余额中心重新查询'
           : restoredBrowserFailure
             ? (websiteLoginRequired
@@ -197,7 +223,7 @@ export class HubService {
               ? '显示上次成功余额；请点击“同步现有会话”一次'
               : '显示上次成功余额；请手动重新登录后刷新')
             : String(previous.message || ''),
-        source: obsoleteSource ? 'cached_previous' : String(previous.source || ''),
+        source: configurationChanged ? '' : (obsoleteSource ? 'cached_previous' : String(previous.source || '')),
         loginSupported: Boolean(loginConfig),
         loginUrl: safeWebsiteUrl(loginConfig?.loginUrl),
         sessionSyncSupported: Boolean(loginConfig?.userHeader),
@@ -205,7 +231,9 @@ export class HubService {
         websiteLoginRequired,
         queryMethod: describeProviderQuery(provider),
         usage: previous.usage || null,
-        updatedAt: String(previous.updatedAt || ''),
+        updatedAt: lastSuccessAt,
+        lastSuccessAt,
+        lastAttemptAt,
         queryDurationMs: Number.isFinite(Number(previous.queryDurationMs))
           ? Math.max(0, Number(previous.queryDurationMs))
           : null,
@@ -230,7 +258,10 @@ export class HubService {
       refreshing: this.refreshes.size > 0,
       lastFullRefreshAt: this.lastFullRefreshAt,
       lastFullRefreshDurationMs: this.lastFullRefreshDurationMs,
-      providers: [...this.items.values()].map(item => ({ ...item, refreshing: this.refreshes.has(item.id) })),
+      providers: [...this.items.values()].map(item => {
+        const { providerFingerprint: _providerFingerprint, ...publicItem } = item;
+        return { ...publicItem, refreshing: this.refreshes.has(item.id) };
+      }),
     };
   }
 
@@ -278,6 +309,7 @@ export class HubService {
       try {
         const result = await this.queryEngine.query(provider);
         if (!isCurrentSnapshot()) return this.items.get(id) || null;
+        const attemptedAt = new Date(this.now()).toISOString();
         const usage = safeUsage(result.usage);
         const targets = usage && providerKind(provider) === 'anyrouter'
           ? [...this.providers.values()].filter(candidate => providerKind(candidate) === 'anyrouter')
@@ -288,6 +320,7 @@ export class HubService {
           const targetUsage = usage && target.id !== id && usage.providerName === provider.name
             ? { ...usage, providerName: target.name }
             : usage;
+          const lastSuccessAt = String(targetUsage?.updatedAt || current.lastSuccessAt || current.usage?.updatedAt || current.updatedAt || '');
           this.items.set(target.id, {
             ...current,
             status: targetUsage ? (result.degraded ? 'degraded' : 'ok') : (result.loginRequired ? 'login-required' : 'error'),
@@ -296,7 +329,9 @@ export class HubService {
             sessionSyncRequired: result.sessionSyncRequired === true,
             websiteLoginRequired: result.websiteLoginRequired === true,
             usage: targetUsage || current.usage,
-            updatedAt: String(targetUsage?.updatedAt || new Date().toISOString()),
+            updatedAt: lastSuccessAt,
+            lastSuccessAt,
+            lastAttemptAt: attemptedAt,
             queryDurationMs: Math.max(0, this.now() - queryStartedAt),
           });
         }
@@ -304,11 +339,14 @@ export class HubService {
         if (!isCurrentSnapshot()) return this.items.get(id) || null;
         const previous = this.items.get(id);
         const message = safeMessage(error);
+        const lastSuccessAt = String(previous.lastSuccessAt || previous.usage?.updatedAt || previous.updatedAt || '');
         const next = {
           ...previous,
           status: previous.usage ? 'degraded' : 'error',
           message: previous.usage ? `最近查询失败：${message}` : message,
-          updatedAt: new Date().toISOString(),
+          updatedAt: lastSuccessAt,
+          lastSuccessAt,
+          lastAttemptAt: new Date(this.now()).toISOString(),
         };
         this.items.set(id, next);
       } finally {
@@ -360,7 +398,7 @@ export class HubService {
       } else {
         await runPool(ids, this.concurrency);
       }
-      this.lastFullRefreshAt = new Date().toISOString();
+      this.lastFullRefreshAt = new Date(this.now()).toISOString();
       this.lastFullRefreshDurationMs = Math.max(0, this.now() - refreshStartedAt);
       this.revision += 1;
       return this.getState();
@@ -387,11 +425,36 @@ export class HubService {
     return this.#balanceResponse(item);
   }
 
+  getBalance(providerSelector) {
+    const provider = this.findProvider(providerSelector);
+    if (!provider) return { success: false, message: `Unknown provider: ${String(providerSelector || '')}`, cache_only: true };
+    const item = this.items.get(provider.id);
+    return {
+      ...this.#balanceResponse(item),
+      cache_only: true,
+      last_success_at: item?.lastSuccessAt || item?.usage?.updatedAt || '',
+      last_attempt_at: item?.lastAttemptAt || '',
+    };
+  }
+
   async queryAllBalances() {
     await this.refreshAll();
     return {
       success: [...this.items.values()].every(item => ['ok', 'degraded'].includes(item.status)),
       data: Object.fromEntries([...this.items.values()].map(item => [item.id, this.#balanceResponse(item)])),
+    };
+  }
+
+  getAllBalances() {
+    return {
+      success: [...this.items.values()].every(item => ['ok', 'degraded'].includes(item.status)),
+      cache_only: true,
+      data: Object.fromEntries([...this.items.values()].map(item => [item.id, {
+        ...this.#balanceResponse(item),
+        cache_only: true,
+        last_success_at: item.lastSuccessAt || item.usage?.updatedAt || '',
+        last_attempt_at: item.lastAttemptAt || '',
+      }])),
     };
   }
 
@@ -420,6 +483,9 @@ export class HubService {
   }
 
   #balanceResponse(item) {
+    if (!item) {
+      return { success: false, provider: '', message: '供应商缓存不存在', login_required: false };
+    }
     const queryable = ['ok', 'degraded'].includes(item.status) && item.usage;
     if (!queryable) {
       return {

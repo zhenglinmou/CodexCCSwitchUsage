@@ -1,15 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
 import { BrowserCallbackBroker } from './browser-callback-broker.mjs';
 import { hasAuxiliaryPageTargets, isCodexTargetCandidate, listCdpTargets } from './cdp-client.mjs';
 import { ProviderRepository } from './provider-repository.mjs';
 import { HubServer } from './hub-server.mjs';
 import { ProviderQueryEngine } from './hub-provider-adapters.mjs';
-import { hubItemToUsagePayload, HubService, safeHubMessage } from './hub-service.mjs';
+import { hubItemToUsagePayload, HubService, providerConfigurationFingerprint, safeHubMessage } from './hub-service.mjs';
 import { buildInjectorScript, INJECTOR_VERSION, UPDATE_GLOBAL } from './injector-script.mjs';
 import { KeyedBackoff } from './keyed-backoff.mjs';
-import { decodePageActionMarker } from './page-action-channel.mjs';
+import { decodePageActionQueue } from './page-action-channel.mjs';
 import { isProcessAlive, ProcessExitMonitor } from './process-lifecycle.mjs';
 import { acknowledgePageAction, installTargetOnce, settleTargetOperations } from './target-session.mjs';
 
@@ -71,8 +70,26 @@ function writeUsageCache(payload, providerSignature = '') {
   fs.renameSync(temporary, cachePath);
 }
 
-const cachedUsage = readUsageCache();
-const cachedProviderSignature = String(cachedUsage?.providerSignature || '');
+let cachedUsage = readUsageCache();
+let cachedProviderSignature = String(cachedUsage?.providerSignature || '');
+if (cachedUsage) {
+  try {
+    const currentProvider = repository.getCurrent();
+    const cacheMatchesCurrent = Boolean(
+      currentProvider
+      && cachedUsage.providerId === currentProvider.id
+      && cachedProviderSignature
+      && cachedProviderSignature === providerConfigurationFingerprint(currentProvider)
+    );
+    if (!cacheMatchesCurrent) {
+      cachedUsage = null;
+      cachedProviderSignature = '';
+    }
+  } catch {
+    cachedUsage = null;
+    cachedProviderSignature = '';
+  }
+}
 if (cachedUsage) delete cachedUsage.providerSignature;
 let lastPayload = cachedUsage || { status: 'loading', providerName: 'CCSwitch', message: '读取中…' };
 const cachedQueryAt = Date.parse(String(lastPayload.updatedAt || ''));
@@ -87,7 +104,8 @@ let lastHubError = null;
 let mountedPages = 0;
 let mountedTargetIds = new Set();
 let lastInjectorAuditAt = 0;
-let lastActionSignature = '';
+const recentActionSignatures = new Set();
+const recentActionSignatureOrder = [];
 let databaseWatcher = null;
 let databaseWatchTimer = null;
 let databaseChangeToken = repository.getChangeToken();
@@ -150,18 +168,7 @@ function safeMessage(error) {
 }
 
 function providerRefreshSignature(provider) {
-  if (!provider) return '';
-  const material = JSON.stringify([
-    provider.id,
-    provider.name,
-    provider.websiteUrl,
-    provider.apiKey,
-    provider.apiBaseUrl,
-    provider.baseUrl,
-    provider.auth,
-    provider.usage,
-  ]);
-  return crypto.createHash('sha256').update(material).digest('base64url');
+  return providerConfigurationFingerprint(provider);
 }
 
 function payloadWithRecentRequests(payload) {
@@ -365,6 +372,17 @@ function actionSignature(action) {
   return action ? `${action.action}:${action.token}:${action.requestedAt}` : '';
 }
 
+function acceptAction(action) {
+  const signature = actionSignature(action);
+  if (!signature || recentActionSignatures.has(signature)) return false;
+  recentActionSignatures.add(signature);
+  recentActionSignatureOrder.push(signature);
+  while (recentActionSignatureOrder.length > 64) {
+    recentActionSignatures.delete(recentActionSignatureOrder.shift());
+  }
+  return true;
+}
+
 async function syncTargets({ audit = true } = {}) {
   const allTargets = await listCdpTargets(args.port);
   const targets = allTargets.filter(target => isCodexTargetCandidate(target) && target.webSocketDebuggerUrl);
@@ -374,8 +392,8 @@ async function syncTargets({ audit = true } = {}) {
     throw new Error('没有找到 Codex 主页面');
   }
 
-  const targetActions = targets.map(target => ({ target, action: decodePageActionMarker(target.title) }));
-  const markedActions = targetActions.filter(item => item.action);
+  const targetActions = targets.map(target => ({ target, actions: decodePageActionQueue(target.title) }));
+  const markedActions = targetActions.filter(item => item.actions.length > 0);
   const targetIds = new Set(targets.map(target => target.id));
   const targetSignature = [...targetIds].sort().join('|');
   const targetIdentityChanged = targetIds.size !== mountedTargetIds.size
@@ -404,14 +422,15 @@ async function syncTargets({ audit = true } = {}) {
     let actionAccepted = false;
     markedActions.forEach((item, index) => {
       if (acknowledgements[index]?.status !== 'fulfilled' || acknowledgements[index].value !== true) return;
-      if (actionSignature(item.action) === lastActionSignature) return;
-      actionAccepted = true;
-      lastActionSignature = actionSignature(item.action);
-      if (item.action.action === 'refresh') {
-        refreshRequested = true;
-        requestCurrentProviderRefresh(true, true);
+      for (const action of item.actions) {
+        if (!acceptAction(action)) continue;
+        actionAccepted = true;
+        if (action.action === 'refresh') {
+          refreshRequested = true;
+          requestCurrentProviderRefresh(true, true);
+        }
+        if (action.action === 'open-hub') openHubFromAction();
       }
-      if (item.action.action === 'open-hub') openHubFromAction();
     });
     mountedPages = targets.length;
     if (actionAccepted) targetInstallBackoff.reset();

@@ -4,6 +4,7 @@ build/
 dist/
 backups/
 node_modules/
+/tests/
 .firecrawl/
 *.orig
 *.log

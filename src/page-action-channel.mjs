@@ -2,7 +2,8 @@ export const PAGE_ACTION_SENTINEL = '\u2063\u2063';
 const ZERO = '\u200b';
 const ONE = '\u200c';
 const ACTIONS = new Set(['refresh', 'open-hub']);
-const MAX_MARKER_LENGTH = 512;
+const QUEUE_PREFIX = 'q1;';
+const MAX_MARKER_LENGTH = 1_024;
 
 function bytesToInvisible(value) {
   let result = '';
@@ -36,21 +37,107 @@ export function encodePageActionMarker(value) {
   return `${PAGE_ACTION_SENTINEL}${bytesToInvisible(`${action.action}|${action.token}|${action.requestedAt}`)}`;
 }
 
-export function decodePageActionMarker(title) {
+export function encodePageActionQueue(values) {
+  const actions = [];
+  for (const value of Array.isArray(values) ? values : [values]) {
+    const action = normalizeAction(value);
+    if (!action) return '';
+    const existingIndex = actions.findIndex(item => item.action === action.action);
+    if (existingIndex >= 0) actions[existingIndex] = action;
+    else actions.push(action);
+  }
+  if (!actions.length) return '';
+  const payload = `${QUEUE_PREFIX}${actions.map(action => `${action.action}|${action.token}|${action.requestedAt}`).join(';')}`;
+  const marker = bytesToInvisible(payload);
+  return marker.length <= MAX_MARKER_LENGTH ? `${PAGE_ACTION_SENTINEL}${marker}` : '';
+}
+
+export function decodePageActionQueue(title) {
   const value = String(title || '');
   const markerIndex = value.lastIndexOf(PAGE_ACTION_SENTINEL);
-  if (markerIndex < 0) return null;
+  if (markerIndex < 0) return [];
   const marker = value.slice(markerIndex + PAGE_ACTION_SENTINEL.length);
-  if (!marker || marker.length > MAX_MARKER_LENGTH) return null;
+  if (!marker || marker.length > MAX_MARKER_LENGTH) return [];
   const decoded = invisibleToBytes(marker);
-  if (!decoded) return null;
-  const [action, token, requestedAt, extra] = decoded.split('|');
-  if (extra !== undefined) return null;
-  return normalizeAction({ action, token: Number(token), requestedAt: Number(requestedAt) });
+  if (!decoded) return [];
+  const entries = decoded.startsWith(QUEUE_PREFIX) ? decoded.slice(QUEUE_PREFIX.length).split(';') : [decoded];
+  if (!entries.length || entries.length > ACTIONS.size) return [];
+  const actions = [];
+  for (const entry of entries) {
+    const [action, token, requestedAt, extra] = entry.split('|');
+    const normalized = extra === undefined
+      ? normalizeAction({ action, token: Number(token), requestedAt: Number(requestedAt) })
+      : null;
+    if (!normalized || actions.some(item => item.action === normalized.action)) return [];
+    actions.push(normalized);
+  }
+  return actions;
+}
+
+export function decodePageActionMarker(title) {
+  return decodePageActionQueue(title)[0] || null;
 }
 
 export function stripPageActionMarker(title) {
   const value = String(title || '');
   const markerIndex = value.lastIndexOf(PAGE_ACTION_SENTINEL);
   return markerIndex < 0 ? value : value.slice(0, markerIndex);
+}
+
+// This helper is serialized into the injected page. Keep it self-contained and
+// limited to ASCII so it works without Node.js Buffer in the renderer.
+export function enqueuePageActionTitle(title, value, sentinel) {
+  const currentTitle = String(title || '');
+  const markerSentinel = String(sentinel || '\u2063\u2063');
+  const normalize = candidate => {
+    const action = String(candidate?.action || '');
+    const token = Number(candidate?.token);
+    const requestedAt = Number(candidate?.requestedAt);
+    if (!['refresh', 'open-hub'].includes(action) || !Number.isSafeInteger(token) || token < 0 || !Number.isFinite(requestedAt) || requestedAt <= 0) return null;
+    return { action, token, requestedAt };
+  };
+  const next = normalize(value);
+  if (!next) return currentTitle;
+
+  const markerIndex = currentTitle.lastIndexOf(markerSentinel);
+  const baseTitle = markerIndex < 0 ? currentTitle : currentTitle.slice(0, markerIndex);
+  const actions = [];
+  if (markerIndex >= 0) {
+    const invisible = currentTitle.slice(markerIndex + markerSentinel.length);
+    if (invisible && invisible.length <= 1_024 && invisible.length % 8 === 0) {
+      let decoded = '';
+      let valid = true;
+      for (let index = 0; index < invisible.length; index += 8) {
+        const chunk = invisible.slice(index, index + 8);
+        if ([...chunk].some(character => character !== '\u200b' && character !== '\u200c')) {
+          valid = false;
+          break;
+        }
+        const byte = Number.parseInt(chunk.replaceAll('\u200b', '0').replaceAll('\u200c', '1'), 2);
+        if (!Number.isInteger(byte) || byte > 127) {
+          valid = false;
+          break;
+        }
+        decoded += String.fromCharCode(byte);
+      }
+      if (valid) {
+        const entries = decoded.startsWith('q1;') ? decoded.slice(3).split(';') : [decoded];
+        for (const entry of entries.slice(0, 2)) {
+          const [action, token, requestedAt, extra] = entry.split('|');
+          const existing = extra === undefined ? normalize({ action, token: Number(token), requestedAt: Number(requestedAt) }) : null;
+          if (existing && !actions.some(item => item.action === existing.action)) actions.push(existing);
+        }
+      }
+    }
+  }
+
+  const existingIndex = actions.findIndex(item => item.action === next.action);
+  if (existingIndex >= 0) actions[existingIndex] = next;
+  else actions.push(next);
+  const payload = `q1;${actions.map(action => `${action.action}|${action.token}|${action.requestedAt}`).join(';')}`;
+  let marker = '';
+  for (let index = 0; index < payload.length; index += 1) {
+    marker += payload.charCodeAt(index).toString(2).padStart(8, '0').replaceAll('0', '\u200b').replaceAll('1', '\u200c');
+  }
+  return `${baseTitle}${markerSentinel}${marker}`;
 }

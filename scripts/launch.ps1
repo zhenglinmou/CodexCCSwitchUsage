@@ -1,6 +1,7 @@
 ﻿param(
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'CodexCCSwitchUsage'),
-    [int]$Port = 9334
+    [int]$Port = 9334,
+    [switch]$AllowCodexRestart
 )
 $ErrorActionPreference = 'Stop'
 
@@ -115,6 +116,10 @@ $codexRoot = $roots | Where-Object { $_.CommandLine -match "--remote-debugging-p
 $ordinaryRoots = @($roots | Where-Object { $_.CommandLine -notmatch "--remote-debugging-port=$Port(?:\s|$)" })
 
 if (-not $codexRoot -and $ordinaryRoots.Count -gt 0) {
+    if (-not $AllowCodexRestart) {
+        [void](Show-CodexWindow -CodexProcessId $ordinaryRoots[0].ProcessId)
+        throw "现有 Codex 未启用本地调试端口 $Port。开发热更新不会自动关闭或重启 Codex；请先保存当前工作，再显式使用 -AllowCodexRestart。"
+    }
     foreach ($rootProcess in $ordinaryRoots) {
         $process = Get-Process -Id $rootProcess.ProcessId -ErrorAction SilentlyContinue
         if ($process) { [void]$process.CloseMainWindow() }

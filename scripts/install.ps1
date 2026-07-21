@@ -24,7 +24,7 @@ $files = @(
     'scripts\install.ps1', 'scripts\launch.ps1', 'scripts\stop.ps1', 'scripts\check-current.mjs',
     'scripts\status.ps1', 'scripts\uninstall.ps1',
     'browser-companion\manifest.json', 'browser-companion\background.js', 'browser-companion\session-state.js',
-    'browser-companion\anyrouter-waf.js',
+    'browser-companion\anyrouter-waf.js', 'browser-companion\protocol.js',
     'browser-companion\popup.html', 'browser-companion\popup.js', 'browser-companion\README.md'
 )
 foreach ($relative in $files) {
@@ -60,7 +60,7 @@ foreach ($shortcutPath in $shortcutPaths) {
     [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($shortcutPath)) | Out-Null
     $shortcut = $shell.CreateShortcut($shortcutPath)
     $shortcut.TargetPath = (Get-Command powershell.exe).Source
-    $shortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + (Join-Path $target 'scripts\launch.ps1') + '"'
+    $shortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + (Join-Path $target 'scripts\launch.ps1') + '" -AllowCodexRestart'
     $shortcut.WorkingDirectory = $target
     $shortcut.IconLocation = "$codexExe,0"
     $shortcut.Description = '启动带 CCSwitch 用量显示的 Codex'

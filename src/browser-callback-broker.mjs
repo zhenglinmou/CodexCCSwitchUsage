@@ -1,4 +1,11 @@
 import crypto from 'node:crypto';
+import {
+  BROWSER_CALLBACK_TIMEOUT_MS,
+  BROWSER_LOGIN_JOB_TIMEOUT_MS,
+  COMPANION_CAPABILITIES,
+  COMPANION_PROTOCOL_VERSION,
+  companionCompatibility,
+} from '../browser-companion/protocol.js';
 
 function normalizeOrigin(value) {
   try {
@@ -23,7 +30,7 @@ export class BrowserCallbackBroker {
   constructor(options = {}) {
     this.now = options.now || Date.now;
     this.connectionMaxAgeMs = Math.max(10_000, Number(options.connectionMaxAgeMs) || 45_000);
-    this.queryTimeoutMs = Math.max(10_000, Number(options.queryTimeoutMs) || 75_000);
+    this.queryTimeoutMs = Math.max(10_000, Number(options.queryTimeoutMs) || BROWSER_CALLBACK_TIMEOUT_MS);
     this.preferredClientGraceMs = Math.max(1_000, Number(options.preferredClientGraceMs) || 5_000);
     this.clients = new Map();
     this.queue = [];
@@ -32,14 +39,26 @@ export class BrowserCallbackBroker {
     this.closed = false;
     this.generation = 0;
     this.preferenceTimer = null;
+    this.lastCompatibilityError = '';
   }
 
   heartbeat(payload = {}) {
     const clientId = cleanClientId(payload.clientId);
     if (!clientId) throw new Error('浏览器伴侣 clientId 无效');
+    const compatibility = companionCompatibility(payload);
+    if (!compatibility.compatible) {
+      this.#cancelWaiters(clientId);
+      this.clients.delete(clientId);
+      this.lastCompatibilityError = compatibility.message;
+      throw new Error(compatibility.message);
+    }
+    this.lastCompatibilityError = '';
     const existing = this.clients.get(clientId) || { sessions: new Set() };
     const instanceId = cleanInstanceId(payload.instanceId) || existing.instanceId || '';
-    if (instanceId && existing.instanceId !== instanceId) this.generation += 1;
+    if (instanceId && existing.instanceId !== instanceId) {
+      this.generation += 1;
+      if (existing.instanceId) this.#cancelWaiters(clientId);
+    }
     const sessions = Array.isArray(payload.sessions)
       ? new Set(payload.sessions.map(normalizeOrigin).filter(Boolean))
       : new Set(existing.sessions);
@@ -48,6 +67,8 @@ export class BrowserCallbackBroker {
       browser: String(payload.browser || existing.browser || 'Chromium').slice(0, 64),
       version: String(payload.version || existing.version || '').slice(0, 32),
       instanceId,
+      protocolVersion: compatibility.protocolVersion,
+      capabilities: compatibility.capabilities,
       sessions,
       lastSeenAt: this.now(),
     });
@@ -59,7 +80,8 @@ export class BrowserCallbackBroker {
     const id = cleanClientId(clientId);
     const normalized = normalizeOrigin(origin);
     if (!id || !normalized) return false;
-    const client = this.clients.get(id) || { clientId: id, browser: 'Chromium', version: '', sessions: new Set(), lastSeenAt: this.now() };
+    const client = this.clients.get(id);
+    if (!client) return false;
     client.sessions.add(normalized);
     client.lastSeenAt = this.now();
     this.clients.set(id, client);
@@ -72,9 +94,14 @@ export class BrowserCallbackBroker {
     return {
       connected: active.length > 0,
       generation: this.generation,
+      protocolVersion: COMPANION_PROTOCOL_VERSION,
+      requiredCapabilities: [...COMPANION_CAPABILITIES],
+      compatibilityError: this.lastCompatibilityError,
       clients: active.map(client => ({
         browser: client.browser,
         version: client.version,
+        protocolVersion: client.protocolVersion,
+        capabilities: [...client.capabilities],
         sessions: [...client.sessions],
         lastSeenAt: new Date(client.lastSeenAt).toISOString(),
       })),
@@ -94,10 +121,16 @@ export class BrowserCallbackBroker {
     return [...this.clients.values()].some(client => client.lastSeenAt >= cutoff && client.sessions.has(normalized));
   }
 
-  async nextJob(payload = {}, waitMs = 25_000) {
+  async nextJob(payload = {}, waitMs = 25_000, options = {}) {
     if (this.closed) return null;
     const clientId = cleanClientId(payload.clientId);
     if (!clientId) throw new Error('浏览器伴侣 clientId 无效');
+    const signal = options?.signal;
+    if (signal?.aborted) return null;
+    // A Chromium MV3 worker may restart while its previous long poll is still
+    // waiting in Node. The newest poll for a stable client id owns delivery;
+    // otherwise an abandoned response can claim and strand the next job.
+    this.#cancelWaiters(clientId);
     this.heartbeat(payload);
     const queued = this.#takeJob(clientId);
     if (queued) {
@@ -105,11 +138,26 @@ export class BrowserCallbackBroker {
       return queued.publicJob;
     }
     return new Promise(resolve => {
-      const waiter = { clientId, resolve, timer: null };
-      waiter.timer = setTimeout(() => {
+      const waiter = {
+        clientId,
+        instanceId: cleanInstanceId(payload.instanceId) || this.clients.get(clientId)?.instanceId || '',
+        resolve: null,
+        timer: null,
+        settled: false,
+      };
+      const abort = () => waiter.resolve(null);
+      waiter.resolve = value => {
+        if (waiter.settled) return;
+        waiter.settled = true;
+        clearTimeout(waiter.timer);
+        signal?.removeEventListener('abort', abort);
         this.waiters = this.waiters.filter(item => item !== waiter);
-        resolve(null);
+        resolve(value);
+      };
+      waiter.timer = setTimeout(() => {
+        waiter.resolve(null);
       }, Math.max(1_000, Math.min(30_000, Number(waitMs) || 25_000)));
+      signal?.addEventListener('abort', abort, { once: true });
       this.waiters.push(waiter);
       this.#dispatch();
     });
@@ -120,7 +168,7 @@ export class BrowserCallbackBroker {
   }
 
   openLogin(request) {
-    return this.#enqueue('open-login', request, 20_000);
+    return this.#enqueue('open-login', request, BROWSER_LOGIN_JOB_TIMEOUT_MS);
   }
 
   complete(jobId, result) {
@@ -141,7 +189,6 @@ export class BrowserCallbackBroker {
     if (this.closed) return;
     this.closed = true;
     for (const waiter of this.waiters) {
-      clearTimeout(waiter.timer);
       waiter.resolve(null);
     }
     this.waiters = [];
@@ -166,6 +213,7 @@ export class BrowserCallbackBroker {
     const publicJob = {
       id,
       type,
+      protocolVersion: COMPANION_PROTOCOL_VERSION,
       createdAt: new Date(this.now()).toISOString(),
       request: { ...request, origin },
     };
@@ -214,6 +262,12 @@ export class BrowserCallbackBroker {
     return [...this.clients.values()].find(client => client.lastSeenAt >= cutoff && client.sessions.has(origin))?.clientId || '';
   }
 
+  #cancelWaiters(clientId) {
+    for (const waiter of [...this.waiters]) {
+      if (waiter.clientId === clientId) waiter.resolve(null);
+    }
+  }
+
   #takeJob(clientId) {
     const index = this.queue.findIndex(job => !job.preferredClientId || job.preferredClientId === clientId);
     if (index < 0) return null;
@@ -225,8 +279,6 @@ export class BrowserCallbackBroker {
     for (const waiter of [...this.waiters]) {
       const job = this.#takeJob(waiter.clientId);
       if (!job) continue;
-      clearTimeout(waiter.timer);
-      this.waiters = this.waiters.filter(item => item !== waiter);
       waiter.resolve(job.publicJob);
     }
     this.#schedulePreferenceRelease();

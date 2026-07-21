@@ -27,6 +27,8 @@ build\
 dist\
 ```
 
+The regression suite under `tests\` is intentionally kept only in this development workspace and excluded from Git. Preserve that local directory: `npm test` depends on it, while runtime installation and EXE packaging do not.
+
 Runtime state is intentionally separate:
 
 - Development state: `D:\software\CodexCCSwitchUsage\runtime`
@@ -52,7 +54,7 @@ The installer preserves the stable `runtime` directory during an upgrade. A real
 | `src\cdp-client.mjs` | Short-lived CDP HTTP/WebSocket client and strict target filtering |
 | `src\target-session.mjs` | One-shot injector installation, hot replacement, and payload delivery |
 | `src\keyed-backoff.mjs` | Target-keyed bounded retry state for failed one-shot injector installations |
-| `src\page-action-channel.mjs` | Invisible, bounded page-title action markers for refresh and Hub clicks |
+| `src\page-action-channel.mjs` | Invisible, bounded page-title pending-action queue for refresh and Hub clicks |
 | `src\process-lifecycle.mjs` | Exact Codex root-process liveness monitor; no CDP session ownership |
 | `scripts\launch.ps1` | Finds/starts Codex with CDP, starts the host, activates the window |
 | `scripts\stop-host.ps1` | Stops plugin hosts without stopping Codex |
@@ -65,13 +67,19 @@ The installer preserves the stable `runtime` directory during an upgrade. A real
 
 The v2 host is the only balance-query center. The Codex footer, Hub page, and loopback balance API all call `HubService`; none executes the CCSwitch `usage_script` or calls the retired Python bridge.
 
-The stable gateway listens on `127.0.0.1:17891` and exposes `/v1/balance/{provider}`, `/v1/balances`, `/v1/providers`, `/v1/health`, plus the legacy-compatible `/usage/{provider}` path. CCSwitch remains read-only and its existing scripts are not rewritten during v2 development.
+The stable gateway listens on `127.0.0.1:17891` and exposes cache-only `/v1/balance/{provider}` and `/v1/balances` reads, plus `/v1/providers`, `/v1/health`, and the legacy-compatible live-query `/usage/{provider}` path. Explicit refreshes use the token-protected Hub POST route. CCSwitch remains read-only and its existing scripts are not rewritten during v2 development.
 
 Provider adapters first use the CCSwitch API Key and configured Base URL when the third-party site supports a balance endpoint. Sites whose model API keys cannot access dashboard balances use the MV3 browser companion after one-time pairing with the Hub token. The companion runs requests inside the user's existing Edge/Chrome profile, keeps Cookie values in that browser, and returns only request results through the same port. Hub opening never triggers refresh. A balance query never creates or activates a website tab; session synchronization and login pages require an explicit user action.
 
+The dedicated `jianzhile.vip` and `free.lyclaude.site` adapters query finite API Keys directly and use the browser companion only when the site reports an unlimited Key whose real balance belongs to the logged-in account. Their site display configuration controls quota units and exchange rates; placeholder unlimited values are never rendered as balances. Routing is pinned to the configured API hostname, so a provider name alone cannot send credentials to either fixed domain.
+
 Every provider with a built-in HTTPS login configuration always exposes that sanitized official login URL in Hub state. The card renders it independently from query status, cached usage, CCSwitch `website_url`, companion connectivity, and WAF classification. `sessionSyncRequired` controls only the separate session-sync action; it must never hide the official login link.
 
-The companion stores its pairing token, stable client id, allowlisted validated origins, and the numeric New API user id required beside browser cookies in `chrome.storage.local`; it never stores Cookie values, Token values, or localStorage source text. Each startup or reconnect begins with one session heartbeat; subsequent long polls carry only client identity and wait for explicit jobs. Ordinary loopback callbacks have a 10,000 ms client timeout, 25,000 ms server long polls have a 30,000 ms client timeout, and each 120-poll batch hands off immediately instead of waiting for the next one-minute alarm. Browser queries reserve 5,000 ms of their job budget for an existing-tab fallback after an extension-context request. A polling iteration reuses one configuration snapshot, repeated status/session values are not rewritten, and event-driven heartbeats are coalesced as a single-flight 350 ms trailing update. New API sites such as AnyRouter and AgentRouter are never restored from arbitrary Cookie presence alone. The provider response is authoritative: successful responses retain the hint, while an explicit authentication failure removes it; ordinary provider or WAF failures preserve the last validated hint. A connected companion may attempt the real same-origin query even before a hint is restored, so a host restart cannot be misclassified as logout. Each Hub provider card exposes a safe “查看” dialog for the actual request URL, method, authentication category, executor, browser/WAF dependency, and current normalized source; credentials are never included.
+The companion stores its pairing token, stable client id, allowlisted validated origins, and the numeric New API user id required beside browser cookies in `chrome.storage.local`; it never stores Cookie values, Token values, or localStorage source text. Each startup or reconnect begins with one session heartbeat; subsequent long polls carry only client identity and wait for explicit jobs. Heartbeats and job polls negotiate companion protocol version `1` plus an explicit capability set. Ordinary loopback callbacks have a 10,000 ms client timeout, 25,000 ms server long polls have a 30,000 ms client timeout, and each 120-poll batch hands off immediately instead of waiting for the next one-minute alarm. A complete provider query, broker callback wait, and browser job use aligned 45,000 / 44,000 / 40,000 ms deadlines; browser queries reserve 5,000 ms of their job budget for an existing-tab fallback after an extension-context request. A polling iteration reuses one configuration snapshot, repeated status/session values are not rewritten, and event-driven heartbeats are coalesced as a single-flight 350 ms trailing update. New API sites such as AnyRouter and AgentRouter are never restored from arbitrary Cookie presence alone. The provider response is authoritative: successful responses retain the hint, while an explicit authentication failure removes it; ordinary provider or WAF failures preserve the last validated hint. A connected companion may attempt the real same-origin query even before a hint is restored, so a host restart cannot be misclassified as logout. Each Hub provider card exposes a safe “查看” dialog for the actual request URL, method, authentication category, executor, browser/WAF dependency, and current normalized source; credentials are never included.
+
+Long polls also carry a worker `instanceId`. A replacement MV3 worker supersedes the previous wait, and an aborted HTTP request removes its waiter immediately. Successful 120-poll batches still hand off without delay; repeated connection failures use bounded jittered backoff and yield to the one-minute alarm after the third failure instead of keeping the service worker awake indefinitely.
+
+Hub cache entries include a SHA-256 configuration fingerprint without credential text. A provider id whose API Key, Base URL, authentication, or usage configuration changes cannot inherit the old account balance. `lastSuccessAt` and `lastAttemptAt` are separate; failed attempts preserve the real age of the displayed balance.
 
 The old standalone Python bridge must not run alongside v2 because both use port `17891`.
 
@@ -93,7 +101,7 @@ $root = (Get-Location).Path
 
 `stop-host.ps1` does not close Codex. When Codex is already running with port `9334`, `launch.ps1` reuses that Codex process and starts only the workspace host.
 
-If only an ordinary Codex process without port `9334` is running, `launch.ps1` first asks it to close normally and then automatically restarts Codex with CDP enabled. It does not show a confirmation before the normal restart. If Codex has not exited after 10 seconds, the launcher still asks before force-terminating it because that can interrupt active work or unsent input.
+If only an ordinary Codex process without port `9334` is running, workspace development mode stops and reports that hot update is unavailable; it does not ask Codex to close. A user-facing installed shortcut passes the explicit `-AllowCodexRestart` authority. With that authority, `launch.ps1` asks Codex to close normally and restarts it with CDP enabled; if Codex has not exited after 10 seconds, it still asks before force-terminating because that can interrupt active work or unsent input.
 
 While the workspace host is active, do not click “Codex + CCSwitch 用量” on the desktop or Start menu. Those shortcuts intentionally point to the stable EXE installation.
 
@@ -126,7 +134,9 @@ Expected fields include:
 
 ### Host background performance baseline
 
-The injected refresh and Hub buttons append a bounded invisible action marker (`refresh` or `open-hub`) to `document.title`. The host reads the short-lived `/json/list` HTTP snapshot every 1,000 ms and acknowledges an exact marker through an isolated one-shot CDP operation before dispatching it. Marker acknowledgement never updates the quota payload, never waits for provider network I/O, and does not require a second target snapshot. Refreshes are coalesced as one active request plus at most one trailing request; only the final queued result is injected, while Hub actions remain responsive during the query. A newer title marker cannot be cleared by acknowledgement of an older click. This title channel carries no provider data or credential and avoids a persistent CDP WebSocket. Each CDP HTTP request uses `Connection: close`; full injector audits remain limited to 300,000 ms and are deferred while the current-provider query is active.
+The injected refresh and Hub buttons maintain a bounded invisible pending-action queue in `document.title`. The queue can retain one latest `refresh` and one latest `open-hub` simultaneously, so a rapid second action cannot overwrite the first. The host reads the short-lived `/json/list` HTTP snapshot every 1,000 ms and acknowledges the exact batch through an isolated one-shot CDP operation before dispatching every action in it. Marker acknowledgement never updates the quota payload, never waits for provider network I/O, and does not require a second target snapshot. Refreshes are coalesced as one active request plus at most one trailing request; only the final queued result is injected, while Hub actions remain responsive during the query. A newer title batch cannot be cleared by acknowledgement of an older click. This title channel carries no provider data or credential and avoids a persistent CDP WebSocket. Each CDP HTTP request uses `Connection: close`; full injector audits remain limited to 300,000 ms and are deferred while the current-provider query is active.
+
+The recent-request popover reads the CCSwitch `latency_ms` and `first_token_ms` fields and displays them as total/first-token time. Popovers move keyboard focus into the dialog, restore it on `Escape`, and expose their expanded/loading state through ARIA. A refresh loading indicator clears itself after 95,000 ms if no payload arrives, without issuing another request.
 
 The CCSwitch database uses `fs.watch` for immediate changes. While the watcher is healthy, the three SQLite files are audited only every 60,000 ms; the 1,000 ms retry is used only when a watcher is unavailable. SQLite/WAL activity that leaves the cached provider snapshot unchanged does not rebuild Hub state, increment its revision, or request a current-provider refresh. The Hub page loads state once and polls only while a user-started refresh operation is in progress. Only the current CCSwitch provider owns a fixed 300,000 ms balance timer.
 
@@ -154,7 +164,7 @@ Do not reintroduce a fixed root `max-width` or an icon-mode `flex: 0 0 28px` roo
 
 ### Codex App interaction layout performance baseline
 
-The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current injector version is `71`; the exhaustive interaction baseline below was established with injector `69` on Codex Desktop `26.715.2305.0`. Update that baseline only after completing the corresponding full live regression.
+The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current injector version is `76`; the exhaustive interaction baseline below was established with injector `69` on Codex Desktop `26.715.2305.0`. Update that baseline only after completing the corresponding full live regression.
 
 | Codex interaction | Expected injector geometry work |
 |---|---|

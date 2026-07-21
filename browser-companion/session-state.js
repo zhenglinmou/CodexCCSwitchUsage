@@ -1,7 +1,14 @@
+import {
+  BROWSER_JOB_TIMEOUT_MS,
+  BROWSER_LOGIN_JOB_TIMEOUT_MS,
+} from './protocol.js';
+
 export const SESSION_ORIGINS = Object.freeze([
   'https://agentrouter.org',
   'https://anyrouter.top',
   'https://chatgpt.com',
+  'https://free.lyclaude.site',
+  'https://jianzhile.vip',
 ]);
 
 const SESSION_ORIGIN_SET = new Set(SESSION_ORIGINS);
@@ -73,9 +80,17 @@ function hasCanonicalSessionOrigins(value, normalized) {
     && value.every((origin, index) => origin === normalized[index]);
 }
 
-export function browserJobTimeout(request = {}) {
-  const requested = Number(request.waitMs);
-  return Math.max(5_000, Math.min(35_000, Number.isFinite(requested) && requested > 0 ? requested : 30_000));
+export function browserJobTimeout(job = {}) {
+  return job.type === 'open-login' ? BROWSER_LOGIN_JOB_TIMEOUT_MS : BROWSER_JOB_TIMEOUT_MS;
+}
+
+export function companionPollFailurePolicy(failureCount, random = Math.random) {
+  const failures = Math.max(1, Math.trunc(Number(failureCount) || 1));
+  if (failures >= 3) return { failures, stop: true, delayMs: 0 };
+  const baseDelayMs = Math.min(30_000, 2_000 * (2 ** (failures - 1)));
+  const randomValue = Math.max(0, Math.min(1, Number(random()) || 0));
+  const jitter = 0.8 + randomValue * 0.4;
+  return { failures, stop: false, delayMs: Math.round(baseDelayMs * jitter) };
 }
 
 export class TrailingSingleFlight {

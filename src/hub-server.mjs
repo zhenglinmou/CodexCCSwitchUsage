@@ -10,6 +10,26 @@ function isLoopbackRequest(request) {
   return value === '127.0.0.1' || value === '::1' || value === '::ffff:127.0.0.1';
 }
 
+export function isAllowedHubHost(value, port) {
+  const authority = String(value || '').trim().toLowerCase();
+  const expectedPort = Number(port);
+  if (!authority || !Number.isInteger(expectedPort) || expectedPort <= 0) return false;
+  try {
+    const url = new URL(`http://${authority}`);
+    const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    const actualPort = url.port ? Number(url.port) : 80;
+    return ['127.0.0.1', 'localhost', '::1'].includes(hostname)
+      && actualPort === expectedPort
+      && url.username === ''
+      && url.password === ''
+      && url.pathname === '/'
+      && url.search === ''
+      && url.hash === '';
+  } catch {
+    return false;
+  }
+}
+
 function readBody(request, maximumBytes = 16_384) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -86,7 +106,10 @@ export class HubServer {
     if (this.startPromise) return this.startPromise;
     const startPromise = (async () => {
       const server = http.createServer((request, response) => {
-        this.#handle(request, response).catch(error => jsonResponse(response, 500, { success: false, message: error.message }));
+        this.#handle(request, response).catch(error => {
+          if (response.destroyed || response.writableEnded) return;
+          jsonResponse(response, 500, { success: false, message: error.message });
+        });
       });
       this.server = server;
       try {
@@ -123,6 +146,10 @@ export class HubServer {
       jsonResponse(response, 403, { success: false, message: '仅允许本机访问' });
       return;
     }
+    if (!isAllowedHubHost(request.headers.host, this.boundPort || this.port)) {
+      jsonResponse(response, 403, { success: false, message: 'Host 不在本机允许列表中' });
+      return;
+    }
     const url = new URL(request.url || '/', `http://127.0.0.1:${this.boundPort || 80}`);
     const crossSite = String(request.headers['sec-fetch-site'] || '').toLowerCase() === 'cross-site';
     if (crossSite && (url.pathname.startsWith('/v1/') || url.pathname.startsWith('/usage/'))) {
@@ -145,12 +172,18 @@ export class HubServer {
       return;
     }
     if (request.method === 'GET' && url.pathname === '/v1/balances') {
-      jsonResponse(response, 200, await this.service.queryAllBalances());
+      jsonResponse(response, 200, this.service.getAllBalances());
       return;
     }
-    const balanceMatch = url.pathname.match(/^\/(?:v1\/balance|usage)\/([^/]+)$/);
-    if (request.method === 'GET' && balanceMatch) {
-      const selector = decodeURIComponent(balanceMatch[1]);
+    const cachedBalanceMatch = url.pathname.match(/^\/v1\/balance\/([^/]+)$/);
+    if (request.method === 'GET' && cachedBalanceMatch) {
+      const selector = decodeURIComponent(cachedBalanceMatch[1]);
+      jsonResponse(response, 200, this.service.getBalance(selector));
+      return;
+    }
+    const legacyBalanceMatch = url.pathname.match(/^\/usage\/([^/]+)$/);
+    if (request.method === 'GET' && legacyBalanceMatch) {
+      const selector = decodeURIComponent(legacyBalanceMatch[1]);
       jsonResponse(response, 200, await this.service.queryBalance(selector));
       return;
     }
@@ -194,13 +227,29 @@ export class HubServer {
       const sessions = url.searchParams.has('sessionsKnown') || url.searchParams.has('session')
         ? url.searchParams.getAll('session')
         : undefined;
-      const job = await this.browserBroker.nextJob({
-        clientId: url.searchParams.get('clientId'),
-        instanceId: url.searchParams.get('instanceId'),
-        browser: url.searchParams.get('browser'),
-        version: url.searchParams.get('version'),
-        sessions,
-      });
+      const pollController = new AbortController();
+      const abortPoll = () => pollController.abort();
+      const closePoll = () => {
+        if (!response.writableEnded) abortPoll();
+      };
+      request.once('aborted', abortPoll);
+      response.once('close', closePoll);
+      let job;
+      try {
+        job = await this.browserBroker.nextJob({
+          clientId: url.searchParams.get('clientId'),
+          instanceId: url.searchParams.get('instanceId'),
+          browser: url.searchParams.get('browser'),
+          version: url.searchParams.get('version'),
+          protocolVersion: url.searchParams.get('protocolVersion'),
+          capabilities: url.searchParams.getAll('capability'),
+          sessions,
+        }, 25_000, { signal: pollController.signal });
+      } finally {
+        request.off('aborted', abortPoll);
+        response.off('close', closePoll);
+      }
+      if (pollController.signal.aborted || response.destroyed) return;
       if (!job) {
         response.writeHead(204, { 'cache-control': 'no-store' });
         response.end();

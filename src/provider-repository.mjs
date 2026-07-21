@@ -73,6 +73,12 @@ function nonNegativeNumber(value) {
   return Number.isFinite(number) && number >= 0 ? number : 0;
 }
 
+function optionalNonNegativeInteger(value) {
+  if (value == null || value === '') return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : null;
+}
+
 export function parseRequestLogRow(row) {
   if (!row) return null;
   const createdAtSeconds = Number(row.created_at);
@@ -86,6 +92,8 @@ export function parseRequestLogRow(row) {
     cacheReadTokens: nonNegativeInteger(row.cache_read_tokens),
     cacheCreationTokens: nonNegativeInteger(row.cache_creation_tokens),
     totalCostUsd: nonNegativeNumber(row.total_cost_usd),
+    latencyMs: optionalNonNegativeInteger(row.latency_ms),
+    firstTokenMs: optionalNonNegativeInteger(row.first_token_ms),
     statusCode: nonNegativeInteger(row.status_code),
     createdAt: Number.isFinite(createdAtSeconds) && createdAtSeconds > 0 && Number.isFinite(createdAt.getTime())
       ? createdAt.toISOString()
@@ -211,7 +219,7 @@ export class ProviderRepository {
       this.recentRequestsStatement = db.prepare(`
         SELECT model, request_model, input_tokens, output_tokens,
                cache_read_tokens, cache_creation_tokens, total_cost_usd,
-               status_code, created_at
+               latency_ms, first_token_ms, status_code, created_at
         FROM proxy_request_logs
         WHERE app_type = 'codex' AND provider_id = ?
         ORDER BY created_at DESC, request_id DESC
