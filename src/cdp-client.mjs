@@ -1,5 +1,7 @@
 import http from 'node:http';
 
+export const CODEX_MAIN_DOCUMENT_URL = 'app://-/index.html';
+
 export class CdpClient {
   constructor(socket) {
     this.socket = socket;
@@ -129,22 +131,8 @@ export class CdpClient {
   }
 }
 
-function codexAppTargetUrl(target) {
-  if (target?.type !== 'page') return false;
-  const rawUrl = String(target.url || '');
-  if (!rawUrl.toLowerCase().startsWith('app://')) return null;
-  try {
-    const url = new URL(rawUrl);
-    if (url.protocol !== 'app:' || url.hostname !== '-' || url.pathname !== '/index.html') return null;
-    return url;
-  } catch {
-    return null;
-  }
-}
-
 export function isCodexTargetCandidate(target) {
-  const url = codexAppTargetUrl(target);
-  return Boolean(url && url.search === '' && url.hash === '');
+  return target?.type === 'page' && String(target.url || '') === CODEX_MAIN_DOCUMENT_URL;
 }
 
 function readJson(port, pathname, hostname) {
@@ -194,11 +182,4 @@ export async function listCdpTargets(port) {
 export async function listCodexTargets(port) {
   const targets = await listCdpTargets(port);
   return targets.filter(target => isCodexTargetCandidate(target) && target.webSocketDebuggerUrl);
-}
-
-export function hasAuxiliaryPageTargets(targets) {
-  return (targets || []).some(target => {
-    const type = String(target?.type || '').toLowerCase();
-    return ['page', 'webview', 'iframe'].includes(type) && !isCodexTargetCandidate(target);
-  });
 }

@@ -1,8 +1,15 @@
-import { CdpClient } from './cdp-client.mjs';
+import { CdpClient, CODEX_MAIN_DOCUMENT_URL } from './cdp-client.mjs';
 import { stripPageActionMarker } from './page-action-channel.mjs';
 
 export function settleTargetOperations(targets, operation) {
   return Promise.allSettled(targets.map(operation));
+}
+
+async function assertCanonicalMainDocument(client) {
+  const matches = await client.evaluate(
+    `location.href === ${JSON.stringify(CODEX_MAIN_DOCUMENT_URL)} && window === window.top`,
+  );
+  if (matches !== true) throw new Error('Codex 主页面身份校验失败');
 }
 
 export async function acknowledgePageAction(target, acknowledgedTitle, connect = CdpClient.connect) {
@@ -10,6 +17,7 @@ export async function acknowledgePageAction(target, acknowledgedTitle, connect =
   const client = await connect(target.webSocketDebuggerUrl);
   const cleanTitle = stripPageActionMarker(acknowledgedTitle);
   try {
+    await assertCanonicalMainDocument(client);
     return await client.evaluate(
       `(() => { if (document.title !== ${JSON.stringify(acknowledgedTitle)}) return false; document.title = ${JSON.stringify(cleanTitle)}; return true; })()`,
     ) === true;
@@ -30,6 +38,7 @@ export async function installTargetOnce(target, {
   let injected = false;
   let mounted = false;
   try {
+    await assertCanonicalMainDocument(client);
     const inspection = await client.evaluate(
       `({ version: ${globalReference}?.version || 0, mounted: Boolean(${globalReference}?.root?.isConnected && ${globalReference}?.footer?.isConnected) })`,
     );

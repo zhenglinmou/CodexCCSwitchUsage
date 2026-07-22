@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { BrowserCallbackBroker } from './browser-callback-broker.mjs';
-import { hasAuxiliaryPageTargets, isCodexTargetCandidate, listCdpTargets } from './cdp-client.mjs';
+import { isCodexTargetCandidate, listCdpTargets } from './cdp-client.mjs';
 import { ProviderRepository } from './provider-repository.mjs';
 import { HubServer } from './hub-server.mjs';
 import { ProviderQueryEngine } from './hub-provider-adapters.mjs';
@@ -408,10 +408,6 @@ async function syncTargets({ audit = true } = {}) {
     targetAuditPending = true;
     return { installed: false, deferred: true };
   }
-  if (hasAuxiliaryPageTargets(allTargets)) {
-    throw new Error('检测到 Codex 内置浏览器页面，已暂停 CDP 注入');
-  }
-
   if (markedActions.length > 0) {
     const acknowledgements = await settleTargetOperations(
       markedActions,
