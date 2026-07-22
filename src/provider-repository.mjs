@@ -216,15 +216,20 @@ export class ProviderRepository {
   getRecentRequests(providerId, limit = 10) {
     const db = this.ensureDatabase();
     if (!this.recentRequestsStatement) {
-      this.recentRequestsStatement = db.prepare(`
+      const query = indexClause => `
         SELECT model, request_model, input_tokens, output_tokens,
                cache_read_tokens, cache_creation_tokens, total_cost_usd,
                latency_ms, first_token_ms, status_code, created_at
-        FROM proxy_request_logs
+        FROM proxy_request_logs ${indexClause}
         WHERE app_type = 'codex' AND provider_id = ?
         ORDER BY created_at DESC, request_id DESC
         LIMIT ?
-      `);
+      `;
+      try {
+        this.recentRequestsStatement = db.prepare(query('INDEXED BY idx_request_logs_provider'));
+      } catch {
+        this.recentRequestsStatement = db.prepare(query(''));
+      }
     }
     const boundedLimit = Math.max(1, Math.min(50, Math.trunc(Number(limit) || 10)));
     return this.recentRequestsStatement

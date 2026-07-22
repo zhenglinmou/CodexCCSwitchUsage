@@ -268,7 +268,18 @@ export class HubServer {
     }
     if (request.method === 'POST' && url.pathname === `${this.apiPath}/refresh`) {
       const body = await readBody(request);
-      const operation = body.providerId ? this.service.refreshProvider(body.providerId) : this.service.refreshAll();
+      const providerSelector = String(body.providerId || '').trim();
+      let operation;
+      if (providerSelector) {
+        const provider = this.service.findProvider(providerSelector);
+        if (!provider) {
+          jsonResponse(response, 404, { success: false, message: 'CCSwitch 中不存在这个 Codex 供应商' });
+          return;
+        }
+        operation = this.service.refreshProvider(provider.id);
+      } else {
+        operation = this.service.refreshAll();
+      }
       operation.catch(() => {});
       jsonResponse(response, 202, { success: true });
       return;

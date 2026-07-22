@@ -11,6 +11,8 @@ $runtime = Join-Path $root 'runtime'
 $pidPath = Join-Path $runtime 'host.pid'
 $hostPath = Join-Path $root 'src\host.mjs'
 $candidateIds = [Collections.Generic.HashSet[int]]::new()
+$cleanupRoots = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+[void]$cleanupRoots.Add($root)
 
 function Get-PluginHostRoot {
     param([string]$CommandLine)
@@ -48,7 +50,11 @@ if (Test-Path -LiteralPath $pidPath -PathType Leaf) {
 }
 
 $matchingHosts = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue | Where-Object { Test-TargetHost $_ })
-foreach ($hostProcess in $matchingHosts) { [void]$candidateIds.Add([int]$hostProcess.ProcessId) }
+foreach ($hostProcess in $matchingHosts) {
+    [void]$candidateIds.Add([int]$hostProcess.ProcessId)
+    $pluginRoot = Get-PluginHostRoot $hostProcess.CommandLine
+    if ($pluginRoot) { [void]$cleanupRoots.Add($pluginRoot) }
+}
 
 $stopped = 0
 foreach ($processId in $candidateIds) {
@@ -66,6 +72,34 @@ do {
 } while ([DateTime]::UtcNow -lt $deadline)
 
 if ($remaining.Count -gt 0) { throw "Plugin host did not stop: $($remaining -join ', ')" }
-if (Test-Path -LiteralPath $pidPath) { Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue }
+foreach ($cleanupRoot in $cleanupRoots) {
+    $cleanupPidPath = Join-Path $cleanupRoot 'runtime\host.pid'
+    $cleanupStatusPath = Join-Path $cleanupRoot 'runtime\status.json'
+    if (Test-Path -LiteralPath $cleanupPidPath) {
+        Remove-Item -LiteralPath $cleanupPidPath -Force -ErrorAction SilentlyContinue
+    }
+    if (-not (Test-Path -LiteralPath $cleanupStatusPath -PathType Leaf)) { continue }
+    $temporaryStatusPath = "$cleanupStatusPath.tmp"
+    try {
+        $statusObject = Get-Content -LiteralPath $cleanupStatusPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $status = [ordered]@{}
+        foreach ($property in $statusObject.PSObject.Properties) { $status[$property.Name] = $property.Value }
+        $status['running'] = $false
+        $status['pid'] = $null
+        $status['databaseWatch'] = $false
+        $status['controlWatch'] = $false
+        $status['connectedPages'] = 0
+        $status['hubRunning'] = $false
+        $status['hubPort'] = $null
+        $status['browserCompanion'] = $false
+        $status['updatedAt'] = [DateTime]::UtcNow.ToString('o')
+        $status['stopReason'] = 'Stopped by stop-host.ps1'
+        $json = ($status | ConvertTo-Json -Depth 12) + [Environment]::NewLine
+        [IO.File]::WriteAllText($temporaryStatusPath, $json, [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporaryStatusPath -Destination $cleanupStatusPath -Force
+    } catch {
+        Remove-Item -LiteralPath $temporaryStatusPath -Force -ErrorAction SilentlyContinue
+    }
+}
 
 [pscustomobject]@{ stopped = $true; hostCount = $stopped; installRoot = $root; allInstances = [bool]$AllInstances } | ConvertTo-Json -Compress

@@ -164,7 +164,7 @@ Do not reintroduce a fixed root `max-width` or an icon-mode `flex: 0 0 28px` roo
 
 ### Codex App interaction layout performance baseline
 
-The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current injector version is `76`; the exhaustive interaction baseline below was established with injector `69` on Codex Desktop `26.715.2305.0`. Update that baseline only after completing the corresponding full live regression.
+The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current injector version is `77`; the exhaustive interaction baseline below was established with injector `69` on Codex Desktop `26.715.2305.0`. Update that baseline only after completing the corresponding full live regression.
 
 | Codex interaction | Expected injector geometry work |
 |---|---|

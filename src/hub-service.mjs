@@ -380,7 +380,14 @@ export class HubService {
           while (cursor < poolIds.length) {
             const id = poolIds[cursor];
             cursor += 1;
-            await this.refreshProvider(id);
+            const provider = this.providers.get(id);
+            if (!provider) continue;
+            try {
+              await this.refreshProvider(id);
+            } catch (error) {
+              if (this.providers.get(id) !== provider) continue;
+              throw error;
+            }
           }
         };
         await Promise.all(Array.from({ length: Math.min(concurrency, poolIds.length) }, worker));

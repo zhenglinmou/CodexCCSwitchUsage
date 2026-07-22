@@ -232,7 +232,7 @@ export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = glob
 }
 
 export { PAGE_ACTION_SENTINEL };
-export const INJECTOR_VERSION = 76;
+export const INJECTOR_VERSION = 77;
 
 function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, formatRequestTime, selectResponsiveUsageMode, calculateResponsiveMeasurements, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, enqueuePageActionTitle, pageActionSentinel, version) {
   const VERSION = version;
@@ -1354,6 +1354,17 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     for (const element of uniqueElements) state.resizeObserver.observe(element);
   }
 
+  function resetTransientUiForMissingComposer() {
+    hideUsageTooltip();
+    state.popoverOpen = false;
+    state.popoverMode = '';
+    state.popoverTrigger = null;
+    state.popoverAnchor = null;
+    const popover = state.popoverShadow?.getElementById('popover');
+    popover?.classList.remove('open');
+    updateElementAttribute(popover, 'aria-hidden', 'true');
+  }
+
   function mount(forceScan = false) {
     if (forceScan) {
       invalidateNativeFlowCaches();
@@ -1368,7 +1379,10 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       ? state.footer
       : [...footers].sort((left, right) => right.getBoundingClientRect().width - left.getBoundingClientRect().width)[0];
     const parts = footerParts(footer);
-    if (!footer || !parts) return false;
+    if (!footer || !parts) {
+      resetTransientUiForMissingComposer();
+      return false;
+    }
     let root = document.getElementById(ROOT_ID);
     if (!root) root = createRoot();
     placeInNativeFlow(root, parts.right);
