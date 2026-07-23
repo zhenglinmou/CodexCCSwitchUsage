@@ -198,6 +198,7 @@ export class BrowserCallbackBroker {
     }
     this.pending.clear();
     this.queue = [];
+    this.clients.clear();
     if (this.preferenceTimer) clearTimeout(this.preferenceTimer);
     this.preferenceTimer = null;
   }

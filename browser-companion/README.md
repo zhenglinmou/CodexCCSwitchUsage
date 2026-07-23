@@ -2,13 +2,13 @@
 
 > 此浏览器伴侣仅属于 v2。v1 不包含 All API Hub、WAF 同源查询或浏览器伴侣；版本差异见 [docs/V1.md](../docs/V1.md) 与 [docs/V2.md](../docs/V2.md)。
 
-当前伴侣版本为 `0.1.14`，协议版本为 `1`。
+当前伴侣版本为 `0.1.15`，协议版本为 `1`。
 
 这个 MV3 伴侣扩展安装在用户日常使用的 Edge 或 Chrome profile 中，通过同一个 `127.0.0.1:17891` Balance Hub 接收查询任务并回调结果。
 
 - 不保存或回传 Cookie 原文。
 - 查询只使用当前浏览器已有的 Cookie 与同源页面环境。
-- 站点权限固定限制为 AgentRouter、AnyRouter、ChatGPT、`jianzhile.vip` 和 `free.lyclaude.site`，不会接受任意第三方 origin。
+- 站点权限固定限制为 AgentRouter、AnyRouter、ChatGPT、`jianzhile.vip`、`free.lyclaude.site` 和 `muyuan.do`，不会接受任意第三方 origin。
 - 简直了与 freely 的有限 API Key 由宿主直接查询；只有无限 Key 才通过伴侣读取官网登录账户的真实总额度，不把负数或超大占位值当作余额。
 - AnyRouter 返回 `arg1` WAF 挑战时，伴侣会在浏览器内计算并更新该站的 `acw_sc__v2`，随后有限重试；Cookie 原文仍不会离开浏览器。
 - 余额查询本身不会创建、激活或聚焦第三方标签页。

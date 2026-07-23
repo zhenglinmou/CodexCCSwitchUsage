@@ -402,6 +402,8 @@ export class HubService {
           runPool(directIds, directSlots),
           runPool(browserIds, browserSlots),
         ]);
+      } else if (browserIds.length > 0 && directIds.length === 0) {
+        await runPool(browserIds, this.browserConcurrency);
       } else {
         await runPool(ids, this.concurrency);
       }

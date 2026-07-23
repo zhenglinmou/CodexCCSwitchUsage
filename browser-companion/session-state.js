@@ -9,6 +9,7 @@ export const SESSION_ORIGINS = Object.freeze([
   'https://chatgpt.com',
   'https://free.lyclaude.site',
   'https://jianzhile.vip',
+  'https://muyuan.do',
 ]);
 
 const SESSION_ORIGIN_SET = new Set(SESSION_ORIGINS);

@@ -378,9 +378,11 @@ async function pollOnce(current) {
   assertHostJobCompatibility(job);
   const timeoutMs = browserJobTimeout(job);
   const deadline = Date.now() + timeoutMs;
+  let value;
+  let outcome = null;
   try {
-    const value = await withTimeout(executeJob(job, deadline), timeoutMs + 1_000, '第三方网站余额查询超时');
-    const outcome = job.type === 'query-json' ? browserSessionOutcome(job.request, value) : null;
+    value = await withTimeout(executeJob(job, deadline), timeoutMs + 1_000, '第三方网站余额查询超时');
+    outcome = job.type === 'query-json' ? browserSessionOutcome(job.request, value) : null;
     const userId = job.type === 'query-json' ? browserSessionUserId(job.request, value) : '';
     const sessionOrigin = job.request.origin || job.request.baseUrl;
     if (outcome === 'valid') {
@@ -391,15 +393,16 @@ async function pollOnce(current) {
       await sessionHints.forget(sessionOrigin);
       await sessionIdentities.forget(sessionOrigin);
     }
-    await post(current.token, `/companion/result/${encodeURIComponent(job.id)}`, { ok: true, value });
-    if (outcome) scheduleHeartbeat();
   } catch (error) {
     await post(current.token, `/companion/result/${encodeURIComponent(job.id)}`, {
       ok: false,
       message: error instanceof Error ? error.message : String(error),
     });
     scheduleHeartbeat();
+    return true;
   }
+  await post(current.token, `/companion/result/${encodeURIComponent(job.id)}`, { ok: true, value });
+  if (outcome) scheduleHeartbeat();
   return true;
 }
 

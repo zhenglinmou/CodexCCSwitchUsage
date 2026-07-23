@@ -193,6 +193,40 @@ function interactiveWafFailure(status, payload, raw = {}) {
   return /(?:cloudflare|challenge|just a moment|attention required|enable javascript|captcha|waf)/i.test(text);
 }
 
+function openAiWhamFailure(result, browserError = null, missingCredentials = false) {
+  const status = Number(result?.status) || 0;
+  const payload = result?.payload;
+  const payloadError = typeof payload?.error === 'string' ? payload.error : payload?.error?.message;
+  const detail = String(payloadError || payload?.message || browserError?.message || browserError || '').trim();
+  const source = result?.transport === 'edge' ? 'openai_wham_browser' : 'openai_wham';
+  const loginRequired = missingCredentials || status === 401 || authenticationFailure(status, payload, result);
+  if (loginRequired) {
+    return {
+      source,
+      loginRequired: true,
+      message: detail || 'OpenAI 登录已失效，请在 Hub 中重新登录',
+    };
+  }
+  if (interactiveWafFailure(status, payload, result)) {
+    return {
+      source,
+      loginRequired: true,
+      websiteLoginRequired: true,
+      message: 'OpenAI 官网要求完成 WAF 验证，请点击“去官网认证”，完成后手动刷新',
+    };
+  }
+  const summary = status && status !== 200
+    ? `OpenAI 用量接口暂时不可用（HTTP ${status}）`
+    : status === 200
+      ? 'OpenAI 用量响应缺少有效额度窗口'
+      : 'OpenAI 用量查询失败';
+  return {
+    source,
+    loginRequired: false,
+    message: detail ? `${summary}：${detail}` : summary,
+  };
+}
+
 function browserPageUnavailable(message) {
   return /(?:frame with id .*error page|no frame with id|cannot access contents|net::err_|showing error page)/i.test(String(message || ''));
 }
@@ -443,6 +477,7 @@ export function providerKind(provider) {
   if (hasProviderDomain(provider, 'chatgpt.com') || (name.includes('openai') && hasOpenAiCredentials)) return 'openai';
   if (configuredProviderApiHostname(provider) === 'jianzhile.vip') return 'jianzhile';
   if (configuredProviderApiHostname(provider) === 'free.lyclaude.site') return 'freely';
+  if (configuredProviderApiHostname(provider) === 'muyuan.do') return 'muyuan';
   if (hasProviderApiDomain(provider, 'packyapi.com')) return 'packy';
   if (hasProviderApiDomain(provider, 'deepseek.com') || (name.includes('deepseek') && Boolean(providerApiBase(provider)))) return 'deepseek';
   if (hasProviderApiDomain(provider, 'rawchat.cn', 'sharedchat.top') || name.includes('付费站')) return 'paid';
@@ -463,6 +498,8 @@ export function loginConfiguration(provider) {
       return { baseUrl: 'https://jianzhile.vip', loginUrl: 'https://jianzhile.vip/login', requestPath: '/api/user/self', userHeader: 'New-Api-User', navigateRequest: true };
     case 'freely':
       return { baseUrl: 'https://free.lyclaude.site', loginUrl: 'https://free.lyclaude.site/login', requestPath: '/api/user/self', userHeader: 'New-Api-User', navigateRequest: true };
+    case 'muyuan':
+      return { baseUrl: 'https://muyuan.do', loginUrl: 'https://muyuan.do/login', requestPath: '/api/user/self', userHeader: 'New-Api-User', navigateRequest: true };
     default:
       return null;
   }
@@ -568,6 +605,22 @@ export function describeProviderQuery(provider) {
       ],
     };
   }
+  if (kind === 'muyuan') {
+    return {
+      ...common,
+      type: 'api-key-with-account-fallback',
+      label: '君的公益 API Key / 账户总额度',
+      requestUrl: 'https://muyuan.do/api/usage/token/',
+      authentication: 'Bearer API Key；无限 Key 时使用君的公益官网登录态',
+      executor: '有限 Key 直接查询；Cloudflare/WAF 或无限 Key 时由 Edge/Chrome 浏览器伴侣执行同源查询',
+      waf: true,
+      notes: [
+        '此分支仅对配置的 muyuan.do API 域名生效',
+        '有限 API Key 显示 Key 自身额度；无限 API Key 显示所属账户总额度',
+        'Cloudflare/WAF 回退只在现有浏览器内执行；Cookie 和 Token 原文不进入 Hub 页面',
+      ],
+    };
+  }
   if (kind === 'deepseek') {
     return {
       ...common,
@@ -619,6 +672,7 @@ export function providerAliases(provider) {
   if (kind === 'openai') aliases.push(name.includes('我自己的') ? 'openai_personal' : 'openai_official');
   if (kind === 'jianzhile') aliases.push('jianzhile');
   if (kind === 'freely') aliases.push('freely');
+  if (kind === 'muyuan') aliases.push('muyuan');
   if (kind === 'packy') aliases.push('packycode');
   if (kind === 'deepseek') aliases.push('deepseek');
   if (kind === 'paid') aliases.push(name.includes('copy') ? 'paid_sharedchat' : 'paid_rawchat');
@@ -714,6 +768,7 @@ export class ProviderQueryEngine {
     if (kind === 'cpa') return this.#queryCpa(provider, signal);
     if (kind === 'jianzhile') return this.#queryJianzhile(provider, signal);
     if (kind === 'freely') return this.#queryFreely(provider, signal);
+    if (kind === 'muyuan') return this.#queryMuyuan(provider, signal);
     if (kind === 'deepseek') return this.#queryDeepSeek(provider, signal);
     if (kind === 'packy') return this.#queryPacky(provider, signal);
     if (kind === 'paid') return this.#queryPaid(provider, signal);
@@ -841,17 +896,110 @@ export class ProviderQueryEngine {
     });
   }
 
+  async #queryMuyuan(provider, signal) {
+    return this.#queryKnownNewApi(provider, signal, {
+      label: '君的公益',
+      apiKeySource: 'muyuan_api_key',
+      accountSource: 'muyuan_account',
+      browserSource: 'muyuan_browser',
+      finiteExtra: '',
+      accountExtra: '',
+      browserApiFallback: true,
+      directTimeoutMs: 8_000,
+      directAttempts: 1,
+    });
+  }
+
   async #queryKnownNewApi(provider, signal, site) {
     const baseUrl = requiredProviderApiBase(provider);
     if (!provider.apiKey || !baseUrl) throw new Error(`${site.label}没有可用的 API Key 或 Base URL`);
     const origin = new URL(baseUrl).origin;
-    const [tokenResponse, statusResponse] = await Promise.all([
-      fetchJson(this.fetchImpl, `${origin}/api/usage/token/`, {
-        Authorization: `Bearer ${provider.apiKey}`,
-        Accept: 'application/json',
-      }, 40_000, 2, signal),
-      fetchJson(this.fetchImpl, `${origin}/api/status`, { Accept: 'application/json' }, 40_000, 2, signal),
-    ]);
+    const tokenHeaders = {
+      Authorization: `Bearer ${provider.apiKey}`,
+      Accept: 'application/json',
+    };
+    const statusHeaders = { Accept: 'application/json' };
+    let tokenResponse;
+    let statusResponse;
+    let browserApiUsed = false;
+    if (!site.browserApiFallback) {
+      [tokenResponse, statusResponse] = await Promise.all([
+        fetchJson(this.fetchImpl, `${origin}/api/usage/token/`, tokenHeaders, 40_000, 2, signal),
+        fetchJson(this.fetchImpl, `${origin}/api/status`, statusHeaders, 40_000, 2, signal),
+      ]);
+    } else {
+      const safeDirectFetch = async (url, headers) => {
+        try {
+          return { ...await fetchJson(
+            this.fetchImpl,
+            url,
+            headers,
+            Math.max(1, Number(site.directTimeoutMs) || 8_000),
+            Math.max(1, Number(site.directAttempts) || 1),
+            signal,
+          ), error: null };
+        } catch (error) {
+          return { status: 0, payload: null, text: '', error };
+        }
+      };
+      [tokenResponse, statusResponse] = await Promise.all([
+        safeDirectFetch(`${origin}/api/usage/token/`, tokenHeaders),
+        safeDirectFetch(`${origin}/api/status`, statusHeaders),
+      ]);
+      const needsBrowser = result => result.status === 0 || interactiveWafFailure(result.status, result.payload, {
+        text: result.text,
+        error: result.error?.message,
+      });
+      if ([tokenResponse, statusResponse].some(needsBrowser)) {
+        const browserAvailable = typeof this.browserBroker?.queryJson === 'function'
+          && (typeof this.browserBroker.isConnected !== 'function' || this.browserBroker.isConnected());
+        if (!browserAvailable) {
+          const directError = [tokenResponse, statusResponse].find(result => result.error)?.error;
+          if (directError && ![tokenResponse, statusResponse].some(result => interactiveWafFailure(result.status, result.payload, {
+            text: result.text,
+            error: result.error?.message,
+          }))) throw directError;
+          throw new Error(`${site.label}额度接口被 Cloudflare/WAF 拦截；请连接浏览器伴侣后重试`);
+        }
+        const browserFetch = async (requestPath, headers) => {
+          try {
+            const raw = await this.browserBroker.queryJson({
+              baseUrl: origin,
+              requestPath,
+              headers,
+              navigateRequest: false,
+            }, { signal });
+            return {
+              status: Number(raw?.status) || 0,
+              payload: parseBrowserJson(raw?.text),
+              text: String(raw?.text || ''),
+              error: raw?.error ? new Error(String(raw.error)) : null,
+            };
+          } catch (error) {
+            return { status: 0, payload: null, text: '', error };
+          }
+        };
+        browserApiUsed = true;
+        [tokenResponse, statusResponse] = await Promise.all([
+          needsBrowser(tokenResponse) ? browserFetch('/api/usage/token/', tokenHeaders) : tokenResponse,
+          needsBrowser(statusResponse) ? browserFetch('/api/status', statusHeaders) : statusResponse,
+        ]);
+        const browserWaf = [tokenResponse, statusResponse].some(result => interactiveWafFailure(result.status, result.payload, {
+          text: result.text,
+          error: result.error?.message,
+        }));
+        if (browserWaf) {
+          return {
+            source: site.browserSource,
+            loginRequired: true,
+            websiteLoginRequired: true,
+            message: `${site.label}官网要求完成 Cloudflare/WAF 验证；请打开官网完成验证后手动刷新`,
+          };
+        }
+        const browserError = [tokenResponse, statusResponse].find(result => result.status === 0 && result.error)?.error;
+        if (browserError) throw new Error(`${site.label}浏览器查询失败：${browserError instanceof Error ? browserError.message : String(browserError)}`);
+      }
+    }
     if (tokenResponse.status !== 200) throw new Error(String(tokenResponse.payload?.message || `${site.label} API Key 额度接口返回 HTTP ${tokenResponse.status}`));
     if (statusResponse.status !== 200) throw new Error(String(statusResponse.payload?.message || `${site.label}站点配置接口返回 HTTP ${statusResponse.status}`));
     const display = parseKnownNewApiDisplayPayload(statusResponse.payload, site.label);
@@ -866,7 +1014,7 @@ export class ProviderQueryEngine {
           unit: display.unit,
           extra: site.finiteExtra,
         }),
-        source: site.apiKeySource,
+        source: browserApiUsed ? site.browserSource : site.apiKeySource,
         loginRequired: false,
       };
     }
@@ -1161,18 +1309,23 @@ export class ProviderQueryEngine {
     let accessToken = String(tokens.access_token || '');
     const replacement = this.#findCpaToken(accountId);
     if (replacement?.access_token) accessToken = String(replacement.access_token);
-    let result = accessToken && accountId ? await this.#queryWham(accessToken, accountId, signal) : { status: 401, payload: null };
+    const missingCredentials = !accessToken || !accountId;
+    const result = missingCredentials ? { status: 401, payload: null } : await this.#queryWham(accessToken, accountId, signal);
     if (result.status !== 200 || !isWhamUsagePayload(result.payload)) {
-      const browserResult = await this.#queryOpenAiBrowser(provider, signal).catch(() => null);
+      let browserError = null;
+      const browserResult = await this.#queryOpenAiBrowser(provider, signal).catch(error => {
+        browserError = error;
+        return null;
+      });
       if (browserResult) return browserResult;
-      const payloadError = typeof result.payload?.error === 'string' ? result.payload.error : result.payload?.error?.message;
-      return { source: 'openai_wham', loginRequired: true, message: String(payloadError || result.payload?.message || 'OpenAI 登录已失效，请在 Hub 中重新登录') };
+      if (signal?.aborted) throw signal.reason || browserError || new Error('OpenAI 用量查询已取消');
+      return openAiWhamFailure(result, browserError, missingCredentials);
     }
     return this.#openAiUsage(provider, result.payload, result.transport === 'edge' ? 'openai_wham_browser' : 'openai_wham');
   }
 
   async #queryOpenAiBrowser(provider, signal) {
-    if (!this.browserBroker.hasSession('https://chatgpt.com')) return null;
+    if (typeof this.browserBroker?.hasSession !== 'function' || !this.browserBroker.hasSession('https://chatgpt.com')) return null;
     const config = loginConfiguration(provider);
     const raw = await this.browserBroker.queryJson(config, { signal });
     const session = parseBrowserJson(raw?.text);

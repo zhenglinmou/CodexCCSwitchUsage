@@ -131,16 +131,17 @@ fs.writeFileSync(pidPath, String(process.pid), 'utf8');
 
 function writeStatus(extra = {}) {
   const temporary = `${statusPath}.tmp`;
+  const stopping = stopped || extra.running === false;
   const status = {
-    running: true,
-    pid: process.pid,
+    running: !stopping,
+    pid: stopping ? null : process.pid,
     codexProcessId: args.codexPid,
     port: args.port,
     provider: lastPayload.providerName || '',
     usageStatus: lastPayload.status || 'loading',
     eventDrivenTargets: false,
-    databaseWatch: Boolean(databaseWatcher),
-    controlWatch: Boolean(controlWatcher),
+    databaseWatch: stopping ? false : Boolean(databaseWatcher),
+    controlWatch: stopping ? false : Boolean(controlWatcher),
     fallbackPollMs: WATCHER_RETRY_MS,
     databaseAuditMs: DATABASE_AUDIT_MS,
     targetAuditMs: INJECTOR_AUDIT_MS,
@@ -149,14 +150,24 @@ function writeStatus(extra = {}) {
     targetInstallRetryMs: targetInstallBackoff.remainingMs(),
     connectedPages: mountedPages,
     connectionError: lastConnectionError,
-    hubRunning: Boolean(hubServer.boundPort),
-    hubPort: hubServer.boundPort || null,
+    hubRunning: stopping ? false : Boolean(hubServer.boundPort),
+    hubPort: stopping ? null : (hubServer.boundPort || null),
     hubProviders: hubService.getState().providers.length,
-    browserCompanion: browserBroker.getStatus().connected,
+    browserCompanion: stopping ? false : browserBroker.getStatus().connected,
     hubError: lastHubError,
     updatedAt: new Date().toISOString(),
     stopReason,
     ...extra,
+    ...(stopping ? {
+      running: false,
+      pid: null,
+      databaseWatch: false,
+      controlWatch: false,
+      connectedPages: 0,
+      hubRunning: false,
+      hubPort: null,
+      browserCompanion: false,
+    } : {}),
   };
   fs.writeFileSync(temporary, JSON.stringify(status, null, 2), 'utf8');
   fs.renameSync(temporary, statusPath);
@@ -630,16 +641,35 @@ function shutdown(reason = null) {
   const forceExitTimer = setTimeout(() => process.exit(0), 750);
   wakeFallbackPoll();
   codexProcessMonitor?.close();
+  codexProcessMonitor = null;
   databaseWatcher?.close();
+  databaseWatcher = null;
   controlWatcher?.close();
+  controlWatcher = null;
+  mountedPages = 0;
+  mountedTargetIds = new Set();
   const auxiliaryShutdown = Promise.allSettled([hubServer.close()]);
   browserBroker.close();
   if (databaseWatchTimer) clearTimeout(databaseWatchTimer);
   if (currentProviderRefreshTimer) clearTimeout(currentProviderRefreshTimer);
   repository.close();
   try { fs.rmSync(pidPath, { force: true }); } catch {}
-  try { writeStatus({ running: false, connectedPages: 0 }); } catch {}
+  const stoppedStatus = {
+    running: false,
+    pid: null,
+    databaseWatch: false,
+    controlWatch: false,
+    connectedPages: 0,
+    hubRunning: false,
+    hubPort: null,
+    browserCompanion: false,
+  };
+  const writeStoppedStatus = () => {
+    try { writeStatus(stoppedStatus); } catch {}
+  };
+  writeStoppedStatus();
   auxiliaryShutdown.finally(() => {
+    writeStoppedStatus();
     clearTimeout(forceExitTimer);
     process.exit(0);
   });

@@ -83,6 +83,10 @@ Hub cache entries include a SHA-256 configuration fingerprint without credential
 
 The old standalone Python bridge must not run alongside v2 because both use port `17891`.
 
+### Local CPA scope
+
+For this computer, CLIProxyAPI (CPA) is an optional external state and is not part of the v2 acceptance or repair scope. CPA file scanning, account enabled/disabled flags, expired tokens, and multi-account selection may be recorded as known limitations, but they are not blockers for v2 work. Revisit CPA behavior only when the user explicitly asks for it.
+
 ## 3. Enter development mode
 
 The stable EXE host normally runs from the installed directory. Stop all plugin copies, then start the workspace copy:
