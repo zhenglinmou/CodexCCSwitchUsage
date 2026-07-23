@@ -166,6 +166,7 @@ internal static class Program
 
         string[] hostArguments = new string[] {
             node,
+            "--use-env-proxy",
             "--no-warnings",
             "--experimental-sqlite",
             host,

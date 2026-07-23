@@ -1,5 +1,6 @@
 import {
   browserJobTimeout,
+  browserResponseMetadata,
   companionPollFailurePolicy,
   browserSessionOutcome,
   browserSessionUserId,
@@ -18,7 +19,8 @@ import {
 } from './anyrouter-waf.js';
 import {
   assertHostJobCompatibility,
-  BROWSER_TAB_FALLBACK_RESERVE_MS,
+  BROWSER_FETCH_ATTEMPT_TIMEOUT_MS,
+  BROWSER_RESULT_DELIVERY_RESERVE_MS,
   companionHandshake,
 } from './protocol.js';
 
@@ -163,18 +165,61 @@ async function matchingTabs(origin) {
   try { return await chrome.tabs.query({ url: `${origin}/*` }); } catch { return []; }
 }
 
+function interactiveResponseText(metadata) {
+  return metadata.cfMitigated
+    ? 'Cloudflare challenge response'
+    : 'Interactive website page returned instead of JSON';
+}
+
+function browserAttemptTime(deadline) {
+  return Math.min(
+    BROWSER_FETCH_ATTEMPT_TIMEOUT_MS,
+    remainingJobTime(deadline, BROWSER_RESULT_DELIVERY_RESERVE_MS),
+  );
+}
+
+const WEBSITE_PERMISSION_MESSAGE = '余额伴侣缺少供应商网站查询权限；请打开扩展弹窗并点击“授予网站查询权限”';
+
+async function hasWebsitePermission(origin) {
+  try {
+    return await chrome.permissions.contains({ origins: [`${origin}/*`] });
+  } catch {
+    return false;
+  }
+}
+
+function websitePermissionFailure(origin) {
+  return {
+    status: 0,
+    url: origin,
+    text: '',
+    permissionRequired: true,
+    error: WEBSITE_PERMISSION_MESSAGE,
+  };
+}
+
 async function fetchInsideTab(tabId, request, timeoutMs) {
   const targetUrl = new URL(request.requestPath || '/', request.baseUrl).href;
-  const results = await chrome.scripting.executeScript({
-    target: { tabId },
-    world: 'ISOLATED',
-    args: [{ targetUrl, headers: request.headers || {}, userHeader: request.userHeader || '', timeoutMs, maximumBytes: MAX_BROWSER_RESPONSE_BYTES }],
-    func: async settings => {
+  let results;
+  try {
+    results = await withTimeout(
+      chrome.scripting.executeScript({
+        target: { tabId },
+        // Keep the request in the extension world. The companion's host
+        // permissions and credentials policy are the stable path for ordinary
+        // API calls; the existing tab is only a bounded fallback for WAF pages.
+        world: 'ISOLATED',
+        args: [{ targetUrl, headers: request.headers || {}, userHeader: request.userHeader || '', timeoutMs, maximumBytes: MAX_BROWSER_RESPONSE_BYTES }],
+        func: async settings => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), settings.timeoutMs);
       let identityFound = false;
       const readText = async response => {
-        const contentLength = Number(response.headers?.get?.('content-length'));
+        const contentLengthHeader = response.headers?.get?.('content-length');
+        const contentLength = contentLengthHeader == null || String(contentLengthHeader).trim() === ''
+          ? null
+          : Number(contentLengthHeader);
+        const expectedBytes = Number.isFinite(contentLength) && contentLength >= 0 ? contentLength : null;
         if (Number.isFinite(contentLength) && contentLength > settings.maximumBytes) throw new Error('第三方网站响应过大');
         if (!response.body || typeof response.body.getReader !== 'function') {
           const text = await response.text();
@@ -183,7 +228,7 @@ async function fetchInsideTab(tabId, request, timeoutMs) {
         }
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
-        const chunks = [];
+        let text = '';
         let receivedBytes = 0;
         let cancelled = false;
         const cancel = reason => {
@@ -202,10 +247,23 @@ async function fetchInsideTab(tabId, request, timeoutMs) {
               cancel(error);
               throw error;
             }
-            chunks.push(decoder.decode(bytes, { stream: true }));
+            text += decoder.decode(bytes, { stream: true });
+            if (expectedBytes != null && receivedBytes >= expectedBytes) {
+              text += decoder.decode();
+              cancel('response complete');
+              return text;
+            }
+            const trimmedText = text.trim();
+            if (trimmedText.startsWith('{') || trimmedText.startsWith('[')) {
+              try {
+                JSON.parse(trimmedText);
+                cancel('response complete');
+                return text;
+              } catch {}
+            }
           }
-          chunks.push(decoder.decode());
-          return chunks.join('');
+          text += decoder.decode();
+          return text;
         } catch (error) {
           cancel(error);
           throw error;
@@ -230,19 +288,45 @@ async function fetchInsideTab(tabId, request, timeoutMs) {
           headers: outgoing,
           signal: controller.signal,
         });
+        const contentType = String(response.headers?.get?.('content-type') || '').trim().toLowerCase();
+        const cfMitigatedValue = String(response.headers?.get?.('cf-mitigated') || '').trim().toLowerCase();
+        const isJson = /(?:^|\/)json(?:;|$)/.test(contentType) || /\+json(?:;|$)/.test(contentType);
+        const cfMitigated = cfMitigatedValue.includes('challenge');
+        const interactivePage = !isJson && (
+          cfMitigated
+          || /(?:text\/html|application\/xhtml\+xml)/.test(contentType)
+          || (response.status === 403 && !contentType)
+        );
         return {
           status: response.status,
           url: response.url,
-          text: await readText(response),
+          text: interactivePage
+            ? (cfMitigated ? 'Cloudflare challenge response' : 'Interactive website page returned instead of JSON')
+            : await readText(response),
           identityFound,
+          contentType,
+          cfMitigated,
+          interactivePage,
         };
       } catch (error) {
         return { status: 0, url: location.href, text: '', identityFound, error: error instanceof Error ? error.message : String(error) };
       } finally {
         clearTimeout(timer);
       }
-    },
-  });
+        },
+      }),
+      timeoutMs,
+      '网页查询超时',
+    );
+  } catch (error) {
+    return {
+      status: 0,
+      url: targetUrl,
+      text: '',
+      identityFound: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
   return results?.[0]?.result || { status: 0, text: '', error: '网页脚本没有返回结果' };
 }
 
@@ -264,10 +348,21 @@ async function fetchFromExtension(request, userId, timeoutMs) {
       headers: outgoing,
       signal: controller.signal,
     });
+    const metadata = browserResponseMetadata(
+      response.status,
+      response.headers?.get?.('content-type'),
+      response.headers?.get?.('cf-mitigated'),
+    );
+    const preserveAnyRouterChallenge = isAnyRouterAcwUrl(targetUrl)
+      && metadata.interactivePage
+      && !metadata.cfMitigated;
     return {
       status: response.status,
       url: response.url,
-      text: await readLimitedResponseText(response),
+      text: metadata.interactivePage && !preserveAnyRouterChallenge
+        ? interactiveResponseText(metadata)
+        : await readLimitedResponseText(response),
+      ...metadata,
     };
   };
   try {
@@ -290,10 +385,19 @@ async function fetchFromExtension(request, userId, timeoutMs) {
 
 async function syncNewApiSession(request, deadline) {
   const origin = new URL(request.baseUrl).origin;
+  if (!await hasWebsitePermission(origin)) {
+    return {
+      synced: false,
+      opened: false,
+      loginRequired: false,
+      permissionRequired: true,
+      message: WEBSITE_PERMISSION_MESSAGE,
+    };
+  }
   const tabs = (await matchingTabs(origin)).filter(tab => tab.id != null);
   const preferred = selectReadySessionTab(tabs);
   if (!preferred) return focusLoginPage(request);
-  const result = await fetchInsideTab(preferred.id, request, Math.max(1_000, deadline - Date.now()));
+  const result = await fetchInsideTab(preferred.id, request, browserAttemptTime(deadline));
   const userId = browserSessionUserId(request, result);
   if (!userId) {
     const opened = await focusLoginPage(request);
@@ -301,9 +405,12 @@ async function syncNewApiSession(request, deadline) {
     return {
       ...opened,
       loginRequired: outcome === 'invalid',
-      message: outcome === 'invalid'
-        ? '现有浏览器登录已失效，已打开官网；完成认证后请手动刷新'
-        : String(result.error || '未能同步网站用户身份，已打开官网；完成认证后请手动刷新'),
+      verificationRequired: result.interactivePage === true,
+      message: result.interactivePage === true
+        ? '官网正在要求 Cloudflare/WAF 验证，已打开官网；完成验证后请手动刷新'
+        : outcome === 'invalid'
+          ? '现有浏览器登录已失效，已打开官网；完成认证后请手动刷新'
+          : String(result.error || '未能同步网站用户身份，已打开官网；完成认证后请手动刷新'),
     };
   }
   await sessionIdentities.remember(origin, userId);
@@ -328,17 +435,24 @@ async function focusLoginPage(request) {
 
 async function queryThroughCurrentBrowser(request, deadline) {
   const origin = new URL(request.baseUrl).origin;
+  if (!await hasWebsitePermission(origin)) return websitePermissionFailure(origin);
   const userId = await sessionIdentities.get(origin);
-  const direct = await fetchFromExtension(request, userId, remainingJobTime(deadline, BROWSER_TAB_FALLBACK_RESERVE_MS));
+  const direct = await fetchFromExtension(request, userId, browserAttemptTime(deadline));
   const directOutcome = browserSessionOutcome(request, direct);
   if (isJsonText(direct.text) && (!request.userHeader || directOutcome === 'valid')) return direct;
 
   const tabs = (await matchingTabs(origin)).filter(tab => tab.id != null);
   const preferred = selectReadySessionTab(tabs);
-  if (!preferred) return request.userHeader && !userId ? { ...direct, identityMissing: true } : direct;
-  const result = await fetchInsideTab(preferred.id, request, remainingJobTime(deadline));
-  if (request.userHeader && !userId && result.identityFound !== true) return { ...result, identityMissing: true };
-  return result;
+  if (preferred) {
+    const pageResult = await fetchInsideTab(preferred.id, request, browserAttemptTime(deadline));
+    const pageOutcome = browserSessionOutcome(request, pageResult);
+    if (isJsonText(pageResult.text) && (!request.userHeader || pageOutcome === 'valid')) return pageResult;
+    const targetUrl = new URL(request.requestPath || '/', request.baseUrl).href;
+    const needsAnyRouterSolver = pageResult.interactivePage === true && isAnyRouterAcwUrl(targetUrl);
+    if (Number(pageResult.status) > 0 && !needsAnyRouterSolver) return pageResult;
+  }
+
+  return request.userHeader && !userId ? { ...direct, identityMissing: true } : direct;
 }
 
 function remainingJobTime(deadline, reserveMs = 0) {
@@ -377,11 +491,18 @@ async function pollOnce(current) {
   const job = payload.job;
   assertHostJobCompatibility(job);
   const timeoutMs = browserJobTimeout(job);
-  const deadline = Date.now() + timeoutMs;
+  const startedAt = Date.now();
+  const hostExpiresAt = Date.parse(String(job.expiresAt || ''));
+  const localDeadline = startedAt + timeoutMs;
+  const deadline = Number.isFinite(hostExpiresAt)
+    ? Math.min(localDeadline, hostExpiresAt - BROWSER_RESULT_DELIVERY_RESERVE_MS)
+    : localDeadline;
+  const executionTimeoutMs = deadline - startedAt;
   let value;
   let outcome = null;
   try {
-    value = await withTimeout(executeJob(job, deadline), timeoutMs + 1_000, '第三方网站余额查询超时');
+    if (executionTimeoutMs < 1_000) throw new Error('浏览器任务已超过宿主截止时间');
+    value = await withTimeout(executeJob(job, deadline), executionTimeoutMs + 500, '第三方网站余额查询超时');
     outcome = job.type === 'query-json' ? browserSessionOutcome(job.request, value) : null;
     const userId = job.type === 'query-json' ? browserSessionUserId(job.request, value) : '';
     const sessionOrigin = job.request.origin || job.request.baseUrl;

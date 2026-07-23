@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CCSwitch Balance Browser Companion",
-  "version": "0.1.15",
+  "version": "0.1.22",
   "description": "Use the current browser profile and its existing website sessions for CCSwitch Balance Hub callbacks.",
   "permissions": [
     "alarms",
@@ -11,13 +11,16 @@
     "tabs"
   ],
   "host_permissions": [
-    "http://127.0.0.1:17891/*",
+    "http://127.0.0.1:17891/*"
+  ],
+  "optional_host_permissions": [
     "https://agentrouter.org/*",
     "https://anyrouter.top/*",
     "https://chatgpt.com/*",
     "https://free.lyclaude.site/*",
     "https://jianzhile.vip/*",
-    "https://muyuan.do/*"
+    "https://muyuan.do/*",
+    "https://welfare.0xpsyche.me/*"
   ],
   "background": {
     "service_worker": "background.js",

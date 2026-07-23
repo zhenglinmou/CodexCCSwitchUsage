@@ -136,7 +136,14 @@ function parseKnownNewApiTokenPayload(payload, display, providerLabel) {
   if (typeof data.unlimited_quota !== 'boolean') throw new Error(`${providerLabel} API Key 额度响应缺少 unlimited_quota`);
   const name = typeof data.name === 'string' ? data.name.trim() : '';
   if (data.unlimited_quota) {
-    return { name, unlimited: true, remaining: null, used: null, total: null };
+    const usedQuota = data.total_used == null ? null : schemaNumber(data.total_used, 'total_used');
+    return {
+      name,
+      unlimited: true,
+      remaining: null,
+      used: usedQuota == null ? null : displayKnownNewApiQuota(usedQuota, display),
+      total: null,
+    };
   }
   const remainingQuota = schemaNumber(data.total_available, 'total_available');
   const usedQuota = schemaNumber(data.total_used, 'total_used');
@@ -187,6 +194,7 @@ function authenticationFailure(status, payload, raw = {}) {
 }
 
 function interactiveWafFailure(status, payload, raw = {}) {
+  if (raw?.cfMitigated === true || raw?.interactivePage === true) return true;
   const text = String(payload?.message || payload?.error || raw?.text || raw?.error || raw?.message || '');
   if (Number(status) === 403) return true;
   if (payload && typeof payload === 'object') return false;
@@ -273,6 +281,33 @@ function usageResult(provider, values) {
     Object.defineProperty(usage, PROVIDER_SCOPED_NAME, { value: true });
   }
   return usage;
+}
+
+function localUsageFallback(repository, provider, reason, options = {}) {
+  let local = { requestCount: 0, totalCost: 0 };
+  try {
+    local = repository?.getLocalUsage?.(provider.id) || local;
+  } catch {}
+  const requestCount = Math.max(0, Number(local.requestCount) || 0);
+  const totalCost = Math.max(0, Number(local.totalCost) || 0);
+  if (requestCount <= 0 && totalCost <= 0) return null;
+  const detail = String(reason || '远端余额接口暂时不可用').trim().slice(0, 240);
+  const websiteLoginRequired = options.websiteLoginRequired === true;
+  return {
+    usage: usageResult(provider, {
+      planName: `${provider.name} 本地已用估算`,
+      remaining: null,
+      used: totalCost,
+      total: null,
+      unit: 'USD',
+      extra: `${detail}；请求次数：${requestCount}`,
+    }),
+    source: 'muyuan_local_usage',
+    degraded: true,
+    loginRequired: websiteLoginRequired,
+    websiteLoginRequired,
+    message: `${provider.name}远端查询失败（${detail}），显示本地已用估算（${totalCost.toFixed(6)} USD；请求次数：${requestCount}）`,
+  };
 }
 
 async function readJsonResponse(response) {
@@ -478,6 +513,7 @@ export function providerKind(provider) {
   if (configuredProviderApiHostname(provider) === 'jianzhile.vip') return 'jianzhile';
   if (configuredProviderApiHostname(provider) === 'free.lyclaude.site') return 'freely';
   if (configuredProviderApiHostname(provider) === 'muyuan.do') return 'muyuan';
+  if (configuredProviderApiHostname(provider) === 'welfare.0xpsyche.me') return 'welfare';
   if (hasProviderApiDomain(provider, 'packyapi.com')) return 'packy';
   if (hasProviderApiDomain(provider, 'deepseek.com') || (name.includes('deepseek') && Boolean(providerApiBase(provider)))) return 'deepseek';
   if (hasProviderApiDomain(provider, 'rawchat.cn', 'sharedchat.top') || name.includes('付费站')) return 'paid';
@@ -500,6 +536,8 @@ export function loginConfiguration(provider) {
       return { baseUrl: 'https://free.lyclaude.site', loginUrl: 'https://free.lyclaude.site/login', requestPath: '/api/user/self', userHeader: 'New-Api-User', navigateRequest: true };
     case 'muyuan':
       return { baseUrl: 'https://muyuan.do', loginUrl: 'https://muyuan.do/login', requestPath: '/api/user/self', userHeader: 'New-Api-User', navigateRequest: true };
+    case 'welfare':
+      return { baseUrl: 'https://welfare.0xpsyche.me', loginUrl: 'https://welfare.0xpsyche.me/login', requestPath: '/api/user/self', userHeader: 'New-Api-User', navigateRequest: true };
     default:
       return null;
   }
@@ -621,6 +659,21 @@ export function describeProviderQuery(provider) {
       ],
     };
   }
+  if (kind === 'welfare') {
+    return {
+      ...common,
+      type: 'api-key-with-account-fallback',
+      label: '无名公益站 API Key / 账户总额度',
+      requestUrl: 'https://welfare.0xpsyche.me/api/usage/token/',
+      authentication: 'Bearer API Key；无限 Key 时使用无名公益站官网登录态',
+      executor: '有限 Key 由 Balance Hub 直接查询；无限 Key 由 Edge/Chrome 伴侣查询账户总额度',
+      notes: [
+        '此分支仅对配置的 welfare.0xpsyche.me API 域名生效',
+        '有限 API Key 显示 Key 自身额度；无限 API Key 显示所属账户总额度',
+        '无限 API Key 需要官网登录态；Cookie 和 Token 原文不回传页面',
+      ],
+    };
+  }
   if (kind === 'deepseek') {
     return {
       ...common,
@@ -673,6 +726,7 @@ export function providerAliases(provider) {
   if (kind === 'jianzhile') aliases.push('jianzhile');
   if (kind === 'freely') aliases.push('freely');
   if (kind === 'muyuan') aliases.push('muyuan');
+  if (kind === 'welfare') aliases.push('welfare');
   if (kind === 'packy') aliases.push('packycode');
   if (kind === 'deepseek') aliases.push('deepseek');
   if (kind === 'paid') aliases.push(name.includes('copy') ? 'paid_sharedchat' : 'paid_rawchat');
@@ -769,6 +823,7 @@ export class ProviderQueryEngine {
     if (kind === 'jianzhile') return this.#queryJianzhile(provider, signal);
     if (kind === 'freely') return this.#queryFreely(provider, signal);
     if (kind === 'muyuan') return this.#queryMuyuan(provider, signal);
+    if (kind === 'welfare') return this.#queryWelfare(provider, signal);
     if (kind === 'deepseek') return this.#queryDeepSeek(provider, signal);
     if (kind === 'packy') return this.#queryPacky(provider, signal);
     if (kind === 'paid') return this.#queryPaid(provider, signal);
@@ -849,6 +904,10 @@ export class ProviderQueryEngine {
         message: '第三方网站要求完成 WAF 验证，请点击“去官网认证”，完成后手动刷新',
       };
     }
+    if (Number(raw?.status) === 0) {
+      const detail = String(raw?.error || raw?.message || '未收到第三方网站响应').trim();
+      throw new Error(`浏览器查询失败：${detail}`);
+    }
     if (!payload) {
       return {
         source: 'browser_session',
@@ -905,8 +964,19 @@ export class ProviderQueryEngine {
       finiteExtra: '',
       accountExtra: '',
       browserApiFallback: true,
+      localUsageFallback: true,
       directTimeoutMs: 8_000,
       directAttempts: 1,
+    });
+  }
+
+  async #queryWelfare(provider, signal) {
+    return this.#queryKnownNewApi(provider, signal, {
+      label: '无名公益站',
+      apiKeySource: 'welfare_api_key',
+      accountSource: 'welfare_account',
+      finiteExtra: '',
+      accountExtra: '',
     });
   }
 
@@ -950,15 +1020,16 @@ export class ProviderQueryEngine {
         text: result.text,
         error: result.error?.message,
       });
+      const directWaf = [tokenResponse, statusResponse].some(result => interactiveWafFailure(result.status, result.payload, {
+        text: result.text,
+        error: result.error?.message,
+      }));
       if ([tokenResponse, statusResponse].some(needsBrowser)) {
         const browserAvailable = typeof this.browserBroker?.queryJson === 'function'
           && (typeof this.browserBroker.isConnected !== 'function' || this.browserBroker.isConnected());
         if (!browserAvailable) {
           const directError = [tokenResponse, statusResponse].find(result => result.error)?.error;
-          if (directError && ![tokenResponse, statusResponse].some(result => interactiveWafFailure(result.status, result.payload, {
-            text: result.text,
-            error: result.error?.message,
-          }))) throw directError;
+          if (directError && !directWaf) throw directError;
           throw new Error(`${site.label}额度接口被 Cloudflare/WAF 拦截；请连接浏览器伴侣后重试`);
         }
         const browserFetch = async (requestPath, headers) => {
@@ -974,6 +1045,9 @@ export class ProviderQueryEngine {
               payload: parseBrowserJson(raw?.text),
               text: String(raw?.text || ''),
               error: raw?.error ? new Error(String(raw.error)) : null,
+              cfMitigated: raw?.cfMitigated === true,
+              interactivePage: raw?.interactivePage === true,
+              permissionRequired: raw?.permissionRequired === true,
             };
           } catch (error) {
             return { status: 0, payload: null, text: '', error };
@@ -989,6 +1063,10 @@ export class ProviderQueryEngine {
           error: result.error?.message,
         }));
         if (browserWaf) {
+          const fallback = site.localUsageFallback
+            ? localUsageFallback(this.repository, provider, '官网要求完成 Cloudflare/WAF 验证', { websiteLoginRequired: true })
+            : null;
+          if (fallback) return fallback;
           return {
             source: site.browserSource,
             loginRequired: true,
@@ -997,7 +1075,21 @@ export class ProviderQueryEngine {
           };
         }
         const browserError = [tokenResponse, statusResponse].find(result => result.status === 0 && result.error)?.error;
-        if (browserError) throw new Error(`${site.label}浏览器查询失败：${browserError instanceof Error ? browserError.message : String(browserError)}`);
+        if (browserError) {
+          const browserPermissionRequired = [tokenResponse, statusResponse].some(result => result.permissionRequired === true);
+          const fallback = site.localUsageFallback
+            ? localUsageFallback(
+                this.repository,
+                provider,
+                browserPermissionRequired
+                  ? '余额伴侣缺少供应商网站查询权限；请打开扩展弹窗并点击“授予网站查询权限”'
+                  : '浏览器传输未能取得远端余额',
+                { websiteLoginRequired: directWaf && !browserPermissionRequired },
+              )
+            : null;
+          if (fallback) return fallback;
+          throw new Error(`${site.label}浏览器查询失败：${browserError instanceof Error ? browserError.message : String(browserError)}`);
+        }
       }
     }
     if (tokenResponse.status !== 200) throw new Error(String(tokenResponse.payload?.message || `${site.label} API Key 额度接口返回 HTTP ${tokenResponse.status}`));
@@ -1071,12 +1163,14 @@ export class ProviderQueryEngine {
       throw new Error(String(accountPayload?.message || raw?.error || `${site.label}账户额度接口返回 HTTP ${Number(raw?.status) || 0}`));
     }
     const account = parseKnownNewApiAccountPayload(accountPayload, display, site.label);
+    const usedCandidates = [account.used, token.used].filter(value => Number.isFinite(value));
+    const used = usedCandidates.length ? Math.max(...usedCandidates) : null;
     return {
       usage: usageResult(provider, {
         planName: `${provider.name} 账户总额度`,
         remaining: account.remaining,
-        used: account.used,
-        total: account.total,
+        used,
+        total: used == null ? account.total : account.remaining + used,
         unit: display.unit,
         extra: site.accountExtra,
       }),

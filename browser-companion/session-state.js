@@ -10,6 +10,7 @@ export const SESSION_ORIGINS = Object.freeze([
   'https://free.lyclaude.site',
   'https://jianzhile.vip',
   'https://muyuan.do',
+  'https://welfare.0xpsyche.me',
 ]);
 
 const SESSION_ORIGIN_SET = new Set(SESSION_ORIGINS);
@@ -17,9 +18,31 @@ const DEFAULT_STORAGE_KEY = 'validatedSessionOrigins';
 const DEFAULT_IDENTITY_STORAGE_KEY = 'sessionUserIds';
 export const MAX_BROWSER_RESPONSE_BYTES = 2_000_000;
 
+export function browserResponseMetadata(status, contentType, cfMitigated) {
+  const normalizedStatus = Number(status) || 0;
+  const normalizedContentType = String(contentType || '').trim().toLowerCase();
+  const normalizedCfMitigated = String(cfMitigated || '').trim().toLowerCase();
+  const isJson = /(?:^|\/)json(?:;|$)/.test(normalizedContentType)
+    || /\+json(?:;|$)/.test(normalizedContentType);
+  const cfChallenge = normalizedCfMitigated === 'challenge'
+    || normalizedCfMitigated.includes('challenge');
+  const interactivePage = cfChallenge
+    || /(?:text\/html|application\/xhtml\+xml)/.test(normalizedContentType)
+    || (normalizedStatus === 403 && !normalizedContentType);
+  return {
+    contentType: normalizedContentType,
+    cfMitigated: cfChallenge,
+    interactivePage: interactivePage && !isJson,
+  };
+}
+
 export async function readLimitedResponseText(response, maximumBytes = MAX_BROWSER_RESPONSE_BYTES) {
   const limit = Math.max(1, Math.trunc(Number(maximumBytes) || MAX_BROWSER_RESPONSE_BYTES));
-  const contentLength = Number(response?.headers?.get?.('content-length'));
+  const contentLengthHeader = response?.headers?.get?.('content-length');
+  const contentLength = contentLengthHeader == null || String(contentLengthHeader).trim() === ''
+    ? null
+    : Number(contentLengthHeader);
+  const expectedBytes = Number.isFinite(contentLength) && contentLength >= 0 ? contentLength : null;
   if (Number.isFinite(contentLength) && contentLength > limit) throw new Error('第三方网站响应过大');
 
   if (!response?.body || typeof response.body.getReader !== 'function') {
@@ -30,7 +53,7 @@ export async function readLimitedResponseText(response, maximumBytes = MAX_BROWS
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  const chunks = [];
+  let text = '';
   let receivedBytes = 0;
   let cancelled = false;
   const cancel = reason => {
@@ -49,10 +72,23 @@ export async function readLimitedResponseText(response, maximumBytes = MAX_BROWS
         cancel(error);
         throw error;
       }
-      chunks.push(decoder.decode(bytes, { stream: true }));
+      text += decoder.decode(bytes, { stream: true });
+      if (expectedBytes != null && receivedBytes >= expectedBytes) {
+        text += decoder.decode();
+        cancel('response complete');
+        return text;
+      }
+      const trimmedText = text.trim();
+      if (trimmedText.startsWith('{') || trimmedText.startsWith('[')) {
+        try {
+          JSON.parse(trimmedText);
+          cancel('response complete');
+          return text;
+        } catch {}
+      }
     }
-    chunks.push(decoder.decode());
-    return chunks.join('');
+    text += decoder.decode();
+    return text;
   } catch (error) {
     cancel(error);
     throw error;

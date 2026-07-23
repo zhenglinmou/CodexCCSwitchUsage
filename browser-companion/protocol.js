@@ -11,7 +11,11 @@ export const COMPANION_CAPABILITIES = Object.freeze([
 export const PROVIDER_QUERY_TIMEOUT_MS = 45_000;
 export const BROWSER_CALLBACK_TIMEOUT_MS = 44_000;
 export const BROWSER_JOB_TIMEOUT_MS = 40_000;
-export const BROWSER_TAB_FALLBACK_RESERVE_MS = 5_000;
+// Keep each browser transport attempt short enough that a second request in
+// the same provider query can still run before the Hub deadline.  A page that
+// is serving a WAF challenge may never finish its response body.
+export const BROWSER_FETCH_ATTEMPT_TIMEOUT_MS = 8_000;
+export const BROWSER_RESULT_DELIVERY_RESERVE_MS = 2_000;
 export const BROWSER_LOGIN_JOB_TIMEOUT_MS = 20_000;
 
 export function companionHandshake() {

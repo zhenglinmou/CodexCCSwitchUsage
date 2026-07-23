@@ -211,11 +211,13 @@ export class BrowserCallbackBroker {
     const origin = normalizeOrigin(request?.baseUrl || request?.loginUrl || request?.origin);
     const preferredClientId = this.#preferredClient(origin);
     const id = crypto.randomUUID();
+    const createdAt = this.now();
     const publicJob = {
       id,
       type,
       protocolVersion: COMPANION_PROTOCOL_VERSION,
-      createdAt: new Date(this.now()).toISOString(),
+      createdAt: new Date(createdAt).toISOString(),
+      expiresAt: new Date(createdAt + timeoutMs).toISOString(),
       request: { ...request, origin },
     };
     return new Promise((resolve, reject) => {

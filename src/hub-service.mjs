@@ -164,6 +164,7 @@ export class HubService {
     this.cacheDirty = false;
     this.revision = 0;
     this.providerSnapshot = null;
+    this.publicProvidersCache = null;
     this.lastFullRefreshAt = '';
     this.lastFullRefreshDurationMs = null;
     this.cachedItems = readCache(this.cachePath);
@@ -247,6 +248,7 @@ export class HubService {
     }
     this.cachedItems = {};
     this.providerSnapshot = providers;
+    this.publicProvidersCache = null;
     this.revision += 1;
     return { changed: true, providers };
   }
@@ -273,7 +275,8 @@ export class HubService {
   }
 
   listPublicProviders() {
-    return [...this.providers.values()].map(provider => {
+    if (this.publicProvidersCache) return this.publicProvidersCache;
+    this.publicProvidersCache = [...this.providers.values()].map(provider => {
       const loginConfig = loginConfiguration(provider);
       return {
         id: provider.id,
@@ -287,6 +290,7 @@ export class HubService {
         balanceUrl: `/v1/balance/${encodeURIComponent(provider.id)}`,
       };
     });
+    return this.publicProvidersCache;
   }
 
   refreshProvider(providerSelector) {
@@ -324,7 +328,11 @@ export class HubService {
           this.items.set(target.id, {
             ...current,
             status: targetUsage ? (result.degraded ? 'degraded' : 'ok') : (result.loginRequired ? 'login-required' : 'error'),
-            message: targetUsage ? (result.degraded ? 'API 可用性检查未通过，显示本地统计' : '') : safeMessage(result.message || '没有返回可显示的额度数据'),
+            message: targetUsage
+              ? (result.degraded
+                ? safeMessage(result.message || 'API 可用性检查未通过，显示本地统计')
+                : '')
+              : safeMessage(result.message || '没有返回可显示的额度数据'),
             source: String(result.source || ''),
             sessionSyncRequired: result.sessionSyncRequired === true,
             websiteLoginRequired: result.websiteLoginRequired === true,

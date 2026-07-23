@@ -14,6 +14,66 @@ if ($packageMarker.name -ne 'codex-ccswitch-usage') { throw '扩展安装标识�
 $runtime = Join-Path $root 'runtime'
 [IO.Directory]::CreateDirectory($runtime) | Out-Null
 
+function ConvertTo-NodeProxyUrl {
+    param([string]$Value)
+    $candidate = [string]$Value
+    $candidate = $candidate.Trim()
+    if (-not $candidate) { return '' }
+    if ($candidate -notmatch '^[A-Za-z][A-Za-z0-9+.-]*://') {
+        $candidate = "http://$candidate"
+    }
+    try {
+        $uri = [Uri]$candidate
+        if ($uri.Scheme -notin @('http', 'https') -or -not $uri.Host) { return '' }
+        return $uri.AbsoluteUri.TrimEnd('/')
+    } catch {
+        return ''
+    }
+}
+
+function Get-NodeProxyEnvironment {
+    $environment = @{}
+    $httpProxy = [Environment]::GetEnvironmentVariable('HTTP_PROXY', 'Process')
+    $httpsProxy = [Environment]::GetEnvironmentVariable('HTTPS_PROXY', 'Process')
+    if (-not $httpProxy -and -not $httpsProxy) {
+        try {
+            $settings = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+            if ([int]$settings.ProxyEnable -eq 1) {
+                $proxies = @{}
+                $fallbackProxy = ''
+                foreach ($segment in ([string]$settings.ProxyServer -split ';')) {
+                    $part = $segment.Trim()
+                    if (-not $part) { continue }
+                    $pair = $part -split '=', 2
+                    if ($pair.Count -eq 2) {
+                        $proxies[$pair[0].Trim().ToLowerInvariant()] = $pair[1].Trim()
+                    } else {
+                        $fallbackProxy = $part
+                    }
+                }
+                $httpValue = if ($proxies.ContainsKey('http')) { $proxies['http'] } else { $fallbackProxy }
+                $httpsValue = if ($proxies.ContainsKey('https')) { $proxies['https'] } else { $fallbackProxy }
+                if (-not $httpValue) { $httpValue = $httpsValue }
+                if (-not $httpsValue) { $httpsValue = $httpValue }
+                $httpProxy = ConvertTo-NodeProxyUrl $httpValue
+                $httpsProxy = ConvertTo-NodeProxyUrl $httpsValue
+            }
+        } catch {}
+    }
+    if (-not $httpProxy) { $httpProxy = $httpsProxy }
+    if (-not $httpsProxy) { $httpsProxy = $httpProxy }
+    if ($httpProxy) { $environment['HTTP_PROXY'] = $httpProxy }
+    if ($httpsProxy) { $environment['HTTPS_PROXY'] = $httpsProxy }
+
+    $noProxy = [Environment]::GetEnvironmentVariable('NO_PROXY', 'Process')
+    $noProxyEntries = @($noProxy -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    foreach ($localAddress in @('127.0.0.1', 'localhost', '::1')) {
+        if ($localAddress -notin $noProxyEntries) { $noProxyEntries += $localAddress }
+    }
+    $environment['NO_PROXY'] = $noProxyEntries -join ','
+    return $environment
+}
+
 function Find-CodexApplication {
     $package = Get-AppxPackage OpenAI.Codex | Sort-Object Version -Descending | Select-Object -First 1
     if ($package) {
@@ -204,40 +264,52 @@ if ($hostMatchesSource -and -not $hostMatchesCodex) {
     $hostProcess = $null
 }
 if (-not $hostMatchesSource -or -not $hostMatchesCodex) {
-    $packagedLauncher = Join-Path $root 'CodexCCSwitchUsage.exe'
-    if (Test-Path -LiteralPath $packagedLauncher -PathType Leaf) {
-        $launcherError = Join-Path $runtime 'launcher-error.log'
-        Remove-Item -LiteralPath $launcherError -Force -ErrorAction SilentlyContinue
-        [IO.File]::WriteAllText((Join-Path $runtime 'host.log'), '')
-        [IO.File]::WriteAllText((Join-Path $runtime 'host-error.log'), '')
-        $hostStart = Start-Process -FilePath $packagedLauncher -ArgumentList @(
-            '--start-host',
-            '--port', $Port,
-            '--codex-pid', $codexProcessId,
-            '--runtime-dir', ('"' + $runtime + '"'),
-            '--database', ('"' + $databasePath + '"')
-        ) -WorkingDirectory $root -WindowStyle Hidden -PassThru
-        $hostStart.WaitForExit()
-        if ($hostStart.ExitCode -ne 0) {
-            $detail = if (Test-Path -LiteralPath $launcherError) {
-                (Get-Content -LiteralPath $launcherError -Raw).Trim()
-            } else {
-                "Detached host launcher exited with code $($hostStart.ExitCode)."
-            }
-            throw $detail
+    $nodeProxyEnvironment = Get-NodeProxyEnvironment
+    $previousProxyEnvironment = @{}
+    try {
+        foreach ($name in $nodeProxyEnvironment.Keys) {
+            $previousProxyEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+            [Environment]::SetEnvironmentVariable($name, $nodeProxyEnvironment[$name], 'Process')
         }
-    } else {
-        $node = (Get-Command node.exe -ErrorAction Stop).Source
-        Start-Process -FilePath $node -ArgumentList @(
-            '--no-warnings', '--experimental-sqlite',
-            ('"' + $hostPath + '"'),
-            '--port', $Port,
-            '--codex-pid', $codexProcessId,
-            '--runtime-dir', ('"' + $runtime + '"'),
-            '--database', ('"' + $databasePath + '"')
-        ) -WorkingDirectory $root -WindowStyle Hidden `
-          -RedirectStandardOutput (Join-Path $runtime 'host.log') `
-          -RedirectStandardError (Join-Path $runtime 'host-error.log') | Out-Null
+        $packagedLauncher = Join-Path $root 'CodexCCSwitchUsage.exe'
+        if (Test-Path -LiteralPath $packagedLauncher -PathType Leaf) {
+            $launcherError = Join-Path $runtime 'launcher-error.log'
+            Remove-Item -LiteralPath $launcherError -Force -ErrorAction SilentlyContinue
+            [IO.File]::WriteAllText((Join-Path $runtime 'host.log'), '')
+            [IO.File]::WriteAllText((Join-Path $runtime 'host-error.log'), '')
+            $hostStart = Start-Process -FilePath $packagedLauncher -ArgumentList @(
+                '--start-host',
+                '--port', $Port,
+                '--codex-pid', $codexProcessId,
+                '--runtime-dir', ('"' + $runtime + '"'),
+                '--database', ('"' + $databasePath + '"')
+            ) -WorkingDirectory $root -WindowStyle Hidden -PassThru
+            $hostStart.WaitForExit()
+            if ($hostStart.ExitCode -ne 0) {
+                $detail = if (Test-Path -LiteralPath $launcherError) {
+                    (Get-Content -LiteralPath $launcherError -Raw).Trim()
+                } else {
+                    "Detached host launcher exited with code $($hostStart.ExitCode)."
+                }
+                throw $detail
+            }
+        } else {
+            $node = (Get-Command node.exe -ErrorAction Stop).Source
+            Start-Process -FilePath $node -ArgumentList @(
+                '--use-env-proxy', '--no-warnings', '--experimental-sqlite',
+                ('"' + $hostPath + '"'),
+                '--port', $Port,
+                '--codex-pid', $codexProcessId,
+                '--runtime-dir', ('"' + $runtime + '"'),
+                '--database', ('"' + $databasePath + '"')
+            ) -WorkingDirectory $root -WindowStyle Hidden `
+              -RedirectStandardOutput (Join-Path $runtime 'host.log') `
+              -RedirectStandardError (Join-Path $runtime 'host-error.log') | Out-Null
+        }
+    } finally {
+        foreach ($name in $previousProxyEnvironment.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $previousProxyEnvironment[$name], 'Process')
+        }
     }
 }
 
