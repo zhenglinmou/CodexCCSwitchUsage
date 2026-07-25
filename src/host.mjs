@@ -3,6 +3,7 @@ import path from 'node:path';
 import { BrowserCallbackBroker } from './browser-callback-broker.mjs';
 import { isCodexTargetCandidate, listCdpTargets } from './cdp-client.mjs';
 import { ProviderRepository } from './provider-repository.mjs';
+import { ProviderRequestUsageEngine } from './provider-request-usage.mjs';
 import { HubServer } from './hub-server.mjs';
 import { ProviderQueryEngine } from './hub-provider-adapters.mjs';
 import { hubItemToUsagePayload, HubService, providerConfigurationFingerprint, safeHubMessage } from './hub-service.mjs';
@@ -45,7 +46,11 @@ const cachePath = path.join(args.runtimeDir, 'usage-cache.json');
 const repository = new ProviderRepository(args.database);
 const browserBroker = new BrowserCallbackBroker();
 const hubQueryEngine = new ProviderQueryEngine(repository, browserBroker);
-const hubService = new HubService(repository, hubQueryEngine, { cachePath: path.join(args.runtimeDir, 'hub-cache.json') });
+const providerRequestUsageEngine = new ProviderRequestUsageEngine({ browserBroker });
+const hubService = new HubService(repository, hubQueryEngine, {
+  cachePath: path.join(args.runtimeDir, 'hub-cache.json'),
+  requestUsageEngine: providerRequestUsageEngine,
+});
 const hubServer = new HubServer(hubService, {
   tokenPath: path.join(args.runtimeDir, 'hub-token'),
   browserBroker,
@@ -66,6 +71,11 @@ function writeUsageCache(payload, providerSignature = '') {
   const temporary = `${cachePath}.tmp`;
   const cachePayload = { ...payload };
   delete cachePayload.recentRequests;
+  delete cachePayload.recentRequestsLoading;
+  delete cachePayload.recentRequestsSource;
+  delete cachePayload.recentRequestsPreciseCost;
+  delete cachePayload.recentRequestsFetchedAt;
+  delete cachePayload.recentRequestsMessage;
   fs.writeFileSync(temporary, JSON.stringify({ ...cachePayload, providerSignature }), 'utf8');
   fs.renameSync(temporary, cachePath);
 }
@@ -125,6 +135,13 @@ let lastHubStartAttemptAt = 0;
 let recentRequestProviderId = '';
 let recentRequests = [];
 let recentRequestsSignature = '';
+let recentRequestsLoading = false;
+let recentRequestsSource = 'ccswitch_local';
+let recentRequestsPreciseCost = false;
+let recentRequestsFetchedAt = '';
+let recentRequestsMessage = '';
+let recentRequestsRefreshPromise = null;
+let recentRequestsRefreshPending = false;
 let codexProcessMonitor = null;
 
 fs.writeFileSync(pidPath, String(process.pid), 'utf8');
@@ -184,40 +201,219 @@ function providerRefreshSignature(provider) {
 
 function payloadWithRecentRequests(payload) {
   const providerId = String(payload?.providerId || '');
+  const matches = Boolean(providerId && providerId === recentRequestProviderId);
   return {
     ...payload,
-    recentRequests: providerId && providerId === recentRequestProviderId ? recentRequests : [],
+    recentRequests: matches ? recentRequests : [],
+    recentRequestsLoading: matches ? recentRequestsLoading : false,
+    recentRequestsSource: matches ? recentRequestsSource : '',
+    recentRequestsPreciseCost: matches ? recentRequestsPreciseCost : false,
+    recentRequestsFetchedAt: matches ? recentRequestsFetchedAt : '',
+    recentRequestsMessage: matches ? recentRequestsMessage : '',
   };
 }
 
-function syncRecentRequests(providerOverride = undefined) {
+function normalizedRecentRequest(item, defaults = {}) {
+  const number = (value, fallback = 0) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+  };
+  const optionalInteger = value => {
+    if (value == null || value === '') return null;
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+  };
+  const text = (value, maximum = 160) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, maximum);
+  const rawTotalCost = item?.totalCost ?? item?.totalCostUsd;
+  const totalCost = rawTotalCost == null || rawTotalCost === '' ? null : number(rawTotalCost, null);
+  const costUnit = text(item?.costUnit || defaults.costUnit || 'USD', 24) || 'USD';
+  const statusCode = optionalInteger(item?.statusCode);
+  const success = typeof item?.success === 'boolean'
+    ? item.success
+    : statusCode == null || (statusCode >= 200 && statusCode < 400);
+  return {
+    createdAt: text(item?.createdAt, 40),
+    model: text(item?.model),
+    requestModel: text(item?.requestModel),
+    inputTokens: Math.trunc(number(item?.inputTokens, 0)),
+    outputTokens: Math.trunc(number(item?.outputTokens, 0)),
+    cacheReadTokens: Math.trunc(number(item?.cacheReadTokens, 0)),
+    cacheCreationTokens: Math.trunc(number(item?.cacheCreationTokens, 0)),
+    totalCost,
+    totalCostUsd: costUnit.toUpperCase() === 'USD' ? totalCost : null,
+    costUnit,
+    costExact: item?.costExact === true || defaults.costExact === true,
+    costSource: text(item?.costSource || defaults.costSource, 40),
+    latencyMs: optionalInteger(item?.latencyMs),
+    firstTokenMs: optionalInteger(item?.firstTokenMs),
+    statusCode,
+    success,
+  };
+}
+
+function updateRecentRequestsState(provider, items, options = {}) {
+  const providerId = String(provider?.id || '');
+  const nextRequests = providerId
+    ? (Array.isArray(items) ? items : []).slice(0, RECENT_REQUEST_LIMIT).map(item => normalizedRecentRequest(item, options))
+    : [];
+  const nextState = {
+    providerId,
+    requests: nextRequests,
+    loading: options.loading === true,
+    source: String(options.source || (providerId ? 'ccswitch_local' : '')),
+    preciseCost: options.preciseCost === true,
+    fetchedAt: String(options.fetchedAt || ''),
+    message: options.message ? safeMessage(options.message) : '',
+  };
+  const nextSignature = JSON.stringify(nextState);
+  if (nextSignature === recentRequestsSignature) return false;
+  recentRequestProviderId = providerId;
+  recentRequests = nextRequests;
+  recentRequestsLoading = nextState.loading;
+  recentRequestsSource = nextState.source;
+  recentRequestsPreciseCost = nextState.preciseCost;
+  recentRequestsFetchedAt = nextState.fetchedAt;
+  recentRequestsMessage = nextState.message;
+  recentRequestsSignature = nextSignature;
+
+  if (providerId && String(lastPayload?.providerId || '') === providerId) {
+    lastPayload = payloadWithRecentRequests(lastPayload);
+    return true;
+  }
+  if (providerId && !lastPayload?.providerId && lastPayload?.status === 'loading') {
+    lastPayload = payloadWithRecentRequests({
+      ...lastPayload,
+      providerId,
+      providerName: provider.name,
+      websiteUrl: provider.websiteUrl,
+    });
+    return true;
+  }
+  return false;
+}
+
+function syncRecentRequests(providerOverride = undefined, options = {}) {
   try {
     const provider = providerOverride === undefined ? repository.getCurrent() : providerOverride;
     const providerId = String(provider?.id || '');
+    if (
+      options.force !== true
+      && providerId
+      && providerId === recentRequestProviderId
+      && recentRequestsSource === 'provider_log'
+    ) return false;
     const nextRequests = providerId ? repository.getRecentRequests(providerId, RECENT_REQUEST_LIMIT) : [];
-    const nextSignature = JSON.stringify([providerId, nextRequests]);
-    if (nextSignature === recentRequestsSignature) return false;
-    recentRequestProviderId = providerId;
-    recentRequests = nextRequests;
-    recentRequestsSignature = nextSignature;
-
-    if (providerId && String(lastPayload?.providerId || '') === providerId) {
-      lastPayload = payloadWithRecentRequests(lastPayload);
-      return true;
-    }
-    if (providerId && !lastPayload?.providerId && lastPayload?.status === 'loading') {
-      lastPayload = payloadWithRecentRequests({
-        ...lastPayload,
-        providerId,
-        providerName: provider.name,
-        websiteUrl: provider.websiteUrl,
-      });
-      return true;
-    }
-    return false;
+    return updateRecentRequestsState(provider, nextRequests, {
+      source: 'ccswitch_local',
+      preciseCost: false,
+      costExact: false,
+      costSource: 'ccswitch_local',
+      costUnit: 'USD',
+      loading: providerId === recentRequestProviderId && recentRequestsLoading,
+      fetchedAt: String(nextRequests[0]?.createdAt || ''),
+      message: '',
+    });
   } catch {
     return false;
   }
+}
+
+async function refreshRecentRequests() {
+  let provider;
+  try {
+    provider = repository.getCurrent();
+  } catch (error) {
+    const payloadProvider = lastPayload?.providerId ? {
+      id: lastPayload.providerId,
+      name: lastPayload.providerName,
+      websiteUrl: lastPayload.websiteUrl,
+    } : null;
+    updateRecentRequestsState(payloadProvider, recentRequests, {
+      source: recentRequestsSource,
+      preciseCost: recentRequestsPreciseCost,
+      loading: false,
+      fetchedAt: recentRequestsFetchedAt,
+      message: safeMessage(error),
+    });
+    requestTargetSync({ audit: true });
+    return;
+  }
+  if (!provider) {
+    updateRecentRequestsState(null, [], { message: '没有找到当前 Codex 供应商' });
+    lastPayload = payloadWithRecentRequests(lastPayload);
+    requestTargetSync({ audit: true });
+    return;
+  }
+
+  if (String(provider.id) !== recentRequestProviderId) syncRecentRequests(provider, { force: true });
+  updateRecentRequestsState(provider, recentRequests, {
+    source: recentRequestsSource,
+    preciseCost: recentRequestsPreciseCost,
+    loading: true,
+    fetchedAt: recentRequestsFetchedAt,
+    message: '',
+  });
+  requestTargetSync({ audit: true });
+
+  try {
+    const syncResult = syncHubProviders();
+    if (!syncResult.succeeded) throw syncResult.error;
+    const result = await hubService.queryRequestUsage(provider.id, { limit: RECENT_REQUEST_LIMIT });
+    const currentProvider = repository.getCurrent();
+    if (!currentProvider || String(currentProvider.id) !== String(provider.id)) return;
+    updateRecentRequestsState(provider, result?.items, {
+      source: String(result?.source || 'ccswitch_local'),
+      preciseCost: result?.preciseCostAvailable === true,
+      loading: false,
+      fetchedAt: String(result?.fetchedAt || new Date().toISOString()),
+      message: String(result?.message || ''),
+    });
+  } catch (error) {
+    try {
+      const fallbackRows = repository.getRecentRequests(provider.id, RECENT_REQUEST_LIMIT);
+      updateRecentRequestsState(provider, fallbackRows, {
+        source: 'ccswitch_local',
+        preciseCost: false,
+        costExact: false,
+        costSource: 'ccswitch_local',
+        costUnit: 'USD',
+        loading: false,
+        fetchedAt: String(fallbackRows[0]?.createdAt || ''),
+        message: `第三方逐请求用量查询失败，显示 CCSwitch 本地估算：${safeMessage(error)}`,
+      });
+    } catch (fallbackError) {
+      updateRecentRequestsState(provider, recentRequests, {
+        source: recentRequestsSource,
+        preciseCost: recentRequestsPreciseCost,
+        loading: false,
+        fetchedAt: recentRequestsFetchedAt,
+        message: `逐请求用量查询失败：${safeMessage(fallbackError || error)}`,
+      });
+    }
+  } finally {
+    if (String(provider.id) === recentRequestProviderId && recentRequestsLoading) {
+      updateRecentRequestsState(provider, recentRequests, {
+        source: recentRequestsSource,
+        preciseCost: recentRequestsPreciseCost,
+        loading: false,
+        fetchedAt: recentRequestsFetchedAt,
+        message: recentRequestsMessage,
+      });
+    }
+    requestTargetSync({ audit: true });
+  }
+}
+
+function requestRecentRequestsRefresh() {
+  recentRequestsRefreshPending = true;
+  if (recentRequestsRefreshPromise) return recentRequestsRefreshPromise;
+  recentRequestsRefreshPromise = (async () => {
+    while (recentRequestsRefreshPending && !stopped) {
+      recentRequestsRefreshPending = false;
+      await refreshRecentRequests();
+    }
+  })().finally(() => { recentRequestsRefreshPromise = null; });
+  return recentRequestsRefreshPromise;
 }
 
 function wakeFallbackPoll() {
@@ -426,6 +622,7 @@ async function syncTargets({ audit = true } = {}) {
     );
     const failures = acknowledgements.filter(result => result.status === 'rejected');
     let refreshRequested = false;
+    let recentRequestsRequested = false;
     let actionAccepted = false;
     markedActions.forEach((item, index) => {
       if (acknowledgements[index]?.status !== 'fulfilled' || acknowledgements[index].value !== true) return;
@@ -436,6 +633,10 @@ async function syncTargets({ audit = true } = {}) {
           refreshRequested = true;
           requestCurrentProviderRefresh(true, true);
         }
+        if (action.action === 'refresh-requests') {
+          recentRequestsRequested = true;
+          requestRecentRequestsRefresh();
+        }
         if (action.action === 'open-hub') openHubFromAction();
       }
     });
@@ -444,7 +645,7 @@ async function syncTargets({ audit = true } = {}) {
     if (failures.length) throw failures[0].reason;
     return {
       installed: false,
-      deferred: !refreshRequested && actionAccepted && (audit || targetIdentityChanged),
+      deferred: !refreshRequested && !recentRequestsRequested && actionAccepted && (audit || targetIdentityChanged),
     };
   }
 

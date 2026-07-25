@@ -26,6 +26,22 @@ function cleanInstanceId(value) {
   return /^[A-Za-z0-9_-]{8,128}$/.test(text) ? text : '';
 }
 
+function normalizeBrowser(value) {
+  const text = String(value || '').trim();
+  if (/^edge$/i.test(text)) return 'Edge';
+  if (/^chrome$/i.test(text)) return 'Chrome';
+  if (/^chromium$/i.test(text)) return 'Chromium';
+  return text.slice(0, 64) || 'Chromium';
+}
+
+function clientKey(clientId, browser) {
+  return `${clientId}\0${normalizeBrowser(browser).toLocaleLowerCase('en-US')}`;
+}
+
+function clientRef(key) {
+  return crypto.createHash('sha256').update(key).digest('base64url').slice(0, 16);
+}
+
 export class BrowserCallbackBroker {
   constructor(options = {}) {
     this.now = options.now || Date.now;
@@ -45,26 +61,30 @@ export class BrowserCallbackBroker {
   heartbeat(payload = {}) {
     const clientId = cleanClientId(payload.clientId);
     if (!clientId) throw new Error('浏览器伴侣 clientId 无效');
+    const browser = normalizeBrowser(payload.browser);
+    const key = clientKey(clientId, browser);
     const compatibility = companionCompatibility(payload);
     if (!compatibility.compatible) {
-      this.#cancelWaiters(clientId);
-      this.clients.delete(clientId);
+      this.#cancelWaiters(key);
+      this.clients.delete(key);
       this.lastCompatibilityError = compatibility.message;
       throw new Error(compatibility.message);
     }
     this.lastCompatibilityError = '';
-    const existing = this.clients.get(clientId) || { sessions: new Set() };
+    const existing = this.clients.get(key) || { sessions: new Set() };
     const instanceId = cleanInstanceId(payload.instanceId) || existing.instanceId || '';
     if (instanceId && existing.instanceId !== instanceId) {
       this.generation += 1;
-      if (existing.instanceId) this.#cancelWaiters(clientId);
+      if (existing.instanceId) this.#cancelWaiters(key);
     }
     const sessions = Array.isArray(payload.sessions)
       ? new Set(payload.sessions.map(normalizeOrigin).filter(Boolean))
       : new Set(existing.sessions);
-    this.clients.set(clientId, {
+    this.clients.set(key, {
+      key,
       clientId,
-      browser: String(payload.browser || existing.browser || 'Chromium').slice(0, 64),
+      ref: clientRef(key),
+      browser,
       version: String(payload.version || existing.version || '').slice(0, 32),
       instanceId,
       protocolVersion: compatibility.protocolVersion,
@@ -76,16 +96,23 @@ export class BrowserCallbackBroker {
     return this.getStatus();
   }
 
-  noteSession(clientId, origin) {
+  noteSession(clientId, origin, browser = '') {
     const id = cleanClientId(clientId);
     const normalized = normalizeOrigin(origin);
     if (!id || !normalized) return false;
-    const client = this.clients.get(id);
-    if (!client) return false;
-    client.sessions.add(normalized);
-    client.lastSeenAt = this.now();
-    this.clients.set(id, client);
-    return true;
+    const requestedBrowser = String(browser || '').trim();
+    const matches = requestedBrowser
+      ? [[clientKey(id, requestedBrowser), this.clients.get(clientKey(id, requestedBrowser))]]
+      : [...this.clients.entries()].filter(([, client]) => client.clientId === id);
+    let accepted = false;
+    for (const [key, client] of matches) {
+      if (!client) continue;
+      client.sessions.add(normalized);
+      client.lastSeenAt = this.now();
+      this.clients.set(key, client);
+      accepted = true;
+    }
+    return accepted;
   }
 
   getStatus() {
@@ -98,6 +125,7 @@ export class BrowserCallbackBroker {
       requiredCapabilities: [...COMPANION_CAPABILITIES],
       compatibilityError: this.lastCompatibilityError,
       clients: active.map(client => ({
+        ref: client.ref,
         browser: client.browser,
         version: client.version,
         protocolVersion: client.protocolVersion,
@@ -114,6 +142,20 @@ export class BrowserCallbackBroker {
     return this.getStatus().connected;
   }
 
+  listQueryClients(origin = '') {
+    const normalized = normalizeOrigin(origin);
+    const cutoff = this.now() - this.connectionMaxAgeMs;
+    return [...this.clients.values()]
+      .filter(client => client.lastSeenAt >= cutoff)
+      .map(client => ({
+        clientId: client.clientId,
+        clientRef: client.ref,
+        browser: client.browser,
+        hasSession: Boolean(normalized && client.sessions.has(normalized)),
+      }))
+      .sort((left, right) => Number(right.hasSession) - Number(left.hasSession));
+  }
+
   hasSession(origin) {
     const normalized = normalizeOrigin(origin);
     if (!normalized) return false;
@@ -125,22 +167,24 @@ export class BrowserCallbackBroker {
     if (this.closed) return null;
     const clientId = cleanClientId(payload.clientId);
     if (!clientId) throw new Error('浏览器伴侣 clientId 无效');
+    const key = clientKey(clientId, payload.browser);
     const signal = options?.signal;
     if (signal?.aborted) return null;
     // A Chromium MV3 worker may restart while its previous long poll is still
     // waiting in Node. The newest poll for a stable client id owns delivery;
     // otherwise an abandoned response can claim and strand the next job.
-    this.#cancelWaiters(clientId);
+    this.#cancelWaiters(key);
     this.heartbeat(payload);
-    const queued = this.#takeJob(clientId);
+    const queued = this.#takeJob(key);
     if (queued) {
       this.#schedulePreferenceRelease();
       return queued.publicJob;
     }
     return new Promise(resolve => {
       const waiter = {
+        clientKey: key,
         clientId,
-        instanceId: cleanInstanceId(payload.instanceId) || this.clients.get(clientId)?.instanceId || '',
+        instanceId: cleanInstanceId(payload.instanceId) || this.clients.get(key)?.instanceId || '',
         resolve: null,
         timer: null,
         settled: false,
@@ -167,8 +211,20 @@ export class BrowserCallbackBroker {
     return this.#enqueue('query-json', request, this.queryTimeoutMs, options);
   }
 
+  queryJsonOnClient(selector, request, options = {}) {
+    const targetClientKey = this.#resolveClientKey(selector);
+    if (!targetClientKey) return Promise.reject(new Error('指定的浏览器余额伴侣未连接'));
+    return this.#enqueue('query-json', request, this.queryTimeoutMs, { ...options, targetClientKey });
+  }
+
   openLogin(request) {
     return this.#enqueue('open-login', request, BROWSER_LOGIN_JOB_TIMEOUT_MS);
+  }
+
+  openLoginOnClient(selector, request) {
+    const targetClientKey = this.#resolveClientKey(selector);
+    if (!targetClientKey) return Promise.reject(new Error('指定的浏览器余额伴侣未连接'));
+    return this.#enqueue('open-login', request, BROWSER_LOGIN_JOB_TIMEOUT_MS, { targetClientKey });
   }
 
   complete(jobId, result) {
@@ -209,7 +265,11 @@ export class BrowserCallbackBroker {
     const signal = options?.signal;
     if (signal?.aborted) return Promise.reject(signal.reason || new Error('浏览器余额回调已取消'));
     const origin = normalizeOrigin(request?.baseUrl || request?.loginUrl || request?.origin);
-    const preferredClientId = this.#preferredClient(origin);
+    const targetClientKey = String(options?.targetClientKey || '');
+    if (targetClientKey && !this.#isActiveClientKey(targetClientKey)) {
+      return Promise.reject(new Error('指定的浏览器余额伴侣未连接'));
+    }
+    const preferredClientKey = targetClientKey ? '' : this.#preferredClient(origin);
     const id = crypto.randomUUID();
     const createdAt = this.now();
     const publicJob = {
@@ -249,8 +309,9 @@ export class BrowserCallbackBroker {
       }, timeoutMs);
       const job = {
         publicJob,
-        preferredClientId,
-        preferredUntil: preferredClientId ? this.now() + this.preferredClientGraceMs : 0,
+        targetClientKey,
+        preferredClientKey,
+        preferredUntil: preferredClientKey ? this.now() + this.preferredClientGraceMs : 0,
       };
       this.pending.set(id, pending);
       this.queue.push(job);
@@ -262,17 +323,39 @@ export class BrowserCallbackBroker {
   #preferredClient(origin) {
     if (!origin) return '';
     const cutoff = this.now() - this.connectionMaxAgeMs;
-    return [...this.clients.values()].find(client => client.lastSeenAt >= cutoff && client.sessions.has(origin))?.clientId || '';
+    return [...this.clients.values()].find(client => client.lastSeenAt >= cutoff && client.sessions.has(origin))?.key || '';
   }
 
-  #cancelWaiters(clientId) {
+  #resolveClientKey(selector) {
+    const value = String(selector || '').trim();
+    if (!value) return '';
+    const cutoff = this.now() - this.connectionMaxAgeMs;
+    const active = [...this.clients.entries()].filter(([, client]) => client.lastSeenAt >= cutoff);
+    const referenced = active.find(([, client]) => client.ref === value);
+    if (referenced) return referenced[0];
+    const id = cleanClientId(value);
+    if (!id) return '';
+    const matchingIds = active.filter(([, client]) => client.clientId === id);
+    return matchingIds.length === 1 ? matchingIds[0][0] : '';
+  }
+
+  #isActiveClientKey(key) {
+    const client = this.clients.get(key);
+    return Boolean(client && client.lastSeenAt >= this.now() - this.connectionMaxAgeMs);
+  }
+
+  #cancelWaiters(key) {
     for (const waiter of [...this.waiters]) {
-      if (waiter.clientId === clientId) waiter.resolve(null);
+      if (waiter.clientKey === key) waiter.resolve(null);
     }
   }
 
-  #takeJob(clientId) {
-    const index = this.queue.findIndex(job => !job.preferredClientId || job.preferredClientId === clientId);
+  #takeJob(key) {
+    const index = this.queue.findIndex(job => (
+      job.targetClientKey
+        ? job.targetClientKey === key
+        : !job.preferredClientKey || job.preferredClientKey === key
+    ));
     if (index < 0) return null;
     return this.queue.splice(index, 1)[0];
   }
@@ -280,7 +363,7 @@ export class BrowserCallbackBroker {
   #dispatch() {
     this.#releaseExpiredPreferences();
     for (const waiter of [...this.waiters]) {
-      const job = this.#takeJob(waiter.clientId);
+      const job = this.#takeJob(waiter.clientKey);
       if (!job) continue;
       waiter.resolve(job.publicJob);
     }
@@ -290,7 +373,7 @@ export class BrowserCallbackBroker {
   #releaseExpiredPreferences() {
     const now = this.now();
     for (const job of this.queue) {
-      if (job.preferredClientId && now >= job.preferredUntil) job.preferredClientId = '';
+      if (job.preferredClientKey && now >= job.preferredUntil) job.preferredClientKey = '';
     }
   }
 
@@ -300,7 +383,7 @@ export class BrowserCallbackBroker {
     if (this.closed) return;
     const now = this.now();
     const next = this.queue
-      .filter(job => job.preferredClientId && job.preferredUntil > now)
+      .filter(job => job.preferredClientKey && job.preferredUntil > now)
       .reduce((minimum, job) => Math.min(minimum, job.preferredUntil), Number.POSITIVE_INFINITY);
     if (!Number.isFinite(next)) return;
     this.preferenceTimer = setTimeout(() => {

@@ -10,6 +10,26 @@ function parseJson(text, fallback) {
   }
 }
 
+function providerCredentialValues(settings) {
+  const values = [];
+  const visit = (value, depth = 0) => {
+    if (!value || typeof value !== 'object' || depth > 4) return;
+    for (const [key, item] of Object.entries(value)) {
+      if (
+        typeof item === 'string'
+        && item
+        && /^(?:openai_api_key|anthropic_api_key|anthropic_auth_token)$/i.test(key)
+      ) {
+        values.push(item);
+      } else if (item && typeof item === 'object') {
+        visit(item, depth + 1);
+      }
+    }
+  };
+  visit(settings);
+  return values;
+}
+
 export function findBaseUrl(configText = '') {
   const matches = [...String(configText).matchAll(/^\s*base_url\s*=\s*["']([^"']+)["']/gmi)];
   return matches.at(-1)?.[1]?.replace(/\/+$/, '') ?? '';
@@ -114,6 +134,7 @@ export class ProviderRepository {
     this.allStatement = null;
     this.localUsageStatement = null;
     this.recentRequestsStatement = null;
+    this.credentialAppTypesStatement = null;
     this.currentCache = null;
     this.byNameCache = new Map();
     this.byIdCache = new Map();
@@ -238,6 +259,24 @@ export class ProviderRepository {
       .filter(Boolean);
   }
 
+  getCredentialAppTypes(credential) {
+    const target = String(credential || '');
+    if (!target) return [];
+    const db = this.ensureDatabase();
+    if (!this.credentialAppTypesStatement) {
+      this.credentialAppTypesStatement = db.prepare(`
+        SELECT app_type, settings_config
+        FROM providers
+      `);
+    }
+    const appTypes = new Set();
+    for (const row of this.credentialAppTypesStatement.all()) {
+      const settings = parseJson(row.settings_config, {});
+      if (providerCredentialValues(settings).includes(target)) appTypes.add(String(row.app_type || ''));
+    }
+    return [...appTypes].filter(Boolean).sort();
+  }
+
   getChangeToken() {
     return [this.databasePath, `${this.databasePath}-wal`, `${this.databasePath}-shm`]
       .map(filename => fileChangeIdentity(filename, this.statSync))
@@ -268,6 +307,7 @@ export class ProviderRepository {
     this.allStatement = null;
     this.localUsageStatement = null;
     this.recentRequestsStatement = null;
+    this.credentialAppTypesStatement = null;
     this.currentCache = null;
     this.byNameCache.clear();
     this.byIdCache.clear();

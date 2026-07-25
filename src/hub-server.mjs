@@ -156,6 +156,10 @@ export class HubServer {
       jsonResponse(response, 403, { success: false, message: 'Cross-site browser requests are not allowed' });
       return;
     }
+    if (crossSite && request.method === 'POST' && url.pathname === `${this.apiPath}/request-usage`) {
+      jsonResponse(response, 403, { success: false, message: 'Cross-site browser requests are not allowed' });
+      return;
+    }
     if (request.method === 'GET' && ['/', '/health', '/v1/health'].includes(url.pathname)) {
       const state = this.service.getState();
       jsonResponse(response, 200, {
@@ -209,6 +213,19 @@ export class HubServer {
       });
       return;
     }
+    if (request.method === 'POST' && url.pathname === `${this.apiPath}/request-usage`) {
+      const body = await readBody(request);
+      const providerSelector = String(body.providerId || body.provider || '').trim();
+      if (typeof this.service.queryRequestUsage !== 'function') {
+        jsonResponse(response, 501, { success: false, message: '第三方逐请求用量接口尚未启用' });
+        return;
+      }
+      const result = await this.service.queryRequestUsage(providerSelector, {
+        limit: body.limit,
+      });
+      jsonResponse(response, result?.notFound ? 404 : 200, result);
+      return;
+    }
     if (request.method === 'POST' && url.pathname === `${this.apiPath}/companion/heartbeat`) {
       if (!this.browserBroker) throw new Error('浏览器伴侣回调未启用');
       const body = await readBody(request);
@@ -218,7 +235,7 @@ export class HubServer {
     if (request.method === 'POST' && url.pathname === `${this.apiPath}/companion/session`) {
       if (!this.browserBroker) throw new Error('浏览器伴侣回调未启用');
       const body = await readBody(request);
-      const accepted = this.browserBroker.noteSession(body.clientId, body.origin);
+      const accepted = this.browserBroker.noteSession(body.clientId, body.origin, body.browser);
       jsonResponse(response, accepted ? 200 : 400, { success: accepted });
       return;
     }
@@ -284,9 +301,18 @@ export class HubServer {
       jsonResponse(response, 202, { success: true });
       return;
     }
+    if (request.method === 'POST' && url.pathname === `${this.apiPath}/account-binding`) {
+      const body = await readBody(request);
+      const providerId = String(body.providerId || '').trim();
+      const item = String(body.action || '').trim().toLowerCase() === 'clear'
+        ? await this.service.clearAccountBinding(providerId)
+        : await this.service.bindAccount(providerId, { clientRef: String(body.clientRef || '').trim() });
+      jsonResponse(response, 200, { success: true, provider: item });
+      return;
+    }
     if (request.method === 'POST' && url.pathname === `${this.apiPath}/login`) {
       const body = await readBody(request);
-      const item = await this.service.openLogin(body.providerId);
+      const item = await this.service.openLogin(body.providerId, { clientRef: body.clientRef });
       jsonResponse(response, 200, { success: true, provider: item });
       return;
     }

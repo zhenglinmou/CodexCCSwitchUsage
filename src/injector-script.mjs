@@ -232,7 +232,7 @@ export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = glob
 }
 
 export { PAGE_ACTION_SENTINEL };
-export const INJECTOR_VERSION = 77;
+export const INJECTOR_VERSION = 81;
 
 function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, formatRequestTime, selectResponsiveUsageMode, calculateResponsiveMeasurements, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, enqueuePageActionTitle, pageActionSentinel, version) {
   const VERSION = version;
@@ -255,6 +255,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     for (const timer of existing.layoutTimers || []) clearTimeout(timer);
     if (existing.tooltipTimer) clearTimeout(existing.tooltipTimer);
     if (existing.refreshLoadingTimer) clearTimeout(existing.refreshLoadingTimer);
+    if (existing.requestLoadingTimer) clearTimeout(existing.requestLoadingTimer);
     if (existing.mountTimer) clearTimeout(existing.mountTimer);
     if (existing.resizeSettleTimer) clearTimeout(existing.resizeSettleTimer);
     if (existing.rootResizeSettleTimer) clearTimeout(existing.rootResizeSettleTimer);
@@ -288,6 +289,9 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     popoverTrigger: null,
     loading: false,
     refreshLoadingTimer: 0,
+    requestRefreshToken: 0,
+    requestLoading: false,
+    requestLoadingTimer: 0,
     popoverRoot: null,
     popoverShadow: null,
     layoutTimers: [],
@@ -322,7 +326,9 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
   const balancePayloadSignature = payload => JSON.stringify([
     payload?.status,
     payload?.providerId,
+    payload?.providerDisplayName,
     payload?.providerName,
+    payload?.accountBrowser,
     payload?.websiteUrl,
     payload?.message,
     payload?.extra,
@@ -509,7 +515,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
         .popover-refresh svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
         .popover-refresh[data-loading="true"] svg{animation:popover-refresh-spin .9s linear infinite}
         .popover-grid{display:grid;gap:6px;margin-top:8px}
-        .popover[data-mode="requests"] .popover-grid,.popover[data-mode="requests"] .popover-refresh{display:none}
+        .popover[data-mode="requests"] .popover-grid{display:none}
         .popover-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:30px;padding:0 9px;border-radius:8px;background:var(--color-background-button-tertiary,rgba(127,127,127,.04))}
         .popover-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-token-text-tertiary,currentColor)}
         .popover-value{flex:0 0 auto;color:var(--color-token-text-primary,currentColor);font:inherit}
@@ -543,7 +549,8 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       shadow.getElementById('popover-refresh').addEventListener('click', event => {
         event.preventDefault();
         event.stopPropagation();
-        requestRefresh(state.popoverAnchor, false);
+        if (state.popoverMode === 'requests') requestRecentRequests(state.popoverAnchor);
+        else requestRefresh(state.popoverAnchor, false);
       });
     }
     state.popoverRoot = host;
@@ -596,11 +603,15 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     return String(Math.trunc(number));
   }
 
-  function formatRequestCost(value) {
+  function formatRequestCost(value, unit = 'USD') {
+    if (value == null || value === '') return '--';
     const number = Math.max(0, Number(value) || 0);
-    if (number > 0 && number < 0.0001) return '<$0.0001';
-    if (number === 0) return '$0';
-    return `$${number.toFixed(number < 1 ? 4 : 2)}`;
+    const normalizedUnit = String(unit || 'USD').trim().toUpperCase();
+    const symbol = normalizedUnit === 'CNY' ? '¥' : normalizedUnit === 'USD' ? '$' : '';
+    if (normalizedUnit === 'TOKENS') return `${formatTokenCount(number)} tokens`;
+    if (number > 0 && number < 0.0001) return `<${symbol || ''}0.0001${symbol ? '' : ` ${unit}`}`.trim();
+    const amount = number === 0 ? '0' : number.toFixed(number < 1 ? 4 : 2);
+    return `${symbol}${amount}${symbol ? '' : ` ${unit}`}`.trim();
   }
 
   function requestMetadata(item) {
@@ -758,8 +769,26 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     state.popoverOpen = true;
     state.popoverMode = 'requests';
     state.popoverTrigger = instance?.root?.__codexUsageHubButton || null;
+    requestRecentRequests(instance);
     render(null, true);
     focusPopover();
+  }
+
+  function requestRecentRequests(instance) {
+    hideUsageTooltip();
+    state.requestRefreshToken += 1;
+    publishPageAction('refresh-requests');
+    state.requestLoading = true;
+    if (state.requestLoadingTimer) clearTimeout(state.requestLoadingTimer);
+    const requestToken = state.requestRefreshToken;
+    state.requestLoadingTimer = setTimeout(() => {
+      if (state.requestRefreshToken !== requestToken) return;
+      state.requestLoadingTimer = 0;
+      state.requestLoading = false;
+      render(null, false);
+    }, REFRESH_LOADING_TIMEOUT_MS);
+    if (instance?.root?.isConnected) state.popoverAnchor = instance;
+    render(null, false);
   }
 
   function requestRefresh(instance, togglePopover = false) {
@@ -983,7 +1012,9 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     if (requests.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'request-empty';
-      empty.textContent = '当前供应商还没有请求记录';
+      empty.textContent = state.requestLoading || payload.recentRequestsLoading
+        ? '正在读取最新 10 条调用记录…'
+        : '当前供应商还没有 Codex 请求记录';
       list.replaceChildren(empty);
       state.recentRequestsPayload = payload;
       state.recentRequestsAgeMinute = ageMinute;
@@ -1017,8 +1048,9 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
         part.textContent = value;
         metadata.appendChild(part);
       }
-      const statusCode = Number(item.statusCode) || 0;
-      if (statusCode < 200 || statusCode >= 300) {
+      const hasStatusCode = item.statusCode != null && item.statusCode !== '' && Number.isFinite(Number(item.statusCode));
+      const statusCode = hasStatusCode ? Number(item.statusCode) : 0;
+      if (item.success === false || (hasStatusCode && (statusCode < 200 || statusCode >= 400))) {
         const status = document.createElement('span');
         status.className = 'request-error';
         status.textContent = statusCode ? `HTTP ${statusCode}` : '请求失败';
@@ -1026,7 +1058,10 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       }
       const cost = document.createElement('span');
       cost.className = 'request-cost';
-      cost.textContent = formatRequestCost(item.totalCostUsd);
+      cost.textContent = formatRequestCost(item.totalCost ?? item.totalCostUsd, item.costUnit || 'USD');
+      cost.title = item.costExact === true
+        ? '第三方实际扣费'
+        : item.costSource === 'ccswitch_local' ? 'CCSwitch 本地估算' : '第三方未返回可换算费用';
       metadata.appendChild(cost);
       row.append(main, metadata);
       return row;
@@ -1067,12 +1102,20 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       updateElementAttribute(popover, 'aria-hidden', state.popoverOpen ? 'false' : 'true');
       updateElementAttribute(popover, 'data-mode', popoverMode);
       updateElementAttribute(popover, 'aria-label', popoverMode === 'requests' ? '当前供应商最近请求' : '完整额度');
+      const requestProviderName = payload.providerDisplayName || payload.providerName || '当前供应商';
+      const requestProviderLabel = payload.accountBrowser
+        ? `${requestProviderName}（${payload.accountBrowser}）`
+        : requestProviderName;
       portal.querySelector('.popover-head-title').textContent = popoverMode === 'requests'
-        ? `${payload.providerName || '当前供应商'} · 最近请求`
+        ? `${requestProviderLabel} · 最近 10 条 Codex 调用`
         : '额度';
       const popoverRefreshButton = portal.getElementById('popover-refresh');
-      updateElementAttribute(popoverRefreshButton, 'data-loading', state.loading ? 'true' : null);
-      updateElementAttribute(popoverRefreshButton, 'aria-busy', state.loading ? 'true' : null);
+      const popoverLoading = popoverMode === 'requests'
+        ? (state.requestLoading || payload.recentRequestsLoading === true)
+        : state.loading;
+      updateElementAttribute(popoverRefreshButton, 'data-loading', popoverLoading ? 'true' : null);
+      updateElementAttribute(popoverRefreshButton, 'aria-busy', popoverLoading ? 'true' : null);
+      updateElementAttribute(popoverRefreshButton, 'aria-label', popoverMode === 'requests' ? '刷新最近 10 条 Codex 调用' : '刷新 CCSwitch 用量');
       renderPopoverRows(portal, payload);
       renderRecentRequests(portal, payload);
     }
@@ -1420,6 +1463,11 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     state.loading = false;
     if (state.refreshLoadingTimer) clearTimeout(state.refreshLoadingTimer);
     state.refreshLoadingTimer = 0;
+    if (payload?.recentRequestsLoading !== true) {
+      state.requestLoading = false;
+      if (state.requestLoadingTimer) clearTimeout(state.requestLoadingTimer);
+      state.requestLoadingTimer = 0;
+    }
     if (state.footer?.isConnected && state.root?.isConnected) {
       render(null, balanceChanged);
       if (state.popoverOpen && !balanceChanged) positionPopover();

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { describeProviderQuery, loginConfiguration, providerAliases, providerKind } from './hub-provider-adapters.mjs';
+import { describeProviderRequestUsage, normalizeRequestUsageLimit } from './provider-request-usage.mjs';
 
 const MAX_SAFE_MESSAGE_CHARS = 8_192;
 const LABELED_CREDENTIAL_PATTERN = /(["']?)(openai[_-]api[_-]key|api[_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|cookie|authorization|secret)\1(\s*[=:]\s*)(?:Bearer\s+)?(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\]]+)/gi;
@@ -73,6 +74,100 @@ function safeWebsiteUrl(value) {
   }
 }
 
+function localRequestNumber(value, fallback = null) {
+  if (value == null || value === '') return fallback;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : fallback;
+}
+
+function localRequestInteger(value, fallback = null) {
+  const number = localRequestNumber(value, fallback);
+  return number != null && Number.isSafeInteger(number) ? number : fallback;
+}
+
+function ccswitchRequestItem(row) {
+  const inputTokens = localRequestInteger(row?.inputTokens, 0);
+  const outputTokens = localRequestInteger(row?.outputTokens, 0);
+  const cacheReadTokens = localRequestInteger(row?.cacheReadTokens, 0);
+  const cacheCreationTokens = localRequestInteger(row?.cacheCreationTokens, 0);
+  const rawStatusCode = localRequestInteger(row?.statusCode, 0);
+  const statusCode = rawStatusCode > 0 ? rawStatusCode : null;
+  const latencyMs = localRequestInteger(row?.latencyMs);
+  const firstTokenMs = localRequestInteger(row?.firstTokenMs);
+  const totalCost = localRequestNumber(row?.totalCostUsd, 0);
+  const succeeded = statusCode == null || (statusCode >= 200 && statusCode < 400);
+
+  return {
+    id: '',
+    requestId: '',
+    upstreamRequestId: '',
+    createdAt: String(row?.createdAt || ''),
+    model: String(row?.model || row?.requestModel || '').slice(0, 160),
+    requestModel: String(row?.requestModel || '').slice(0, 160),
+    recordType: succeeded ? 'consume' : 'error',
+    recordTypeCode: succeeded ? 2 : 5,
+    success: succeeded,
+    statusCode,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheCreationTokens,
+    totalTokens: inputTokens + outputTokens,
+    usageReturned: inputTokens > 0 || outputTokens > 0 || cacheReadTokens > 0 || cacheCreationTokens > 0,
+    rawQuota: null,
+    totalCost,
+    costUnit: 'USD',
+    costExact: false,
+    costSource: 'ccswitch_local',
+    durationSeconds: latencyMs == null ? 0 : Number((latencyMs / 1_000).toFixed(3)),
+    latencyMs,
+    firstTokenMs,
+    isStream: false,
+    billingSource: 'ccswitch_local_multiplier',
+    requestPath: '',
+  };
+}
+
+function ccswitchRequestUsageFallback(provider, rows, remoteResult, limit, now) {
+  const fallbackReason = safeMessage(remoteResult?.message || '第三方真实逐请求扣费接口不可用');
+  const warning = 'CCSwitch 本地费用按其模型价格和倍率计算；第三方倍率不同时可能与账户实际扣费不一致';
+  const items = rows.slice(0, limit).map(ccswitchRequestItem);
+  return {
+    success: true,
+    supported: true,
+    remoteSupported: remoteResult?.supported === true,
+    preciseCostAvailable: false,
+    providerId: String(provider.id || ''),
+    providerName: String(provider.name || '供应商'),
+    providerKind: providerKind(provider),
+    appType: 'codex',
+    source: 'ccswitch_local',
+    remoteSource: String(remoteResult?.source || ''),
+    interface: remoteResult?.interface || describeProviderRequestUsage(provider),
+    limit,
+    fetchedAt: new Date(now()).toISOString(),
+    fallback: true,
+    degraded: true,
+    fallbackReason,
+    message: `未能取得第三方真实逐请求扣费，已回退 CCSwitch 本地估算：${fallbackReason}`,
+    requestCount: items.length,
+    totalLocalRecords: items.length,
+    billing: {
+      available: true,
+      exact: false,
+      displayType: 'USD',
+      unit: 'USD',
+      quotaPerUnit: null,
+      multiplier: 1,
+      source: 'ccswitch_local',
+      warning,
+    },
+    ...(remoteResult?.httpStatus != null ? { remoteHttpStatus: remoteResult.httpStatus } : {}),
+    ...(remoteResult?.errorType ? { remoteErrorType: String(remoteResult.errorType) } : {}),
+    items,
+  };
+}
+
 export function providerConfigurationFingerprint(provider) {
   if (!provider) return '';
   const material = JSON.stringify([
@@ -88,11 +183,50 @@ export function providerConfigurationFingerprint(provider) {
   return crypto.createHash('sha256').update(material).digest('base64url');
 }
 
+function safeAccountBinding(value) {
+  if (!value || typeof value !== 'object') return null;
+  const clientRef = String(value.clientRef || '').trim();
+  const browser = String(value.browser || '').replace(/\s+/g, ' ').trim().slice(0, 64);
+  const origin = String(value.origin || '').trim();
+  const accountRef = String(value.accountRef || '').trim();
+  const boundAt = String(value.boundAt || '').trim();
+  if (!/^[A-Za-z0-9_-]{8,128}$/.test(clientRef)) return null;
+  if (!browser || origin !== 'https://anyrouter.top') return null;
+  if (!/^[A-Za-z0-9_-]{43}$/.test(accountRef)) return null;
+  return {
+    clientRef,
+    browser,
+    origin,
+    accountRef,
+    boundAt: Number.isFinite(Date.parse(boundAt)) ? new Date(boundAt).toISOString() : '',
+  };
+}
+
+function publicAccountBinding(value) {
+  const binding = safeAccountBinding(value);
+  return binding ? { clientRef: binding.clientRef, browser: binding.browser } : null;
+}
+
+function sameAnyRouterCredential(left, right) {
+  const apiKey = String(left?.apiKey || '');
+  return Boolean(apiKey && apiKey === String(right?.apiKey || ''));
+}
+
+function sameAccountBinding(left, right) {
+  const first = safeAccountBinding(left);
+  const second = safeAccountBinding(right);
+  if (!first || !second) return !first && !second;
+  return first.clientRef === second.clientRef
+    && first.origin === second.origin
+    && first.accountRef === second.accountRef;
+}
+
 function safeUsage(payload) {
   if (!payload || payload.status !== 'ok') return null;
   const numberOrNull = value => value == null || value === '' || !Number.isFinite(Number(value)) ? null : Number(value);
   return {
     providerName: String(payload.providerName || ''),
+    accountBrowser: String(payload.accountBrowser || '').replace(/\s+/g, ' ').trim().slice(0, 64),
     extra: payload.extra ? safeMessage(payload.extra) : '',
     periodLabel: String(payload.periodLabel || ''),
     hideTotal: payload.hideTotal === true,
@@ -124,7 +258,9 @@ export function hubItemToUsagePayload(provider, item) {
     return {
       status: 'ok',
       providerId: provider.id,
+      providerDisplayName: String(provider.name || usage.providerName || '供应商'),
       providerName: usage.providerName || provider.name,
+      accountBrowser: usage.accountBrowser || '',
       websiteUrl: provider.websiteUrl,
       extra: usage.extra,
       periodLabel: usage.periodLabel,
@@ -141,7 +277,9 @@ export function hubItemToUsagePayload(provider, item) {
   return {
     status: item?.status === 'idle' || item?.status === 'loading' ? 'loading' : 'error',
     providerId: provider.id,
+    providerDisplayName: String(provider.name || '供应商'),
     providerName: provider.name,
+    accountBrowser: '',
     websiteUrl: provider.websiteUrl,
     message: String(item?.message || 'Balance Hub 尚未返回额度'),
     updatedAt: item?.updatedAt || new Date().toISOString(),
@@ -152,6 +290,7 @@ export class HubService {
   constructor(repository, queryEngine, options = {}) {
     this.repository = repository;
     this.queryEngine = queryEngine;
+    this.requestUsageEngine = options.requestUsageEngine || null;
     this.cachePath = options.cachePath || '';
     this.concurrency = Math.max(1, Math.min(6, Number(options.concurrency) || 3));
     this.browserConcurrency = Math.max(1, Math.min(this.concurrency, Number(options.browserConcurrency) || 1));
@@ -204,6 +343,7 @@ export class HubService {
         !websiteLoginRequired
         && (previous.sessionSyncRequired || (restoredBrowserFailure && loginConfig?.userHeader))
       );
+      const accountBinding = configurationChanged ? null : safeAccountBinding(previous.accountBinding);
       const lastSuccessAt = String(previous.lastSuccessAt || previous.usage?.updatedAt || (previous.usage ? previous.updatedAt : '') || '');
       const lastAttemptAt = String(previous.lastAttemptAt || previous.updatedAt || '');
       this.items.set(provider.id, {
@@ -230,6 +370,9 @@ export class HubService {
         sessionSyncSupported: Boolean(loginConfig?.userHeader),
         sessionSyncRequired,
         websiteLoginRequired,
+        accountBindingSupported: providerKind(provider) === 'anyrouter',
+        accountBindingRequired: configurationChanged ? false : previous.accountBindingRequired === true,
+        accountBinding,
         queryMethod: describeProviderQuery(provider),
         usage: previous.usage || null,
         updatedAt: lastSuccessAt,
@@ -260,10 +403,7 @@ export class HubService {
       refreshing: this.refreshes.size > 0,
       lastFullRefreshAt: this.lastFullRefreshAt,
       lastFullRefreshDurationMs: this.lastFullRefreshDurationMs,
-      providers: [...this.items.values()].map(item => {
-        const { providerFingerprint: _providerFingerprint, ...publicItem } = item;
-        return { ...publicItem, refreshing: this.refreshes.has(item.id) };
-      }),
+      providers: [...this.items.values()].map(item => this.#publicItem(item, this.refreshes.has(item.id))),
     };
   }
 
@@ -286,6 +426,7 @@ export class HubService {
         loginSupported: Boolean(loginConfig),
         loginUrl: safeWebsiteUrl(loginConfig?.loginUrl),
         sessionSyncSupported: Boolean(loginConfig?.userHeader),
+        accountBindingSupported: providerKind(provider) === 'anyrouter',
         queryMethod: describeProviderQuery(provider),
         balanceUrl: `/v1/balance/${encodeURIComponent(provider.id)}`,
       };
@@ -311,12 +452,24 @@ export class HubService {
     const isCurrentSnapshot = () => this.providers.get(id) === provider && this.items.has(id);
     const promise = Promise.resolve().then(async () => {
       try {
-        const result = await this.queryEngine.query(provider);
+        const anyRouterCredentials = providerKind(provider) === 'anyrouter'
+          ? new Set([...this.providers.values()]
+              .filter(candidate => providerKind(candidate) === 'anyrouter')
+              .map(candidate => String(candidate.apiKey || candidate.id || '')))
+          : null;
+        const result = await this.queryEngine.query(provider, {
+          accountBinding: previous.accountBinding || null,
+          allowSoleSessionFallback: !anyRouterCredentials || anyRouterCredentials.size <= 1,
+        });
         if (!isCurrentSnapshot()) return this.items.get(id) || null;
         const attemptedAt = new Date(this.now()).toISOString();
         const usage = safeUsage(result.usage);
-        const targets = usage && providerKind(provider) === 'anyrouter'
-          ? [...this.providers.values()].filter(candidate => providerKind(candidate) === 'anyrouter')
+        const targets = providerKind(provider) === 'anyrouter'
+          ? [...this.providers.values()].filter(candidate => {
+              if (candidate.id === provider.id) return true;
+              if (providerKind(candidate) !== 'anyrouter' || !sameAnyRouterCredential(provider, candidate)) return false;
+              return sameAccountBinding(previous.accountBinding, this.items.get(candidate.id)?.accountBinding);
+            })
           : [provider];
         for (const target of targets) {
           if (this.providers.get(target.id) !== target || !this.items.has(target.id)) continue;
@@ -324,7 +477,10 @@ export class HubService {
           const targetUsage = usage && target.id !== id && usage.providerName === provider.name
             ? { ...usage, providerName: target.name }
             : usage;
-          const lastSuccessAt = String(targetUsage?.updatedAt || current.lastSuccessAt || current.usage?.updatedAt || current.updatedAt || '');
+          const nextUsage = result.invalidateUsage === true ? null : (targetUsage || current.usage);
+          const lastSuccessAt = result.invalidateUsage === true
+            ? ''
+            : String(targetUsage?.updatedAt || current.lastSuccessAt || current.usage?.updatedAt || current.updatedAt || '');
           this.items.set(target.id, {
             ...current,
             status: targetUsage ? (result.degraded ? 'degraded' : 'ok') : (result.loginRequired ? 'login-required' : 'error'),
@@ -336,7 +492,8 @@ export class HubService {
             source: String(result.source || ''),
             sessionSyncRequired: result.sessionSyncRequired === true,
             websiteLoginRequired: result.websiteLoginRequired === true,
-            usage: targetUsage || current.usage,
+            accountBindingRequired: result.accountBindingRequired === true,
+            usage: nextUsage,
             updatedAt: lastSuccessAt,
             lastSuccessAt,
             lastAttemptAt: attemptedAt,
@@ -400,7 +557,10 @@ export class HubService {
         };
         await Promise.all(Array.from({ length: Math.min(concurrency, poolIds.length) }, worker));
       };
-      const browserIds = ids.filter(id => this.items.get(id)?.queryMethod?.requiresBrowser === true);
+      const browserIds = ids.filter(id => {
+        const method = this.items.get(id)?.queryMethod;
+        return method?.requiresBrowser === true || method?.type === 'api-key-with-account-fallback';
+      });
       const browserIdSet = new Set(browserIds);
       const directIds = ids.filter(id => !browserIdSet.has(id));
       if (browserIds.length > 0 && directIds.length > 0 && this.concurrency > 1) {
@@ -442,6 +602,86 @@ export class HubService {
     return this.#balanceResponse(item);
   }
 
+  async queryRequestUsage(providerSelector, options = {}) {
+    const provider = this.findProvider(providerSelector);
+    if (!provider) {
+      return {
+        success: false,
+        notFound: true,
+        message: `Unknown provider: ${String(providerSelector || '')}`,
+      };
+    }
+    const limit = normalizeRequestUsageLimit(options.limit);
+    let credentialAppTypes = ['codex'];
+    try {
+      if (typeof this.repository?.getCredentialAppTypes === 'function') {
+        credentialAppTypes = this.repository.getCredentialAppTypes(provider.apiKey);
+      }
+    } catch {}
+    const sharedAcrossApps = credentialAppTypes.some(appType => appType !== 'codex');
+    let remoteResult;
+    if (!this.requestUsageEngine || typeof this.requestUsageEngine.query !== 'function') {
+      remoteResult = {
+        success: false,
+        supported: false,
+        providerId: provider.id,
+        providerName: provider.name,
+        providerKind: providerKind(provider),
+        source: 'unavailable',
+        interface: describeProviderRequestUsage(provider),
+        limit,
+        fetchedAt: new Date(this.now()).toISOString(),
+        items: [],
+        message: '第三方真实逐请求扣费接口尚未启用',
+      };
+    } else {
+      try {
+        remoteResult = await this.requestUsageEngine.query(provider, {
+          ...options,
+          limit,
+          appType: 'codex',
+          strictAppType: sharedAcrossApps,
+        });
+      } catch (error) {
+        remoteResult = {
+          success: false,
+          supported: true,
+          providerId: provider.id,
+          providerName: provider.name,
+          providerKind: providerKind(provider),
+          source: 'provider_log',
+          interface: describeProviderRequestUsage(provider),
+          limit,
+          fetchedAt: new Date(this.now()).toISOString(),
+          items: [],
+          errorType: 'provider',
+          message: safeMessage(error),
+        };
+      }
+    }
+    if (remoteResult?.success === true) {
+      return {
+        ...remoteResult,
+        appType: 'codex',
+        credentialSharedAcrossApps: sharedAcrossApps,
+        fallback: false,
+        preciseCostAvailable: remoteResult?.billing?.exact === true,
+      };
+    }
+    if (typeof this.repository?.getRecentRequests !== 'function') return remoteResult;
+    try {
+      const rows = this.repository.getRecentRequests(provider.id, limit);
+      if (!Array.isArray(rows)) return remoteResult;
+      return ccswitchRequestUsageFallback(provider, rows, remoteResult, limit, this.now);
+    } catch (error) {
+      return {
+        ...remoteResult,
+        fallback: false,
+        fallbackError: safeMessage(error),
+      };
+    }
+  }
+
   getBalance(providerSelector) {
     const provider = this.findProvider(providerSelector);
     if (!provider) return { success: false, message: `Unknown provider: ${String(providerSelector || '')}`, cache_only: true };
@@ -475,16 +715,93 @@ export class HubService {
     };
   }
 
-  async openLogin(providerSelector) {
+  async bindAccount(providerSelector, options = {}) {
+    const provider = this.findProvider(providerSelector);
+    if (!provider) throw new Error('CCSwitch 中不存在这个 Codex 供应商');
+    if (providerKind(provider) !== 'anyrouter') throw new Error('只有 AnyRouter 支持显式浏览器账号绑定');
+    if (typeof this.queryEngine?.bindBrowserAccount !== 'function') throw new Error('当前余额适配器不支持浏览器账号绑定');
+    const result = await this.queryEngine.bindBrowserAccount(provider, { clientRef: String(options.clientRef || '').trim() });
+    if (result?.failure) {
+      return {
+        ...this.#publicItem(this.items.get(provider.id)),
+        bindingAttemptFailed: true,
+        message: safeMessage(result.failure.message || 'AnyRouter 账号绑定失败'),
+      };
+    }
+    const binding = safeAccountBinding(result?.binding);
+    if (!binding) throw new Error('AnyRouter 账号绑定结果无效');
+    const targets = [...this.providers.values()].filter(candidate => (
+      providerKind(candidate) === 'anyrouter'
+      && (candidate.id === provider.id || sameAnyRouterCredential(provider, candidate))
+    ));
+    for (const target of targets) {
+      const current = this.items.get(target.id);
+      if (!current) continue;
+      this.items.set(target.id, {
+        ...current,
+        accountBinding: binding,
+        accountBindingRequired: false,
+        status: 'idle',
+        message: `已绑定 ${binding.browser} AnyRouter 账号，等待刷新`,
+        source: '',
+        usage: null,
+        updatedAt: '',
+        lastSuccessAt: '',
+        lastAttemptAt: '',
+      });
+    }
+    this.revision += 1;
+    this.#writeCache();
+    await this.refreshProvider(provider.id);
+    return this.#publicItem(this.items.get(provider.id));
+  }
+
+  clearAccountBinding(providerSelector) {
+    const provider = this.findProvider(providerSelector);
+    if (!provider) throw new Error('CCSwitch 中不存在这个 Codex 供应商');
+    if (providerKind(provider) !== 'anyrouter') throw new Error('只有 AnyRouter 支持显式浏览器账号绑定');
+    const selected = this.items.get(provider.id);
+    const targets = [...this.providers.values()].filter(candidate => (
+      providerKind(candidate) === 'anyrouter'
+      && (candidate.id === provider.id || (
+        sameAnyRouterCredential(provider, candidate)
+        && sameAccountBinding(selected?.accountBinding, this.items.get(candidate.id)?.accountBinding)
+      ))
+    ));
+    for (const target of targets) {
+      const current = this.items.get(target.id);
+      if (!current) continue;
+      this.items.set(target.id, {
+        ...current,
+        accountBinding: null,
+        accountBindingRequired: false,
+        status: 'idle',
+        message: 'AnyRouter 浏览器账号绑定已解除',
+        source: '',
+        usage: null,
+        updatedAt: '',
+        lastSuccessAt: '',
+        lastAttemptAt: '',
+      });
+    }
+    this.revision += 1;
+    this.#writeCache();
+    return this.#publicItem(this.items.get(provider.id));
+  }
+
+  async openLogin(providerSelector, options = {}) {
     const provider = this.findProvider(providerSelector);
     if (!provider) throw new Error('CCSwitch 中不存在这个 Codex 供应商');
     const id = provider.id;
     if (!loginConfiguration(provider)) throw new Error('该供应商不支持网页登录修复');
-    const action = await this.queryEngine.openLogin(provider);
+    const action = await this.queryEngine.openLogin(provider, options);
     if (this.providers.get(id) !== provider || !this.items.has(id)) {
       throw new Error('供应商在登录操作期间已变更');
     }
-    if (action?.synced === true) return this.refreshProvider(id);
+    if (action?.synced === true) {
+      await this.refreshProvider(id);
+      return this.#publicItem(this.items.get(id));
+    }
     const item = this.items.get(id);
     this.items.set(id, {
       ...item,
@@ -492,11 +809,25 @@ export class HubService {
       sessionSyncRequired: Boolean(item.sessionSyncSupported && !action?.opened),
       websiteLoginRequired: action?.opened === true,
       message: safeMessage(action?.message || (action?.opened
-        ? '已在现有浏览器中打开登录页；登录完成后回到 Hub 手动点击刷新'
+        ? `已在${action?.browser ? ` ${action.browser} 浏览器` : '现有浏览器'}中打开登录页；登录完成后回到 Hub 手动点击刷新`
         : '未能同步现有浏览器会话，请先在官网确认登录状态')),
     });
     this.revision += 1;
-    return this.items.get(id);
+    return this.#publicItem(this.items.get(id));
+  }
+
+  #publicItem(item, refreshing = false) {
+    if (!item) return null;
+    const {
+      providerFingerprint: _providerFingerprint,
+      accountBinding: internalAccountBinding,
+      ...publicItem
+    } = item;
+    return {
+      ...publicItem,
+      accountBinding: publicAccountBinding(internalAccountBinding),
+      refreshing,
+    };
   }
 
   #balanceResponse(item) {

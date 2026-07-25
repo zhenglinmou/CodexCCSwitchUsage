@@ -5,6 +5,7 @@ dist/
 backups/
 node_modules/
 /tests/
+/output/
 .firecrawl/
 *.orig
 *.log

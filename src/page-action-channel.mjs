@@ -1,7 +1,7 @@
 export const PAGE_ACTION_SENTINEL = '\u2063\u2063';
 const ZERO = '\u200b';
 const ONE = '\u200c';
-const ACTIONS = new Set(['refresh', 'open-hub']);
+const ACTIONS = new Set(['refresh', 'refresh-requests', 'open-hub']);
 const QUEUE_PREFIX = 'q1;';
 const MAX_MARKER_LENGTH = 1_024;
 
@@ -93,7 +93,7 @@ export function enqueuePageActionTitle(title, value, sentinel) {
     const action = String(candidate?.action || '');
     const token = Number(candidate?.token);
     const requestedAt = Number(candidate?.requestedAt);
-    if (!['refresh', 'open-hub'].includes(action) || !Number.isSafeInteger(token) || token < 0 || !Number.isFinite(requestedAt) || requestedAt <= 0) return null;
+    if (!['refresh', 'refresh-requests', 'open-hub'].includes(action) || !Number.isSafeInteger(token) || token < 0 || !Number.isFinite(requestedAt) || requestedAt <= 0) return null;
     return { action, token, requestedAt };
   };
   const next = normalize(value);
@@ -122,7 +122,7 @@ export function enqueuePageActionTitle(title, value, sentinel) {
       }
       if (valid) {
         const entries = decoded.startsWith('q1;') ? decoded.slice(3).split(';') : [decoded];
-        for (const entry of entries.slice(0, 2)) {
+        for (const entry of entries.slice(0, 3)) {
           const [action, token, requestedAt, extra] = entry.split('|');
           const existing = extra === undefined ? normalize({ action, token: Number(token), requestedAt: Number(requestedAt) }) : null;
           if (existing && !actions.some(item => item.action === existing.action)) actions.push(existing);

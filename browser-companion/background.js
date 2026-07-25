@@ -60,14 +60,18 @@ function browserName() {
 }
 
 async function config() {
-  const stored = await chrome.storage.local.get(['hubToken', 'clientId', 'lastError']);
+  const stored = await chrome.storage.local.get(['hubToken', 'clientId', 'clientBrowser', 'lastError']);
+  const currentBrowser = browserName();
   let clientId = stored.clientId;
-  if (!/^[A-Za-z0-9_-]{8,128}$/.test(String(clientId || ''))) {
+  if (
+    !/^[A-Za-z0-9_-]{8,128}$/.test(String(clientId || ''))
+    || String(stored.clientBrowser || '') !== currentBrowser
+  ) {
     clientId = crypto.randomUUID();
-    await chrome.storage.local.set({ clientId });
+    await chrome.storage.local.set({ clientId, clientBrowser: currentBrowser });
   }
   lastErrorValue = String(stored.lastError || '');
-  return { token: String(stored.hubToken || '').trim(), clientId, lastError: lastErrorValue };
+  return { token: String(stored.hubToken || '').trim(), clientId, browser: currentBrowser, lastError: lastErrorValue };
 }
 
 function updateStatus({ lastHeartbeatAt, lastError } = {}) {
@@ -141,7 +145,7 @@ async function performHeartbeat(current) {
   const payload = {
     clientId: resolved.clientId,
     instanceId,
-    browser: browserName(),
+    browser: resolved.browser,
     version: manifest.version,
     ...companionHandshake(),
     sessions: await knownSessions(),
@@ -476,7 +480,7 @@ async function pollOnce(current) {
   const query = new URLSearchParams({
     clientId: current.clientId,
     instanceId,
-    browser: browserName(),
+    browser: current.browser,
     version: manifest.version,
     protocolVersion: String(handshake.protocolVersion),
   });

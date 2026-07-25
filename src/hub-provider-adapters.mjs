@@ -11,6 +11,15 @@ const WHAM_BROWSER_RACE_DELAY_MS = 400;
 const WHAM_DIRECT_BACKOFF_MS = 300_000;
 const WHAM_RESULT_CACHE_MS = 30_000;
 const PROVIDER_SCOPED_NAME = Symbol('providerScopedName');
+const API_KEY_NO_LOGIN = 'API Key 直接查询，无需官网登录';
+
+function joinedDetails(...values) {
+  return values.map(value => String(value || '').trim()).filter(Boolean).join('；');
+}
+
+function apiKeyDetails(...values) {
+  return joinedDetails(...values, API_KEY_NO_LOGIN);
+}
 
 export function parseBrowserJson(text) {
   const source = String(text || '').trim();
@@ -59,6 +68,25 @@ export function parseNewApiBalancePayload(payload) {
     total: (quota + usedQuota) / QUOTA_PER_USD,
     requestCount,
   };
+}
+
+function newApiAccountId(payload) {
+  const root = record(payload);
+  const data = record(root?.data) || root;
+  const nestedUser = record(data?.user);
+  const value = data?.id ?? data?.user_id ?? data?.userId ?? nestedUser?.id;
+  const normalized = String(value ?? '').trim();
+  return /^\d+$/.test(normalized) ? normalized : '';
+}
+
+function anyRouterAccountRef(origin, clientRef, accountId) {
+  return crypto.createHash('sha256')
+    .update(String(origin || ''))
+    .update('\0')
+    .update(String(clientRef || ''))
+    .update('\0')
+    .update(String(accountId || ''))
+    .digest('base64url');
 }
 
 export function parseDeepSeekBalancePayload(payload) {
@@ -178,6 +206,43 @@ function parseKnownNewApiAccountPayload(payload, display, providerLabel) {
   };
 }
 
+function normalizedNewApiKey(value) {
+  return String(value || '').trim().replace(/^sk-/i, '');
+}
+
+function maskedNewApiKeyMatches(value, apiKey) {
+  const candidate = normalizedNewApiKey(value);
+  const expected = normalizedNewApiKey(apiKey);
+  if (!candidate || !expected) return false;
+  if (!candidate.includes('*')) return candidate === expected;
+  const firstMask = candidate.indexOf('*');
+  const lastMask = candidate.lastIndexOf('*');
+  const prefix = candidate.slice(0, firstMask);
+  const suffix = candidate.slice(lastMask + 1);
+  return prefix.length >= 2 && suffix.length >= 2 && expected.startsWith(prefix) && expected.endsWith(suffix);
+}
+
+function newApiAccountKeyOwnership(payload, apiKey, providerLabel) {
+  const root = record(payload);
+  const data = root?.data;
+  const items = Array.isArray(data)
+    ? data
+    : Array.isArray(data?.items)
+      ? data.items
+      : Array.isArray(data?.data)
+        ? data.data
+        : null;
+  if (root?.success !== true || !items) {
+    throw new Error(String(root?.message || `${providerLabel}账号 API Key 列表响应格式无效`));
+  }
+  const candidates = items.map(item => record(item)?.key);
+  const total = Number(record(data)?.total ?? root?.total);
+  return {
+    ownsKey: candidates.some(candidate => maskedNewApiKeyMatches(candidate, apiKey)),
+    emptyList: items.length === 0 && (!Number.isFinite(total) || total === 0),
+  };
+}
+
 export function parseJianzhileAccountPayload(payload, display = DEFAULT_KNOWN_NEW_API_DISPLAY) {
   return parseKnownNewApiAccountPayload(payload, display, '简直了');
 }
@@ -277,6 +342,8 @@ function usageResult(provider, values) {
     periodLabel: values.periodLabel || '',
     hideTotal: values.hideTotal === true,
   });
+  const accountBrowser = String(values.accountBrowser || '').replace(/\s+/g, ' ').trim().slice(0, 64);
+  if (accountBrowser) usage.accountBrowser = accountBrowser;
   if (values.providerScopedName === true) {
     Object.defineProperty(usage, PROVIDER_SCOPED_NAME, { value: true });
   }
@@ -617,7 +684,7 @@ export function describeProviderQuery(provider) {
       type: 'api-key-with-account-fallback',
       label: '简直了 API Key / 账户总额度',
       requestUrl: 'https://jianzhile.vip/api/usage/token/',
-      authentication: 'Bearer API Key；无限 Key 时使用简直了官网登录态',
+      authentication: '有限 Key 使用 Bearer API Key，无需官网登录；无限 Key 使用简直了官网登录态',
       executor: '有限 Key 由 Balance Hub 直接查询；无限 Key 由 Edge/Chrome 伴侣查询账户总额度',
       waf: true,
       notes: [
@@ -633,7 +700,7 @@ export function describeProviderQuery(provider) {
       type: 'api-key-with-account-fallback',
       label: 'freely API Key / 账户总额度',
       requestUrl: 'https://free.lyclaude.site/api/usage/token/',
-      authentication: 'Bearer API Key；无限 Key 时使用 freely 官网登录态',
+      authentication: '有限 Key 使用 Bearer API Key，无需官网登录；无限 Key 使用 freely 官网登录态',
       executor: '有限 Key 由 Balance Hub 直接查询；无限 Key 由 Edge/Chrome 伴侣查询账户总额度',
       waf: true,
       notes: [
@@ -649,7 +716,7 @@ export function describeProviderQuery(provider) {
       type: 'api-key-with-account-fallback',
       label: '君的公益 API Key / 账户总额度',
       requestUrl: 'https://muyuan.do/api/usage/token/',
-      authentication: 'Bearer API Key；无限 Key 时使用君的公益官网登录态',
+      authentication: '有限 Key 使用 Bearer API Key，无需官网登录；无限 Key 使用君的公益官网登录态',
       executor: '有限 Key 直接查询；Cloudflare/WAF 或无限 Key 时由 Edge/Chrome 浏览器伴侣执行同源查询',
       waf: true,
       notes: [
@@ -665,7 +732,7 @@ export function describeProviderQuery(provider) {
       type: 'api-key-with-account-fallback',
       label: '无名公益站 API Key / 账户总额度',
       requestUrl: 'https://welfare.0xpsyche.me/api/usage/token/',
-      authentication: 'Bearer API Key；无限 Key 时使用无名公益站官网登录态',
+      authentication: '有限 Key 使用 Bearer API Key，无需官网登录；无限 Key 使用无名公益站官网登录态',
       executor: '有限 Key 由 Balance Hub 直接查询；无限 Key 由 Edge/Chrome 伴侣查询账户总额度',
       notes: [
         '此分支仅对配置的 welfare.0xpsyche.me API 域名生效',
@@ -680,7 +747,7 @@ export function describeProviderQuery(provider) {
       type: 'api-key',
       label: 'DeepSeek 官方余额 API',
       requestUrl: safeRequestUrl(apiBaseUrl || 'https://api.deepseek.com', '/user/balance'),
-      authentication: 'Bearer API Key',
+      authentication: 'Bearer API Key；无需官网登录',
       executor: 'Balance Hub 直接请求第三方官网',
     };
   }
@@ -690,7 +757,7 @@ export function describeProviderQuery(provider) {
       type: 'api-key',
       label: 'PackyCode 官方用量 API',
       requestUrl: 'https://www.packyapi.com/api/usage/token/',
-      authentication: 'Bearer API Key',
+      authentication: 'Bearer API Key；无需官网登录',
       executor: 'Balance Hub 直接请求第三方官网',
     };
   }
@@ -700,7 +767,7 @@ export function describeProviderQuery(provider) {
       type: 'api-key',
       label: '第三方窗口额度 API',
       requestUrl: safeRequestUrl(apiBaseUrl, '/user/balance'),
-      authentication: 'Bearer API Key',
+      authentication: 'Bearer API Key；无需官网登录',
       executor: 'Balance Hub 直接请求第三方官网',
       notes: ['读取 3 小时与 1 天窗口；相同 API Key 的镜像站复用一次查询结果'],
     };
@@ -710,7 +777,7 @@ export function describeProviderQuery(provider) {
     type: 'api-health',
     label: 'API Key 能力检查与本地统计',
     requestUrl: safeRequestUrl(apiBaseUrl, '/models'),
-    authentication: 'Bearer API Key',
+    authentication: 'Bearer API Key；无需官网登录',
     executor: 'Balance Hub 检查模型 API；余额不可用时显示 CCSwitch 本地费用',
     notes: ['该站没有已知的模型 Key 余额接口'],
   };
@@ -754,14 +821,16 @@ export class ProviderQueryEngine {
     this.recentQueries = new Map();
   }
 
-  async query(provider) {
-    const cacheKey = this.#sharedQueryKey(provider);
+  async query(provider, options = {}) {
+    const accountBinding = options?.accountBinding || null;
+    const allowSoleSessionFallback = options?.allowSoleSessionFallback !== false;
+    const cacheKey = this.#sharedQueryKey(provider, accountBinding, allowSoleSessionFallback);
     const cached = cacheKey ? this.recentQueries.get(cacheKey) : null;
     if (cached && Date.now() - cached.createdAt < 30_000) return this.#copyResult(cached.result, provider);
     if (cacheKey && this.inFlightQueries.has(cacheKey)) {
       return this.#copyResult(await this.inFlightQueries.get(cacheKey), provider);
     }
-    const operation = this.#queryWithDeadline(provider);
+    const operation = this.#queryWithDeadline(provider, accountBinding, allowSoleSessionFallback);
     if (cacheKey) this.inFlightQueries.set(cacheKey, operation);
     try {
       const result = await operation;
@@ -776,7 +845,7 @@ export class ProviderQueryEngine {
     }
   }
 
-  async #queryWithDeadline(provider) {
+  async #queryWithDeadline(provider, accountBinding = null, allowSoleSessionFallback = true) {
     const controller = new AbortController();
     const timeoutError = new Error(`供应商余额查询超过 ${Math.ceil(this.providerQueryTimeoutMs / 1_000)} 秒`);
     let timer = null;
@@ -787,16 +856,25 @@ export class ProviderQueryEngine {
       }, this.providerQueryTimeoutMs);
     });
     try {
-      return await Promise.race([this.#queryUncached(provider, controller.signal), timeout]);
+      return await Promise.race([
+        this.#queryUncached(provider, controller.signal, accountBinding, allowSoleSessionFallback),
+        timeout,
+      ]);
     } finally {
       clearTimeout(timer);
     }
   }
 
-  #sharedQueryKey(provider) {
+  #sharedQueryKey(provider, accountBinding = null, allowSoleSessionFallback = true) {
     const kind = providerKind(provider);
     if (['openai', 'cpa'].includes(kind)) return '';
-    if (kind === 'anyrouter' || kind === 'agentrouter') return `browser:${kind}`;
+    if (kind === 'anyrouter' || kind === 'agentrouter') {
+      const accountIdentity = String(provider.apiKey || provider.id || '');
+      const bindingIdentity = kind === 'anyrouter' && accountBinding
+        ? `${String(accountBinding.clientRef || '')}\0${String(accountBinding.accountRef || '')}`
+        : allowSoleSessionFallback ? 'auto' : 'binding-required';
+      return `browser:${kind}:${crypto.createHash('sha256').update(accountIdentity).update('\0').update(bindingIdentity).digest('base64url')}`;
+    }
     const baseIdentity = kind === 'paid' ? '' : providerApiBase(provider);
     const material = [kind, baseIdentity, provider.apiKey].join('\0');
     return crypto.createHash('sha256').update(material).digest('base64url');
@@ -815,9 +893,11 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryUncached(provider, signal) {
+  async #queryUncached(provider, signal, accountBinding = null, allowSoleSessionFallback = true) {
     const kind = providerKind(provider);
-    if (kind === 'anyrouter' || kind === 'agentrouter') return this.#queryWebProvider(provider, signal);
+    if (kind === 'anyrouter' || kind === 'agentrouter') {
+      return this.#queryWebProvider(provider, signal, accountBinding, allowSoleSessionFallback);
+    }
     if (kind === 'openai') return this.#queryOpenAi(provider, signal);
     if (kind === 'cpa') return this.#queryCpa(provider, signal);
     if (kind === 'jianzhile') return this.#queryJianzhile(provider, signal);
@@ -831,24 +911,90 @@ export class ProviderQueryEngine {
     throw new Error('该供应商没有可用的 API Key、Base URL 或内置余额适配器');
   }
 
-  async openLogin(provider) {
+  async bindBrowserAccount(provider, options = {}) {
+    if (providerKind(provider) !== 'anyrouter') throw new Error('只有 AnyRouter 支持显式浏览器账号绑定');
+    const config = loginConfiguration(provider);
+    const clientRef = String(options.clientRef || '').trim();
+    if (!clientRef) throw new Error('请选择要绑定的 Edge 或 Chrome');
+    if (
+      typeof this.browserBroker?.listQueryClients !== 'function'
+      || typeof this.browserBroker?.queryJsonOnClient !== 'function'
+    ) {
+      return {
+        failure: {
+          source: 'browser_session',
+          loginRequired: true,
+          sessionSyncRequired: true,
+          message: '余额伴侣版本不支持 AnyRouter 账号绑定，请在 Chrome 和 Edge 中重新加载当前伴侣',
+        },
+      };
+    }
+    const client = this.browserBroker.listQueryClients(config.baseUrl)
+      .find(candidate => String(candidate.clientRef || candidate.clientId || '') === clientRef);
+    if (!client) {
+      return {
+        failure: {
+          source: 'browser_session',
+          loginRequired: true,
+          sessionSyncRequired: true,
+          message: '指定的浏览器余额伴侣当前未连接，无法绑定 AnyRouter 账号',
+        },
+      };
+    }
+    const probe = await this.#probeNewApiAccount(client, config, undefined, parseNewApiBalancePayload);
+    if (probe.kind !== 'account') {
+      return { failure: this.#newApiAccountProbeFailure(probe, 'AnyRouter', String(client.browser || 'Chromium')) };
+    }
+    if (!probe.accountId) {
+      return {
+        failure: {
+          source: 'browser_session',
+          loginRequired: true,
+          sessionSyncRequired: true,
+          message: `无法取得 ${String(client.browser || 'Chromium')} 中 AnyRouter 账号的稳定用户 ID，请先在该浏览器重新验证官网会话`,
+        },
+      };
+    }
+    const origin = new URL(config.baseUrl).origin;
+    return {
+      binding: {
+        clientRef,
+        browser: String(client.browser || 'Chromium'),
+        origin,
+        accountRef: anyRouterAccountRef(origin, clientRef, probe.accountId),
+        boundAt: new Date(this.now()).toISOString(),
+      },
+    };
+  }
+
+  async openLogin(provider, options = {}) {
     const config = loginConfiguration(provider);
     if (!config) throw new Error('该供应商不支持网页登录修复');
     if (!this.browserBroker.isConnected()) throw new Error('请先连接现有 Edge/Chrome 的余额伴侣扩展');
-    const result = await this.browserBroker.openLogin(config);
+    const clients = typeof this.browserBroker.listQueryClients === 'function'
+      ? this.browserBroker.listQueryClients(config.baseUrl)
+      : [];
+    const target = options.clientRef
+      ? clients.find(client => client.clientRef === options.clientRef)
+      : null;
+    if (options.clientRef && !target) throw new Error('指定的浏览器余额伴侣未连接');
+    const result = target && typeof this.browserBroker.openLoginOnClient === 'function'
+      ? await this.browserBroker.openLoginOnClient(target.clientRef, config)
+      : await this.browserBroker.openLogin(config);
     return {
       success: true,
       loginUrl: config.loginUrl,
       synced: result?.synced === true,
       opened: result?.opened === true,
       loginRequired: result?.loginRequired === true,
+      browser: target?.browser || '',
       message: String(result?.message || ''),
     };
   }
 
-  async #queryWebProvider(provider, signal) {
+  async #queryWebProvider(provider, signal, accountBinding = null, allowSoleSessionFallback = true) {
     if (this.browserBroker.isConnected()) {
-      return this.#queryBrowserNewApi(provider, signal);
+      return this.#queryBrowserNewApi(provider, signal, accountBinding, allowSoleSessionFallback);
     }
     return {
       source: 'browser_session',
@@ -857,69 +1003,100 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryBrowserNewApi(provider, signal) {
+  async #queryBrowserNewApi(provider, signal, accountBinding = null, allowSoleSessionFallback = true) {
     const kind = providerKind(provider);
     const config = loginConfiguration(provider);
     if (!this.browserBroker.isConnected()) {
       return { source: 'browser_session', loginRequired: false, message: '现有 Edge/Chrome 的余额伴侣扩展未连接' };
     }
-    let raw;
-    try {
-      raw = await this.browserBroker.queryJson(
-        { ...config, headers: {} },
-        { signal },
+    let balance;
+    let accountBrowser = '';
+    let accountBrowserNote = '';
+    const supportsAccountSelection = Boolean(
+      provider.apiKey
+      && typeof this.browserBroker?.listQueryClients === 'function'
+      && typeof this.browserBroker?.queryJsonOnClient === 'function'
+    );
+    if (supportsAccountSelection) {
+      const verified = await this.#queryVerifiedNewApiAccount(
+        provider,
+        {
+          label: kind === 'anyrouter' ? 'AnyRouter' : 'AgentRouter',
+          accountSource: 'browser_session',
+          allowSoleSessionFallback: kind === 'anyrouter' && allowSoleSessionFallback,
+          accountBinding: kind === 'anyrouter' ? accountBinding : null,
+        },
+        config,
+        signal,
+        parseNewApiBalancePayload,
       );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!browserPageUnavailable(message)) throw error;
-      return {
-        source: 'browser_session',
-        loginRequired: true,
-        websiteLoginRequired: true,
-        message: `浏览器中的官网页面当前不可用（${message}）；请打开官网登录页完成认证后手动刷新`,
-      };
+      if (verified.failure) return verified.failure;
+      balance = verified.account;
+      accountBrowser = verified.browser;
+      accountBrowserNote = verified.bound
+        ? `已使用绑定的 ${accountBrowser} AnyRouter 账号`
+        : verified.sessionOnly
+        ? `AnyRouter Token 列表未返回条目；已使用唯一的 ${accountBrowser} 有效会话`
+        : `已通过 ${accountBrowser} 核验此 API Key 所属账号`;
+    } else {
+      let raw;
+      try {
+        raw = await this.browserBroker.queryJson(
+          { ...config, headers: {} },
+          { signal },
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!browserPageUnavailable(message)) throw error;
+        return {
+          source: 'browser_session',
+          loginRequired: true,
+          websiteLoginRequired: true,
+          message: `浏览器中的官网页面当前不可用（${message}）；请打开官网登录页完成认证后手动刷新`,
+        };
+      }
+      const payload = parseBrowserJson(raw?.text);
+      if (raw?.identityMissing === true) {
+        return {
+          source: 'browser_session',
+          loginRequired: true,
+          sessionSyncRequired: true,
+          message: '尚未保存该站的数字用户 ID，请点击“同步现有会话”一次',
+        };
+      }
+      if (authenticationFailure(raw?.status, payload, raw)) {
+        return {
+          source: 'browser_session',
+          loginRequired: true,
+          websiteLoginRequired: true,
+          message: String(raw.message || '现有浏览器登录已失效，请手动前往官网认证'),
+        };
+      }
+      if (interactiveWafFailure(raw?.status, payload, raw)) {
+        return {
+          source: 'browser_session',
+          loginRequired: true,
+          websiteLoginRequired: true,
+          message: '第三方网站要求完成 WAF 验证，请点击“去官网认证”，完成后手动刷新',
+        };
+      }
+      if (Number(raw?.status) === 0) {
+        const detail = String(raw?.error || raw?.message || '未收到第三方网站响应').trim();
+        throw new Error(`浏览器查询失败：${detail}`);
+      }
+      if (!payload) {
+        return {
+          source: 'browser_session',
+          loginRequired: true,
+          websiteLoginRequired: true,
+          message: String(raw?.error || (raw?.status
+            ? `第三方网站返回了非余额页面（HTTP ${raw.status}），可能需要在官网登录或完成 WAF 验证`
+            : '第三方网站没有返回余额数据，请打开官网登录页确认登录状态')),
+        };
+      }
+      if (Number(raw?.status) !== 200) throw new Error(String(payload?.message || `第三方网站余额接口返回 HTTP ${Number(raw?.status) || 0}`));
+      balance = parseNewApiBalancePayload(payload);
     }
-    const payload = parseBrowserJson(raw?.text);
-    if (raw?.identityMissing === true) {
-      return {
-        source: 'browser_session',
-        loginRequired: true,
-        sessionSyncRequired: true,
-        message: '尚未保存该站的数字用户 ID，请点击“同步现有会话”一次',
-      };
-    }
-    if (authenticationFailure(raw?.status, payload, raw)) {
-      return {
-        source: 'browser_session',
-        loginRequired: true,
-        websiteLoginRequired: true,
-        message: String(raw.message || '现有浏览器登录已失效，请手动前往官网认证'),
-      };
-    }
-    if (interactiveWafFailure(raw?.status, payload, raw)) {
-      return {
-        source: 'browser_session',
-        loginRequired: true,
-        websiteLoginRequired: true,
-        message: '第三方网站要求完成 WAF 验证，请点击“去官网认证”，完成后手动刷新',
-      };
-    }
-    if (Number(raw?.status) === 0) {
-      const detail = String(raw?.error || raw?.message || '未收到第三方网站响应').trim();
-      throw new Error(`浏览器查询失败：${detail}`);
-    }
-    if (!payload) {
-      return {
-        source: 'browser_session',
-        loginRequired: true,
-        websiteLoginRequired: true,
-        message: String(raw?.error || (raw?.status
-          ? `第三方网站返回了非余额页面（HTTP ${raw.status}），可能需要在官网登录或完成 WAF 验证`
-          : '第三方网站没有返回余额数据，请打开官网登录页确认登录状态')),
-      };
-    }
-    if (Number(raw?.status) !== 200) throw new Error(String(payload?.message || `第三方网站余额接口返回 HTTP ${Number(raw?.status) || 0}`));
-    const balance = parseNewApiBalancePayload(payload);
     return {
       usage: usageResult(provider, {
         planName: balance.group || provider.name,
@@ -928,7 +1105,11 @@ export class ProviderQueryEngine {
         used: balance.used,
         total: balance.total,
         unit: 'USD',
-        extra: balance.requestCount == null ? '' : `请求次数：${balance.requestCount}`,
+        extra: joinedDetails(
+          balance.requestCount == null ? '' : `请求次数：${balance.requestCount}`,
+          accountBrowserNote,
+        ),
+        accountBrowser,
       }),
       source: 'browser_session',
       loginRequired: false,
@@ -942,6 +1123,7 @@ export class ProviderQueryEngine {
       accountSource: 'jianzhile_account',
       finiteExtra: '有限 API Key：显示 Key 自身总额度',
       accountExtra: '无限 API Key：显示所属账户总额度',
+      verifyAccountOwnership: true,
     });
   }
 
@@ -952,6 +1134,7 @@ export class ProviderQueryEngine {
       accountSource: 'freely_account',
       finiteExtra: '',
       accountExtra: '',
+      verifyAccountOwnership: true,
     });
   }
 
@@ -965,6 +1148,7 @@ export class ProviderQueryEngine {
       accountExtra: '',
       browserApiFallback: true,
       localUsageFallback: true,
+      verifyAccountOwnership: true,
       directTimeoutMs: 8_000,
       directAttempts: 1,
     });
@@ -977,6 +1161,7 @@ export class ProviderQueryEngine {
       accountSource: 'welfare_account',
       finiteExtra: '',
       accountExtra: '',
+      verifyAccountOwnership: true,
     });
   }
 
@@ -1104,7 +1289,7 @@ export class ProviderQueryEngine {
           used: token.used,
           total: token.total,
           unit: display.unit,
-          extra: site.finiteExtra,
+          extra: apiKeyDetails(site.finiteExtra),
         }),
         source: browserApiUsed ? site.browserSource : site.apiKeySource,
         loginRequired: false,
@@ -1121,48 +1306,63 @@ export class ProviderQueryEngine {
       };
     }
 
-    let raw;
-    try {
-      raw = await this.browserBroker.queryJson({ ...config, headers: {} }, { signal });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!browserPageUnavailable(message)) throw error;
-      return {
-        source: site.accountSource,
-        loginRequired: true,
-        websiteLoginRequired: true,
-        message: `${site.label}官网页面当前不可用（${message}）；请登录官网后手动刷新`,
-      };
+    let account;
+    let accountBrowser = '';
+    if (site.verifyAccountOwnership) {
+      const verified = await this.#queryVerifiedNewApiAccount(
+        provider,
+        { ...site, unlimitedKey: true },
+        config,
+        signal,
+        payload => parseKnownNewApiAccountPayload(payload, display, site.label),
+      );
+      if (verified.failure) return verified.failure;
+      account = verified.account;
+      accountBrowser = verified.browser;
+    } else {
+      let raw;
+      try {
+        raw = await this.browserBroker.queryJson({ ...config, headers: {} }, { signal });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!browserPageUnavailable(message)) throw error;
+        return {
+          source: site.accountSource,
+          loginRequired: true,
+          websiteLoginRequired: true,
+          message: `${site.label}官网页面当前不可用（${message}）；请登录官网后手动刷新`,
+        };
+      }
+      const accountPayload = parseBrowserJson(raw?.text);
+      if (raw?.identityMissing === true) {
+        return {
+          source: site.accountSource,
+          loginRequired: true,
+          sessionSyncRequired: true,
+          message: `尚未保存 ${site.label} 的纯数字用户 ID，请点击“同步现有会话”一次`,
+        };
+      }
+      if (authenticationFailure(raw?.status, accountPayload, raw)) {
+        return {
+          source: site.accountSource,
+          loginRequired: true,
+          websiteLoginRequired: true,
+          message: `${site.label}官网登录已失效，请重新登录后手动刷新`,
+        };
+      }
+      if (interactiveWafFailure(raw?.status, accountPayload, raw)) {
+        return {
+          source: site.accountSource,
+          loginRequired: true,
+          websiteLoginRequired: true,
+          message: `${site.label}官网要求完成 WAF 验证，请在官网完成后手动刷新`,
+        };
+      }
+      if (Number(raw?.status) !== 200 || !accountPayload) {
+        throw new Error(String(accountPayload?.message || raw?.error || `${site.label}账户额度接口返回 HTTP ${Number(raw?.status) || 0}`));
+      }
+      account = parseKnownNewApiAccountPayload(accountPayload, display, site.label);
     }
-    const accountPayload = parseBrowserJson(raw?.text);
-    if (raw?.identityMissing === true) {
-      return {
-        source: site.accountSource,
-        loginRequired: true,
-        sessionSyncRequired: true,
-        message: `尚未保存 ${site.label} 的纯数字用户 ID，请点击“同步现有会话”一次`,
-      };
-    }
-    if (authenticationFailure(raw?.status, accountPayload, raw)) {
-      return {
-        source: site.accountSource,
-        loginRequired: true,
-        websiteLoginRequired: true,
-        message: `${site.label}官网登录已失效，请重新登录后手动刷新`,
-      };
-    }
-    if (interactiveWafFailure(raw?.status, accountPayload, raw)) {
-      return {
-        source: site.accountSource,
-        loginRequired: true,
-        websiteLoginRequired: true,
-        message: `${site.label}官网要求完成 WAF 验证，请在官网完成后手动刷新`,
-      };
-    }
-    if (Number(raw?.status) !== 200 || !accountPayload) {
-      throw new Error(String(accountPayload?.message || raw?.error || `${site.label}账户额度接口返回 HTTP ${Number(raw?.status) || 0}`));
-    }
-    const account = parseKnownNewApiAccountPayload(accountPayload, display, site.label);
     const usedCandidates = [account.used, token.used].filter(value => Number.isFinite(value));
     const used = usedCandidates.length ? Math.max(...usedCandidates) : null;
     return {
@@ -1172,10 +1372,285 @@ export class ProviderQueryEngine {
         used,
         total: used == null ? account.total : account.remaining + used,
         unit: display.unit,
-        extra: site.accountExtra,
+        extra: [site.accountExtra, accountBrowser ? `已通过 ${accountBrowser} 核验此 API Key 所属账号` : ''].filter(Boolean).join('；'),
+        accountBrowser,
       }),
       source: site.accountSource,
       loginRequired: false,
+    };
+  }
+
+  async #probeNewApiAccount(client, config, signal, parseAccountPayload) {
+    try {
+      const accountRaw = await this.browserBroker.queryJsonOnClient(
+        client.clientRef || client.clientId,
+        { ...config, headers: {} },
+        { signal },
+      );
+      const accountPayload = parseBrowserJson(accountRaw?.text);
+      if (accountRaw?.identityMissing === true) return { kind: 'identity', client };
+      if (authenticationFailure(accountRaw?.status, accountPayload, accountRaw)) return { kind: 'authentication', client };
+      if (interactiveWafFailure(accountRaw?.status, accountPayload, accountRaw)) return { kind: 'waf', client };
+      if (Number(accountRaw?.status) !== 200 || !accountPayload) {
+        return {
+          kind: 'error',
+          client,
+          message: String(accountPayload?.message || accountRaw?.error || `HTTP ${Number(accountRaw?.status) || 0}`),
+        };
+      }
+      return {
+        kind: 'account',
+        client,
+        account: parseAccountPayload(accountPayload),
+        accountId: newApiAccountId(accountPayload),
+      };
+    } catch (error) {
+      return { kind: 'error', client, message: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  #newApiAccountProbeFailure(probe, label, browser) {
+    const base = { source: 'browser_session', loginRequired: true };
+    if (probe.kind === 'identity') {
+      return {
+        ...base,
+        sessionSyncRequired: true,
+        message: `请先在 ${browser} 中为 ${label} 点击一次“验证”以同步现有会话`,
+      };
+    }
+    if (probe.kind === 'waf') {
+      return {
+        ...base,
+        websiteLoginRequired: true,
+        message: `${browser} 中的 ${label} 官网要求完成 WAF 验证，请完成后重新绑定`,
+      };
+    }
+    if (probe.kind === 'authentication') {
+      return {
+        ...base,
+        websiteLoginRequired: true,
+        message: `${browser} 中的 ${label} 官网登录已失效，请重新登录后再绑定`,
+      };
+    }
+    return {
+      ...base,
+      websiteLoginRequired: true,
+      message: `${browser} 中的 ${label} 账号查询失败${probe.message ? `：${probe.message}` : ''}`,
+    };
+  }
+
+  async #queryVerifiedNewApiAccount(provider, site, config, signal, parseAccountPayload) {
+    if (
+      typeof this.browserBroker?.listQueryClients !== 'function'
+      || typeof this.browserBroker?.queryJsonOnClient !== 'function'
+    ) {
+      return {
+        failure: {
+          source: site.accountSource,
+          loginRequired: true,
+          sessionSyncRequired: true,
+          message: '余额伴侣版本不支持同站多账号隔离，请在 Chrome 和 Edge 中重新加载当前 v2 余额伴侣',
+        },
+      };
+    }
+    const clients = this.browserBroker.listQueryClients(config.baseUrl).slice(0, 6);
+    if (!clients.length) {
+      return {
+        failure: {
+          source: site.accountSource,
+          loginRequired: true,
+          sessionSyncRequired: true,
+          message: site.unlimitedKey
+            ? `${site.label} API Key 为无限额度；请在对应账号所在浏览器中连接余额伴侣`
+            : `${site.label} 需要对应账号的浏览器登录态；请连接余额伴侣`,
+        },
+      };
+    }
+
+    const requestedBinding = site.accountBinding;
+    if (requestedBinding) {
+      const expectedOrigin = new URL(config.baseUrl).origin;
+      const bindingClientRef = String(requestedBinding.clientRef || '').trim();
+      const bindingAccountRef = String(requestedBinding.accountRef || '').trim();
+      if (
+        !bindingClientRef
+        || !/^[A-Za-z0-9_-]{43}$/.test(bindingAccountRef)
+        || String(requestedBinding.origin || '') !== expectedOrigin
+      ) {
+        return {
+          failure: {
+            source: site.accountSource,
+            loginRequired: true,
+            accountBindingMismatch: true,
+            accountBindingRequired: true,
+            invalidateUsage: true,
+            message: 'AnyRouter 账号绑定已失效，请重新选择 Edge 或 Chrome',
+          },
+        };
+      }
+      const client = clients.find(candidate => String(candidate.clientRef || candidate.clientId || '') === bindingClientRef);
+      const boundBrowser = String(requestedBinding.browser || client?.browser || 'Chromium');
+      if (!client) {
+        return {
+          failure: {
+            source: site.accountSource,
+            loginRequired: true,
+            sessionSyncRequired: true,
+            message: `绑定的 ${boundBrowser} 余额伴侣当前未连接；不会改用其他浏览器账号`,
+          },
+        };
+      }
+      const boundProbe = await this.#probeNewApiAccount(client, config, signal, parseAccountPayload);
+      if (boundProbe.kind !== 'account') {
+        return { failure: { ...this.#newApiAccountProbeFailure(boundProbe, site.label, boundBrowser), source: site.accountSource } };
+      }
+      if (!boundProbe.accountId) {
+        return {
+          failure: {
+            source: site.accountSource,
+            loginRequired: true,
+            sessionSyncRequired: true,
+            accountBindingRequired: true,
+            message: `绑定的 ${boundBrowser} AnyRouter 响应缺少稳定用户 ID，请重新验证并绑定`,
+          },
+        };
+      }
+      const actualAccountRef = anyRouterAccountRef(expectedOrigin, bindingClientRef, boundProbe.accountId);
+      if (actualAccountRef !== bindingAccountRef) {
+        return {
+          failure: {
+            source: site.accountSource,
+            loginRequired: true,
+            accountBindingMismatch: true,
+            accountBindingRequired: true,
+            invalidateUsage: true,
+            message: `绑定的 ${boundBrowser} AnyRouter 账号已变化；请重新绑定`,
+          },
+        };
+      }
+      return {
+        account: boundProbe.account,
+        browser: String(client.browser || boundBrowser),
+        bound: true,
+      };
+    }
+
+    const probe = async client => {
+      try {
+        const accountProbe = await this.#probeNewApiAccount(client, config, signal, parseAccountPayload);
+        if (accountProbe.kind !== 'account') return accountProbe;
+        const ownershipRaw = await this.browserBroker.queryJsonOnClient(
+          client.clientRef || client.clientId,
+          { ...config, requestPath: '/api/token/?p=1&size=100', headers: {} },
+          { signal },
+        );
+        const ownershipPayload = parseBrowserJson(ownershipRaw?.text);
+        if (ownershipRaw?.identityMissing === true) return { kind: 'identity', client };
+        if (authenticationFailure(ownershipRaw?.status, ownershipPayload, ownershipRaw)) return { kind: 'authentication', client };
+        if (interactiveWafFailure(ownershipRaw?.status, ownershipPayload, ownershipRaw)) return { kind: 'waf', client };
+        if (Number(ownershipRaw?.status) !== 200 || !ownershipPayload) {
+          return { kind: 'error', client, message: String(ownershipPayload?.message || ownershipRaw?.error || `HTTP ${Number(ownershipRaw?.status) || 0}`) };
+        }
+        const ownership = newApiAccountKeyOwnership(ownershipPayload, provider.apiKey, site.label);
+        if (ownership.ownsKey) return { kind: 'match', client, account: accountProbe.account };
+        if (ownership.emptyList) return { kind: 'empty-list', client, account: accountProbe.account };
+        return { kind: 'mismatch', client };
+      } catch (error) {
+        return { kind: 'error', client, message: error instanceof Error ? error.message : String(error) };
+      }
+    };
+
+    const hintedClients = clients.filter(client => client.hasSession === true);
+    const unhintedClients = clients.filter(client => client.hasSession !== true);
+    const results = [];
+    const probeClients = async candidates => {
+      for (const client of candidates) {
+        const result = await probe(client);
+        results.push(result);
+        if (result.kind === 'match') return result;
+      }
+      return null;
+    };
+    let matched = await probeClients(hintedClients.length ? hintedClients : unhintedClients);
+    if (
+      !matched
+      && site.allowSoleSessionFallback === true
+      && hintedClients.length === 1
+      && results.length === 1
+      && results[0].kind === 'empty-list'
+    ) {
+      const soleSession = results[0];
+      return {
+        account: soleSession.account,
+        browser: String(soleSession.client.browser || 'Chromium'),
+        sessionOnly: true,
+      };
+    }
+    if (!matched && hintedClients.length && results.every(result => result.kind === 'mismatch')) {
+      matched = await probeClients(unhintedClients);
+    }
+    if (matched) return { account: matched.account, browser: String(matched.client.browser || 'Chromium') };
+    const browserNames = [...new Set(results.map(result => String(result.client.browser || 'Chromium')))];
+    const browserLabel = browserNames.join(' / ') || 'Chrome / Edge';
+    if (results.length > 0 && results.every(result => result.kind === 'mismatch')) {
+      return {
+        failure: {
+          source: site.accountSource,
+          loginRequired: true,
+          websiteLoginRequired: true,
+          accountMismatch: true,
+          message: `已连接的 ${browserLabel} 登录账号都不包含 ${provider.name} 的 API Key；请在对应账号所在浏览器中连接余额伴侣并同步现有会话`,
+        },
+      };
+    }
+    if (results.length > 0 && results.every(result => result.kind === 'empty-list')) {
+      return {
+        failure: {
+          source: site.accountSource,
+          loginRequired: true,
+          accountBindingRequired: true,
+          message: `${site.label} Token 列表未返回可核验条目；请为 ${provider.name} 明确绑定 Edge 或 Chrome 账号`,
+        },
+      };
+    }
+    if (results.some(result => result.kind === 'identity')) {
+      return {
+        failure: {
+          source: site.accountSource,
+          loginRequired: true,
+          sessionSyncRequired: true,
+          message: `请分别在 ${browserLabel} 中为 ${site.label} 点击一次“同步现有会话”`,
+        },
+      };
+    }
+    if (results.some(result => result.kind === 'waf')) {
+      return {
+        failure: {
+          source: site.accountSource,
+          loginRequired: true,
+          websiteLoginRequired: true,
+          message: `${site.label} 官网要求完成 WAF 验证，请在对应浏览器完成后手动刷新`,
+        },
+      };
+    }
+    if (results.some(result => result.kind === 'authentication')) {
+      return {
+        failure: {
+          source: site.accountSource,
+          loginRequired: true,
+          websiteLoginRequired: true,
+          message: `${browserLabel} 中的 ${site.label} 官网登录已失效，请重新登录后手动刷新`,
+        },
+      };
+    }
+    const detail = results.map(result => result.message).find(Boolean);
+    return {
+      failure: {
+        source: site.accountSource,
+        loginRequired: true,
+        websiteLoginRequired: true,
+        message: `${provider.name} 无法从已连接的 ${browserLabel} 核验账号${detail ? `：${detail}` : ''}`,
+      },
     };
   }
 
@@ -1196,7 +1671,7 @@ export class ProviderQueryEngine {
         used: null,
         total: null,
         unit: currencies.size === 1 ? [...currencies][0] : 'currency',
-        extra: balances.map(item => `${item.currency}: ${item.value}`).join('，'),
+        extra: apiKeyDetails(balances.map(item => `${item.currency}: ${item.value}`).join('，')),
       }),
       source: 'official_api',
       loginRequired: false,
@@ -1212,7 +1687,14 @@ export class ProviderQueryEngine {
     if (status !== 200) throw new Error(String(payload?.message || `PackyCode 余额接口返回 HTTP ${status}`));
     const balance = parsePackyBalancePayload(payload);
     return {
-      usage: usageResult(provider, { planName: 'PackyCode', remaining: balance.remaining, used: balance.used, total: balance.total, unit: 'USD', extra: `重置周期：${balance.resetPeriod}` }),
+      usage: usageResult(provider, {
+        planName: 'PackyCode',
+        remaining: balance.remaining,
+        used: balance.used,
+        total: balance.total,
+        unit: 'USD',
+        extra: apiKeyDetails(`重置周期：${balance.resetPeriod}`),
+      }),
       source: 'provider_api',
       loginRequired: false,
     };
@@ -1244,7 +1726,7 @@ export class ProviderQueryEngine {
       usage: usageResult(provider, {
         planName: provider.name,
         providerScopedName: true,
-        extra: `3H剩:${short(quota3h.remaining)}`,
+        extra: apiKeyDetails(`3H剩:${short(quota3h.remaining)}`),
         periodLabel: '1D',
         hideTotal: true,
         used,
@@ -1421,25 +1903,84 @@ export class ProviderQueryEngine {
   async #queryOpenAiBrowser(provider, signal) {
     if (typeof this.browserBroker?.hasSession !== 'function' || !this.browserBroker.hasSession('https://chatgpt.com')) return null;
     const config = loginConfiguration(provider);
-    const raw = await this.browserBroker.queryJson(config, { signal });
-    const session = parseBrowserJson(raw?.text);
-    const accessToken = String(session?.accessToken || session?.access_token || '');
-    const accountId = accountIdFromSession(session, accessToken);
+    const configuredAccountId = String(provider.auth?.tokens?.account_id || '');
+    let session;
+    let accessToken = '';
+    let accountId = '';
+    let accountBrowser = '';
+    const supportsAccountSelection = Boolean(
+      typeof this.browserBroker?.listQueryClients === 'function'
+      && typeof this.browserBroker?.queryJsonOnClient === 'function'
+    );
+    if (supportsAccountSelection) {
+      const clients = this.browserBroker.listQueryClients(config.baseUrl).slice(0, 6);
+      const candidates = await Promise.all(clients.map(async client => {
+        try {
+          const raw = await this.browserBroker.queryJsonOnClient(
+            client.clientRef || client.clientId,
+            config,
+            { signal },
+          );
+          if (Number(raw?.status) !== 200) return null;
+          const candidateSession = parseBrowserJson(raw?.text);
+          const candidateToken = String(candidateSession?.accessToken || candidateSession?.access_token || '');
+          const candidateAccountId = accountIdFromSession(candidateSession, candidateToken);
+          if (!candidateToken || !candidateAccountId) return null;
+          return { client, session: candidateSession, accessToken: candidateToken, accountId: candidateAccountId };
+        } catch {
+          return null;
+        }
+      }));
+      const valid = candidates.filter(Boolean);
+      const matched = configuredAccountId
+        ? valid.find(candidate => candidate.accountId === configuredAccountId)
+        : valid[0];
+      if (!matched) {
+        const browserLabel = [...new Set(clients.map(client => String(client.browser || 'Chromium')))].join(' / ') || 'Chrome / Edge';
+        return {
+          source: 'browser_session',
+          loginRequired: true,
+          websiteLoginRequired: true,
+          message: configuredAccountId
+            ? `已连接的 ${browserLabel} 未找到与 ${provider.name} 匹配的 OpenAI 账号`
+            : `已连接的 ${browserLabel} 没有可用的 OpenAI 登录账号`,
+        };
+      }
+      ({ session, accessToken, accountId } = matched);
+      accountBrowser = String(matched.client.browser || 'Chromium');
+    } else {
+      const raw = await this.browserBroker.queryJson(config, { signal });
+      session = parseBrowserJson(raw?.text);
+      accessToken = String(session?.accessToken || session?.access_token || '');
+      accountId = accountIdFromSession(session, accessToken);
+    }
     if (!accessToken || !accountId) return null;
     const result = await this.#queryWham(accessToken, accountId, signal);
     if (result.status !== 200 || !isWhamUsagePayload(result.payload)) return null;
-    return this.#openAiUsage(provider, result.payload, 'browser_session');
+    return this.#openAiUsage(provider, result.payload, 'browser_session', {
+      accountBrowser,
+      extra: accountBrowser ? `已通过 ${accountBrowser} 匹配 OpenAI 账号` : '',
+    });
   }
 
-  #openAiUsage(provider, payload, source) {
+  #openAiUsage(provider, payload, source, options = {}) {
     const summary = summarizeWham(payload);
     const details = summary.limits.map(item => {
       const reset = item.resetAfterSeconds ? `，约 ${Math.floor(item.resetAfterSeconds / 60)} 分钟后重置` : '';
       return `${item.label} ${item.remaining.toFixed(1)}% 可用${reset}`;
     });
     if (summary.creditBalance != null) details.push(`Credits ${summary.creditBalance}`);
+    if (options.extra) details.push(String(options.extra));
     return {
-      usage: usageResult(provider, { planName: `OpenAI ${summary.plan}`, remaining: summary.remaining, used: summary.used, total: 100, unit: '%', extra: details.join('；') }),
+      usage: usageResult(provider, {
+        planName: `OpenAI ${summary.plan}`,
+        remaining: summary.remaining,
+        used: summary.used,
+        total: 100,
+        unit: '%',
+        extra: details.join('；'),
+        accountBrowser: options.accountBrowser,
+      }),
       source,
       loginRequired: false,
     };
@@ -1521,7 +2062,7 @@ export class ProviderQueryEngine {
         remaining: null,
         total: null,
         unit: 'USD',
-        extra: `${message}；请求次数：${local.requestCount}`,
+        extra: apiKeyDetails(message, `请求次数：${local.requestCount}`),
       }),
       source: 'api_health_and_local_usage',
       loginRequired: false,
