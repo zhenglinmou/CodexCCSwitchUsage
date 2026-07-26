@@ -448,7 +448,40 @@ function abortable(operation, signal) {
   });
 }
 
-export async function fetchJson(fetchImpl, url, headers, timeoutMs = 40_000, attempts = 2, externalSignal = null, retryDelayMs = 500) {
+function sharedJsonRequestKey(url, headers = {}) {
+  const normalizedHeaders = Object.entries(headers || {})
+    .filter(([name]) => String(name).toLowerCase() !== 'user-agent')
+    .map(([name, value]) => [String(name).toLowerCase(), String(value)])
+    .sort(([left], [right]) => left.localeCompare(right));
+  return crypto.createHash('sha256')
+    .update(JSON.stringify([String(url), normalizedHeaders]))
+    .digest('base64url');
+}
+
+export async function fetchJson(fetchImpl, url, headers, timeoutMs = 40_000, attempts = 2, externalSignal = null, retryDelayMs = 500, requestCache = null) {
+  const responses = requestCache?.responses instanceof Map
+    ? requestCache.responses
+    : requestCache instanceof Map
+      ? requestCache
+      : null;
+  if (responses) {
+    const key = sharedJsonRequestKey(url, headers);
+    let operation = responses.get(key);
+    if (!operation) {
+      operation = fetchJson(
+        fetchImpl,
+        url,
+        headers,
+        timeoutMs,
+        attempts,
+        requestCache?.signal || externalSignal,
+        retryDelayMs,
+        null,
+      );
+      responses.set(key, operation);
+    }
+    return abortable(operation, externalSignal);
+  }
   let lastError = null;
   let lastResult = null;
   const maximumAttempts = Math.max(1, Math.trunc(Number(attempts) || 1));
@@ -873,6 +906,8 @@ export class ProviderQueryEngine {
   }
 
   async query(provider, options = {}) {
+    const externalSignal = options.signal;
+    if (externalSignal?.aborted) throw externalSignal.reason || new Error('供应商余额查询已取消');
     const accountBinding = options?.accountBinding || null;
     const allowSoleSessionFallback = options?.allowSoleSessionFallback !== false;
     const balanceTemplateId = resolvedBalanceTemplateId(provider, options.balanceTemplateId);
@@ -880,23 +915,55 @@ export class ProviderQueryEngine {
     const cacheKey = bypassCache ? '' : this.#sharedQueryKey(provider, balanceTemplateId, accountBinding, allowSoleSessionFallback);
     const cached = cacheKey ? this.recentQueries.get(cacheKey) : null;
     if (cached && Date.now() - cached.createdAt < 30_000) return this.#copyResult(cached.result, provider);
-    if (cacheKey && this.inFlightQueries.has(cacheKey)) {
-      return this.#copyResult(await this.inFlightQueries.get(cacheKey), provider);
+    if (!cacheKey) {
+      return this.#copyResult(await this.#queryWithDeadline(
+        provider,
+        balanceTemplateId,
+        accountBinding,
+        allowSoleSessionFallback,
+        options.timeoutMs,
+        externalSignal,
+        options.requestCache,
+      ), provider);
     }
-    const operation = this.#queryWithDeadline(
-      provider,
-      balanceTemplateId,
-      accountBinding,
-      allowSoleSessionFallback,
-      options.timeoutMs,
-    );
-    if (cacheKey) this.inFlightQueries.set(cacheKey, operation);
+
+    let entry = this.inFlightQueries.get(cacheKey);
+    if (!entry) {
+      const controller = new AbortController();
+      entry = { controller, consumers: 0, settled: false, promise: null };
+      entry.promise = this.#queryWithDeadline(
+        provider,
+        balanceTemplateId,
+        accountBinding,
+        allowSoleSessionFallback,
+        options.timeoutMs,
+        controller.signal,
+        options.requestCache,
+      ).then(result => {
+        if (result?.usage) this.recentQueries.set(cacheKey, { result, createdAt: Date.now() });
+        return result;
+      }).finally(() => {
+        entry.settled = true;
+        if (this.inFlightQueries.get(cacheKey) === entry) this.inFlightQueries.delete(cacheKey);
+      });
+      entry.promise.catch(() => {});
+      this.inFlightQueries.set(cacheKey, entry);
+    }
+    entry.consumers += 1;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      entry.consumers = Math.max(0, entry.consumers - 1);
+      if (!entry.settled && entry.consumers === 0) {
+        entry.controller.abort(externalSignal?.reason || new Error('供应商余额查询已取消'));
+      }
+    };
     try {
-      const result = await operation;
-      if (cacheKey && result?.usage) this.recentQueries.set(cacheKey, { result, createdAt: Date.now() });
+      const result = await abortable(entry.promise, externalSignal);
       return this.#copyResult(result, provider);
     } finally {
-      if (cacheKey) this.inFlightQueries.delete(cacheKey);
+      release();
       const cutoff = Date.now() - 30_000;
       for (const [key, item] of this.recentQueries) {
         if (item.createdAt < cutoff) this.recentQueries.delete(key);
@@ -904,8 +971,10 @@ export class ProviderQueryEngine {
     }
   }
 
-  async #queryWithDeadline(provider, balanceTemplateId, accountBinding = null, allowSoleSessionFallback = true, requestedTimeoutMs = 0) {
+  async #queryWithDeadline(provider, balanceTemplateId, accountBinding = null, allowSoleSessionFallback = true, requestedTimeoutMs = 0, externalSignal = null, requestCache = null) {
+    if (externalSignal?.aborted) throw externalSignal.reason || new Error('供应商余额查询已取消');
     const controller = new AbortController();
+    const signal = combinedSignal(controller.signal, externalSignal);
     const timeoutMs = Math.max(1, Number(requestedTimeoutMs) || this.providerQueryTimeoutMs);
     const timeoutError = new Error(`供应商余额查询超过 ${Math.ceil(timeoutMs / 1_000)} 秒`);
     let timer = null;
@@ -917,7 +986,10 @@ export class ProviderQueryEngine {
     });
     try {
       return await Promise.race([
-        this.#queryUncached(provider, balanceTemplateId, controller.signal, accountBinding, allowSoleSessionFallback),
+        abortable(
+          this.#queryUncached(provider, balanceTemplateId, signal, accountBinding, allowSoleSessionFallback, requestCache),
+          signal,
+        ),
         timeout,
       ]);
     } finally {
@@ -957,18 +1029,18 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryUncached(provider, balanceTemplateId, signal, accountBinding = null, allowSoleSessionFallback = true) {
+  async #queryUncached(provider, balanceTemplateId, signal, accountBinding = null, allowSoleSessionFallback = true, requestCache = null) {
     if (balanceTemplateId === 'new-api-browser-account') {
       return this.#queryWebProvider(provider, balanceTemplateId, signal, accountBinding, allowSoleSessionFallback);
     }
-    if (balanceTemplateId === 'new-api-key-quota') return this.#queryConfiguredNewApi(provider, signal);
+    if (balanceTemplateId === 'new-api-key-quota') return this.#queryConfiguredNewApi(provider, signal, requestCache);
     if (balanceTemplateId === 'openai-wham') return this.#queryOpenAi(provider, signal);
     if (balanceTemplateId === 'cpa-local') return this.#queryCpa(provider, signal);
-    if (balanceTemplateId === 'deepseek-balance') return this.#queryDeepSeek(provider, signal);
-    if (balanceTemplateId === 'packy-balance') return this.#queryPacky(provider, signal);
-    if (balanceTemplateId === 'window-balance') return this.#queryPaid(provider, signal);
+    if (balanceTemplateId === 'deepseek-balance') return this.#queryDeepSeek(provider, signal, requestCache);
+    if (balanceTemplateId === 'packy-balance') return this.#queryPacky(provider, signal, requestCache);
+    if (balanceTemplateId === 'window-balance') return this.#queryPaid(provider, signal, requestCache);
     if (balanceTemplateId === 'api-health-local' && provider.apiKey && configuredProviderApiBase(provider)) {
-      return this.#queryHealth(provider, signal);
+      return this.#queryHealth(provider, signal, requestCache);
     }
     throw new Error('该供应商没有可用于所选模板的 API Key 或 Base URL');
   }
@@ -1180,7 +1252,7 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryJianzhile(provider, signal) {
+  async #queryJianzhile(provider, signal, requestCache = null) {
     return this.#queryKnownNewApi(provider, signal, {
       label: '简直了',
       apiKeySource: 'jianzhile_api_key',
@@ -1188,10 +1260,10 @@ export class ProviderQueryEngine {
       finiteExtra: '有限 API Key：显示 Key 自身总额度',
       accountExtra: '无限 API Key：显示所属账户总额度',
       verifyAccountOwnership: true,
-    });
+    }, requestCache);
   }
 
-  async #queryFreely(provider, signal) {
+  async #queryFreely(provider, signal, requestCache = null) {
     return this.#queryKnownNewApi(provider, signal, {
       label: 'freely',
       apiKeySource: 'freely_api_key',
@@ -1199,10 +1271,10 @@ export class ProviderQueryEngine {
       finiteExtra: '',
       accountExtra: '',
       verifyAccountOwnership: true,
-    });
+    }, requestCache);
   }
 
-  async #queryMuyuan(provider, signal) {
+  async #queryMuyuan(provider, signal, requestCache = null) {
     return this.#queryKnownNewApi(provider, signal, {
       label: '君的公益',
       apiKeySource: 'muyuan_api_key',
@@ -1215,10 +1287,10 @@ export class ProviderQueryEngine {
       verifyAccountOwnership: true,
       directTimeoutMs: 8_000,
       directAttempts: 1,
-    });
+    }, requestCache);
   }
 
-  async #queryWelfare(provider, signal) {
+  async #queryWelfare(provider, signal, requestCache = null) {
     return this.#queryKnownNewApi(provider, signal, {
       label: '无名公益站',
       apiKeySource: 'welfare_api_key',
@@ -1226,15 +1298,15 @@ export class ProviderQueryEngine {
       finiteExtra: '',
       accountExtra: '',
       verifyAccountOwnership: true,
-    });
+    }, requestCache);
   }
 
-  async #queryConfiguredNewApi(provider, signal) {
+  async #queryConfiguredNewApi(provider, signal, requestCache = null) {
     switch (providerKind(provider)) {
-      case 'jianzhile': return this.#queryJianzhile(provider, signal);
-      case 'freely': return this.#queryFreely(provider, signal);
-      case 'muyuan': return this.#queryMuyuan(provider, signal);
-      case 'welfare': return this.#queryWelfare(provider, signal);
+      case 'jianzhile': return this.#queryJianzhile(provider, signal, requestCache);
+      case 'freely': return this.#queryFreely(provider, signal, requestCache);
+      case 'muyuan': return this.#queryMuyuan(provider, signal, requestCache);
+      case 'welfare': return this.#queryWelfare(provider, signal, requestCache);
       default:
         return this.#queryKnownNewApi(provider, signal, {
           label: provider.name || 'New API 供应商',
@@ -1248,11 +1320,11 @@ export class ProviderQueryEngine {
           directTimeoutMs: 8_000,
           directAttempts: 1,
           loginConfig: loginConfiguration(provider, 'new-api-key-quota'),
-        });
+        }, requestCache);
     }
   }
 
-  async #queryKnownNewApi(provider, signal, site) {
+  async #queryKnownNewApi(provider, signal, site, requestCache = null) {
     const baseUrl = requiredProviderApiBase(provider);
     if (!provider.apiKey || !baseUrl) throw new Error(`${site.label}没有可用的 API Key 或 Base URL`);
     const origin = new URL(baseUrl).origin;
@@ -1266,8 +1338,8 @@ export class ProviderQueryEngine {
     let browserApiUsed = false;
     if (!site.browserApiFallback) {
       [tokenResponse, statusResponse] = await Promise.all([
-        fetchJson(this.fetchImpl, `${origin}/api/usage/token/`, tokenHeaders, 40_000, 2, signal),
-        fetchJson(this.fetchImpl, `${origin}/api/status`, statusHeaders, 40_000, 2, signal),
+        fetchJson(this.fetchImpl, `${origin}/api/usage/token/`, tokenHeaders, 40_000, 2, signal, 500, requestCache),
+        fetchJson(this.fetchImpl, `${origin}/api/status`, statusHeaders, 40_000, 2, signal, 500, requestCache),
       ]);
     } else {
       const safeDirectFetch = async (url, headers) => {
@@ -1279,6 +1351,8 @@ export class ProviderQueryEngine {
             Math.max(1, Number(site.directTimeoutMs) || 8_000),
             Math.max(1, Number(site.directAttempts) || 1),
             signal,
+            500,
+            requestCache,
           ), error: null };
         } catch (error) {
           return { status: 0, payload: null, text: '', error };
@@ -1742,14 +1816,14 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryDeepSeek(provider, signal) {
+  async #queryDeepSeek(provider, signal, requestCache = null) {
     const origin = normalizeProviderTemplateOrigin(provider)
       || (providerKind(provider) === 'deepseek' ? 'https://api.deepseek.com' : '');
     if (!provider.apiKey || !origin) throw new Error('DeepSeek 模板没有可用的 API Key 或安全 Base URL');
     const { status, payload } = await fetchJson(this.fetchImpl, `${origin}/user/balance`, {
       Authorization: `Bearer ${provider.apiKey}`,
       Accept: 'application/json',
-    }, 40_000, 2, signal);
+    }, 40_000, 2, signal, 500, requestCache);
     if (status !== 200) throw new Error(String(payload?.message || `DeepSeek 余额接口返回 HTTP ${status}`));
     const balances = parseDeepSeekBalancePayload(payload);
     const remaining = balances.reduce((sum, item) => sum + item.value, 0);
@@ -1768,14 +1842,14 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryPacky(provider, signal) {
+  async #queryPacky(provider, signal, requestCache = null) {
     const origin = normalizeProviderTemplateOrigin(provider);
     if (!provider.apiKey || !origin) throw new Error('New API 重置周期额度模板没有可用的 API Key 或安全 Base URL');
     const { status, payload } = await fetchJson(this.fetchImpl, `${origin}/api/usage/token/`, {
       Authorization: `Bearer ${provider.apiKey}`,
       Accept: 'application/json',
       'User-Agent': 'cc-switch/1.0',
-    }, 40_000, 2, signal);
+    }, 40_000, 2, signal, 500, requestCache);
     if (status !== 200) throw new Error(String(payload?.message || `New API 重置周期额度接口返回 HTTP ${status}`));
     const balance = parsePackyBalancePayload(payload);
     const quotaMode = balance.unlimited === true
@@ -1798,14 +1872,14 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryPaid(provider, signal) {
+  async #queryPaid(provider, signal, requestCache = null) {
     const baseUrl = requiredProviderApiBase(provider);
     if (!provider.apiKey || !baseUrl) throw new Error('窗口额度模板没有可用的 API Key 或安全 Base URL');
     const { status, payload } = await fetchJson(this.fetchImpl, `${baseUrl}/user/balance`, {
       Authorization: `Bearer ${provider.apiKey}`,
       Accept: 'application/json',
       'User-Agent': 'codex-ccswitch-usage/2',
-    }, 40_000, 2, signal);
+    }, 40_000, 2, signal, 500, requestCache);
     if (status !== 200 || !payload || typeof payload !== 'object') throw new Error(`付费站余额接口返回 HTTP ${status}`);
     const balance = parseWindowBalancePayload(payload);
     const short = value => {
@@ -2133,13 +2207,13 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryHealth(provider, signal) {
+  async #queryHealth(provider, signal, requestCache = null) {
     const baseUrl = requiredProviderApiBase(provider);
     if (!provider.apiKey || !baseUrl) throw new Error('该站没有可用于健康检查的 API Key 或 Base URL');
     const { status, payload } = await fetchJson(this.fetchImpl, `${baseUrl}/models`, {
       Authorization: `Bearer ${provider.apiKey}`,
       Accept: 'application/json',
-    }, 40_000, 2, signal);
+    }, 40_000, 2, signal, 500, requestCache);
     let local = { requestCount: 0, totalCost: 0 };
     try { local = this.repository.getLocalUsage(provider.id); } catch {}
     const valid = status === 200 && payload && Array.isArray(payload.data);

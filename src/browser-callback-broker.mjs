@@ -75,7 +75,10 @@ export class BrowserCallbackBroker {
     const instanceId = cleanInstanceId(payload.instanceId) || existing.instanceId || '';
     if (instanceId && existing.instanceId !== instanceId) {
       this.generation += 1;
-      if (existing.instanceId) this.#cancelWaiters(key);
+      if (existing.instanceId) {
+        this.#requeueClaimedJobs(key, existing.instanceId);
+        this.#cancelWaiters(key);
+      }
     }
     const sessions = Array.isArray(payload.sessions)
       ? new Set(payload.sessions.map(normalizeOrigin).filter(Boolean))
@@ -232,7 +235,9 @@ export class BrowserCallbackBroker {
     const pending = this.pending.get(key);
     if (!pending) return false;
     this.pending.delete(key);
+    this.queue = this.queue.filter(job => job.publicJob.id !== key);
     clearTimeout(pending.timer);
+    this.#schedulePreferenceRelease();
     if (result?.ok === false) {
       pending.reject(new Error(String(result.message || '浏览器伴侣执行失败')));
     } else {
@@ -292,6 +297,9 @@ export class BrowserCallbackBroker {
           reject(error);
         },
         timer: null,
+        job: null,
+        claimedClientKey: '',
+        claimedInstanceId: '',
       };
       const abort = () => {
         if (this.pending.get(id) !== pending) return;
@@ -313,6 +321,7 @@ export class BrowserCallbackBroker {
         preferredClientKey,
         preferredUntil: preferredClientKey ? this.now() + this.preferredClientGraceMs : 0,
       };
+      pending.job = job;
       this.pending.set(id, pending);
       this.queue.push(job);
       signal?.addEventListener('abort', abort, { once: true });
@@ -357,7 +366,29 @@ export class BrowserCallbackBroker {
         : !job.preferredClientKey || job.preferredClientKey === key
     ));
     if (index < 0) return null;
-    return this.queue.splice(index, 1)[0];
+    const job = this.queue.splice(index, 1)[0];
+    const pending = this.pending.get(job.publicJob.id);
+    if (pending) {
+      pending.claimedClientKey = key;
+      pending.claimedInstanceId = this.clients.get(key)?.instanceId || '';
+    }
+    return job;
+  }
+
+  #requeueClaimedJobs(key, instanceId) {
+    const queuedIds = new Set(this.queue.map(job => job.publicJob.id));
+    for (const pending of this.pending.values()) {
+      if (!pending.job
+        || pending.claimedClientKey !== key
+        || pending.claimedInstanceId !== instanceId
+        || queuedIds.has(pending.job.publicJob.id)) continue;
+      pending.claimedClientKey = '';
+      pending.claimedInstanceId = '';
+      pending.job.preferredClientKey = pending.job.targetClientKey || key;
+      pending.job.preferredUntil = this.now() + this.preferredClientGraceMs;
+      this.queue.push(pending.job);
+      queuedIds.add(pending.job.publicJob.id);
+    }
   }
 
   #dispatch() {

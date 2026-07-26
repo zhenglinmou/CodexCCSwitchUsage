@@ -19,6 +19,16 @@ Content-Type: application/json
 
 CCSwitch 本地回退固定查询 `app_type = 'codex'`。如果同一个 API Key 同时配置给 Codex 与 Claude/Claude Desktop，第三方记录会先按请求路径分类（`/v1/responses` / OpenAI 兼容路径属于 Codex，`/v1/messages` / Anthropic 路径属于 Claude），路径缺失时再使用模型族判断，然后才截取最新 10 条。共享 Key 中无法判定归属的远端记录不会混入 Codex 列表。
 
+## 模板自动识别
+
+All API Hub 自动识别逐请求模板时固定使用 `limit = 10`，只验证模板能力，不保存选择。识别结果会更新弹窗中的候选项，用户仍需点击“保存模板”才会写入绑定。
+
+- `/api/log/token` 返回 HTTP 200 并不足以判定成功；响应必须包含 `success: true` 和数组形式的 `data`。
+- 非空 `data` 必须至少包含一条可识别的 New API 消费日志；只有无关对象的数组会按 schema 错误拒绝。
+- 空 `data` 只有在 `/api/status` 同时返回可验证的 New API 计费结构时才算模板可用，避免把任意空数组误判为逐请求接口。
+- 日志结构有效但 `/api/status` 计费配置不完整时，Token 记录仍可使用，但费用会标记为非精确和降级，不会伪装成供应商真实扣费。
+- `record not found`、鉴权失败、WAF、网络错误或无效响应都会使远端模板识别失败；Hub 随后测试 `CCSwitch 本地请求记录` 回退模板。
+
 ## 返回数据
 
 成功查询时，`items` 是供应商最近的逐请求记录（按供应商时间倒序）：
@@ -88,7 +98,7 @@ CCSwitch 本地回退固定查询 `app_type = 'codex'`。如果同一个 API Key
 
 ## 当前适配范围
 
-已确认提供 New API 兼容 `/api/log/token` 的站点：
+以下站点具有内置 New API `/api/log/token` 尝试与回退配置。该清单表示 Hub 知道其安全 Origin 和查询方式，不表示远端接口在所有账号、地区或时刻都一定可用：
 
 - AnyRouter（直连遇到 WAF 时通过已连接的浏览器伴侣请求同一个 API Key 接口）
 - AgentRouter
@@ -102,7 +112,7 @@ CCSwitch 本地回退固定查询 `app_type = 'codex'`。如果同一个 API Key
 
 其他 CCSwitch 中转站可在 All API Hub 的“模板”弹窗中测试并选择 `New API 逐请求日志`。手动模板始终请求该供应商自己配置的 HTTPS Origin，不会因显示名称把 API Key 转发到上述固定站点；测试成功后仍需显式保存。
 
-其中 PackyCode 当前远端接口返回 `record not found` 时会自动回退 CCSwitch，并明确标记为非精确。CHY 当前若受地区限制，同样回退 CCSwitch。
+当前实测中，PackyCode 远端接口返回 `record not found`，会自动回退 CCSwitch 并明确标记为非精确；CHY 受地区限制或返回 403 时同样回退。君的公益直连受 WAF 或网站权限限制时可尝试浏览器伴侣，仍不可用才回退 CCSwitch。
 
 `rawchat.cn` / `sharedchat.top` 的精确消费记录位于官网登录会话接口 `/frontend-api/vibe-code/records`，API Key 不能直接调用。当前遵循“不读取网页登录态”的约束，因此这两项直接走 CCSwitch 回退。
 

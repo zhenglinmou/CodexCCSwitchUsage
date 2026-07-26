@@ -507,6 +507,7 @@ export class ProviderRequestUsageEngine {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error('第三方逐请求用量查询超时')), this.timeoutMs);
     const externalSignal = options.signal;
+    const requestCache = options.requestCache || null;
     const signal = externalSignal
       ? AbortSignal.any([controller.signal, externalSignal])
       : controller.signal;
@@ -516,8 +517,9 @@ export class ProviderRequestUsageEngine {
         config.logPath,
         { Authorization: `Bearer ${provider.apiKey}`, Accept: 'application/json' },
         signal,
+        requestCache,
       );
-      const statusPromise = this.#getStatus(config, signal, options.bypassCache === true);
+      const statusPromise = this.#getStatus(config, signal, options.bypassCache === true, requestCache);
       const [logsResult, statusResult] = await Promise.allSettled([logsPromise, statusPromise]);
 
       if (logsResult.status === 'rejected') {
@@ -601,7 +603,7 @@ export class ProviderRequestUsageEngine {
     }
   }
 
-  async #fetchProviderJson(config, requestPath, headers, signal) {
+  async #fetchProviderJson(config, requestPath, headers, signal, requestCache = null) {
     let direct = null;
     let directError = null;
     try {
@@ -612,6 +614,8 @@ export class ProviderRequestUsageEngine {
         this.timeoutMs,
         this.attempts,
         signal,
+        500,
+        requestCache,
       );
     } catch (error) {
       directError = error;
@@ -644,10 +648,10 @@ export class ProviderRequestUsageEngine {
     };
   }
 
-  async #getStatus(config, signal, bypassCache = false) {
+  async #getStatus(config, signal, bypassCache = false, requestCache = null) {
     const cached = this.statusCache.get(config.origin);
     if (!bypassCache && cached && cached.expiresAt > this.now()) return { status: 200, payload: cached.payload, cached: true };
-    const result = await this.#fetchProviderJson(config, config.statusPath, { Accept: 'application/json' }, signal);
+    const result = await this.#fetchProviderJson(config, config.statusPath, { Accept: 'application/json' }, signal, requestCache);
     if (result.status === 200 && result.payload?.success === true) {
       this.statusCache.set(config.origin, { payload: result.payload, expiresAt: this.now() + this.statusCacheTtlMs });
     }

@@ -7,7 +7,7 @@ import { ProviderRequestUsageEngine } from './provider-request-usage.mjs';
 import { ProviderTemplateStore } from './provider-templates.mjs';
 import { HubServer } from './hub-server.mjs';
 import { ProviderQueryEngine } from './hub-provider-adapters.mjs';
-import { hubItemToUsagePayload, HubService, providerConfigurationFingerprint, safeHubMessage } from './hub-service.mjs';
+import { hubItemToUsagePayload, HubService, safeHubMessage } from './hub-service.mjs';
 import { buildInjectorScript, INJECTOR_VERSION, UPDATE_GLOBAL } from './injector-script.mjs';
 import { KeyedBackoff } from './keyed-backoff.mjs';
 import { decodePageActionQueue } from './page-action-channel.mjs';
@@ -92,7 +92,7 @@ if (cachedUsage) {
       currentProvider
       && cachedUsage.providerId === currentProvider.id
       && cachedProviderSignature
-      && cachedProviderSignature === providerConfigurationFingerprint(currentProvider)
+      && cachedProviderSignature === providerRefreshSignature(currentProvider)
     );
     if (!cacheMatchesCurrent) {
       cachedUsage = null;
@@ -199,7 +199,7 @@ function safeMessage(error) {
 }
 
 function providerRefreshSignature(provider) {
-  return providerConfigurationFingerprint(provider);
+  return hubService.getProviderConfigurationFingerprint(provider);
 }
 
 function payloadWithRecentRequests(payload) {

@@ -16,9 +16,12 @@ import {
   getBalanceTemplate,
   getRequestUsageTemplate,
   listProviderTemplates,
+  PROVIDER_TEMPLATE_REGISTRY_VERSION,
 } from './provider-templates.mjs';
 
 const MAX_SAFE_MESSAGE_CHARS = 8_192;
+const DEFAULT_TEMPLATE_PROBE_TIMEOUT_MS = 12_000;
+const DEFAULT_TEMPLATE_PROBE_SPECULATION_DELAY_MS = 100;
 const LABELED_CREDENTIAL_PATTERN = /(["']?)(openai[_-]api[_-]key|api[_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|cookie|authorization|secret)\1(\s*[=:]\s*)(?:Bearer\s+)?(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\]]+)/gi;
 
 function isJwtRunCharacter(character) {
@@ -186,6 +189,7 @@ function ccswitchRequestUsageFallback(provider, rows, remoteResult, limit, now) 
 export function providerConfigurationFingerprint(provider, templateSelection = null) {
   if (!provider) return '';
   const fields = [
+    PROVIDER_TEMPLATE_REGISTRY_VERSION,
     provider.id,
     provider.name,
     provider.websiteUrl,
@@ -195,10 +199,7 @@ export function providerConfigurationFingerprint(provider, templateSelection = n
     provider.auth,
     provider.usage,
   ];
-  if (templateSelection && (
-    templateSelection.balanceSource === 'manual'
-    || templateSelection.requestUsageSource === 'manual'
-  )) {
+  if (templateSelection) {
     fields.push(
       String(templateSelection.balanceTemplateId || ''),
       String(templateSelection.balanceSource || ''),
@@ -208,6 +209,25 @@ export function providerConfigurationFingerprint(provider, templateSelection = n
   }
   const material = JSON.stringify(fields);
   return crypto.createHash('sha256').update(material).digest('base64url');
+}
+
+function abortableOperation(operation, signal) {
+  if (!signal) return operation;
+  if (signal.aborted) return Promise.reject(signal.reason || new Error('操作已取消'));
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason || new Error('操作已取消'));
+    signal.addEventListener('abort', abort, { once: true });
+    Promise.resolve(operation).then(
+      value => {
+        signal.removeEventListener('abort', abort);
+        resolve(value);
+      },
+      error => {
+        signal.removeEventListener('abort', abort);
+        reject(error);
+      },
+    );
+  });
 }
 
 function selectedTemplateOption(selection, type) {
@@ -366,6 +386,11 @@ export class HubService {
     this.cachePath = options.cachePath || '';
     this.concurrency = Math.max(1, Math.min(6, Number(options.concurrency) || 3));
     this.browserConcurrency = Math.max(1, Math.min(this.concurrency, Number(options.browserConcurrency) || 1));
+    this.templateProbeTimeoutMs = Math.max(1_000, Number(options.templateProbeTimeoutMs) || DEFAULT_TEMPLATE_PROBE_TIMEOUT_MS);
+    const configuredProbeDelay = Number(options.templateProbeSpeculationDelayMs);
+    this.templateProbeSpeculationDelayMs = Number.isFinite(configuredProbeDelay)
+      ? Math.max(0, configuredProbeDelay)
+      : DEFAULT_TEMPLATE_PROBE_SPECULATION_DELAY_MS;
     this.now = options.now || Date.now;
     this.items = new Map();
     this.providers = new Map();
@@ -395,6 +420,10 @@ export class HubService {
       const livePrevious = this.items.get(provider.id);
       const savedPrevious = livePrevious || this.cachedItems[provider.id] || {};
       const providerFingerprint = providerConfigurationFingerprint(provider, templateSelection);
+      const activeRefresh = this.refreshes.get(provider.id);
+      if (activeRefresh && activeRefresh.fingerprint !== providerFingerprint) {
+        activeRefresh.controller?.abort(new Error('供应商配置或模板已变更'));
+      }
       const hasSavedState = Boolean(savedPrevious.id || savedPrevious.usage || savedPrevious.status);
       const configurationChanged = hasSavedState
         && String(savedPrevious.providerFingerprint || '') !== providerFingerprint;
@@ -460,6 +489,7 @@ export class HubService {
     }
     for (const id of this.items.keys()) {
       if (!activeIds.has(id)) {
+        this.refreshes.get(id)?.controller?.abort(new Error('供应商已移除'));
         this.items.delete(id);
         this.providers.delete(id);
       }
@@ -487,6 +517,14 @@ export class HubService {
     if (!key) return null;
     if (this.providers.has(key)) return this.providers.get(key);
     return [...this.providers.values()].find(provider => providerAliases(provider).includes(key)) || null;
+  }
+
+  getProviderConfigurationFingerprint(providerOrSelector) {
+    const provider = providerOrSelector && typeof providerOrSelector === 'object'
+      ? providerOrSelector
+      : this.findProvider(providerOrSelector);
+    if (!provider) return '';
+    return providerConfigurationFingerprint(provider, templateSelectionFor(provider, this.templateStore));
   }
 
   listPublicProviders() {
@@ -584,60 +622,34 @@ export class HubService {
             ...preferredBalance,
             ...balanceOrder.filter(id => getBalanceTemplate(id)?.autoDetect),
           ])];
-    const balanceResults = [];
-    let balanceTemplateId = '';
-    for (const templateId of balanceCandidates) {
-      const useBuiltin = selection.balanceSource === 'builtin'
-        && selection.balanceTemplateId === templateId;
-      const result = await this.#probeBalanceTemplate(provider, templateId, { useBuiltin });
-      balanceResults.push(result);
-      if (result.status === 'success') {
-        balanceTemplateId = templateId;
-        break;
-      }
-    }
-    let fallbackBalanceTemplateId = '';
-    if (!requestedBalance && !balanceTemplateId) {
-      const fallback = await this.#probeBalanceTemplate(provider, 'api-health-local');
-      balanceResults.push(fallback);
-      if (fallback.status === 'success') fallbackBalanceTemplateId = 'api-health-local';
-    }
-
     const requestCandidates = requestedRequestUsage
       ? [requestedRequestUsage]
       : ['new-api-token-log'];
-    const requestUsageResults = [];
-    let requestUsageTemplateId = '';
-    for (const templateId of requestCandidates) {
-      const useBuiltin = selection.requestUsageSource === 'builtin'
-        && selection.requestUsageTemplateId === templateId;
-      const result = await this.#probeRequestUsageTemplate(provider, templateId, { useBuiltin });
-      requestUsageResults.push(result);
-      if (result.status === 'success') {
-        requestUsageTemplateId = templateId;
-        break;
-      }
+    const controller = new AbortController();
+    const timeoutError = new Error(`模板自动识别超过 ${Math.ceil(this.templateProbeTimeoutMs / 1_000)} 秒`);
+    const timer = setTimeout(() => controller.abort(timeoutError), this.templateProbeTimeoutMs);
+    const requestCache = { responses: new Map(), signal: controller.signal };
+    try {
+      const [balance, requestUsage] = await Promise.all([
+        this.#probeBalanceCandidates(provider, selection, balanceCandidates, requestedBalance, {
+          signal: controller.signal,
+          requestCache,
+        }),
+        this.#probeRequestUsageCandidates(provider, selection, requestCandidates, requestedRequestUsage, {
+          signal: controller.signal,
+          requestCache,
+        }),
+      ]);
+      return {
+        success: Boolean(balance.recommendedTemplateId || balance.fallbackTemplateId || requestUsage.recommendedTemplateId),
+        providerId: provider.id,
+        testedAt: new Date(this.now()).toISOString(),
+        balance,
+        requestUsage,
+      };
+    } finally {
+      clearTimeout(timer);
     }
-    if (!requestedRequestUsage && !requestUsageTemplateId) {
-      const fallback = await this.#probeRequestUsageTemplate(provider, 'ccswitch-local');
-      requestUsageResults.push(fallback);
-      if (fallback.status === 'success') requestUsageTemplateId = 'ccswitch-local';
-    }
-
-    return {
-      success: Boolean(balanceTemplateId || fallbackBalanceTemplateId || requestUsageTemplateId),
-      providerId: provider.id,
-      testedAt: new Date(this.now()).toISOString(),
-      balance: {
-        recommendedTemplateId: balanceTemplateId,
-        fallbackTemplateId: fallbackBalanceTemplateId,
-        results: balanceResults,
-      },
-      requestUsage: {
-        recommendedTemplateId: requestUsageTemplateId,
-        results: requestUsageResults,
-      },
-    };
   }
 
   listBrowserOrigins() {
@@ -669,8 +681,11 @@ export class HubService {
     if (!resolved) return Promise.reject(new Error('CCSwitch 中不存在这个 Codex 供应商'));
     const id = resolved.id;
     const activeRefresh = this.refreshes.get(id);
+    const currentFingerprint = String(this.items.get(id)?.providerFingerprint || '');
     if (activeRefresh) {
-      if (activeRefresh.provider === resolved) return activeRefresh.promise;
+      if (activeRefresh.provider === resolved && activeRefresh.fingerprint === currentFingerprint) {
+        return activeRefresh.promise;
+      }
       return activeRefresh.promise.catch(() => null).then(() => this.refreshProvider(id));
     }
     const provider = resolved;
@@ -679,7 +694,8 @@ export class HubService {
     const queryStartedAt = this.now();
     this.items.set(id, { ...previous, status: previous.usage ? previous.status : 'loading', message: '' });
     this.revision += 1;
-    const refresh = { provider, promise: null };
+    const controller = new AbortController();
+    const refresh = { provider, fingerprint: refreshFingerprint, controller, promise: null };
     const isCurrentSnapshot = () => this.providers.get(id) === provider
       && this.items.has(id)
       && String(this.items.get(id)?.providerFingerprint || '') === refreshFingerprint;
@@ -691,6 +707,7 @@ export class HubService {
               .map(candidate => String(candidate.apiKey || candidate.id || '')))
           : null;
         const result = await this.queryEngine.query(provider, {
+          signal: controller.signal,
           accountBinding: previous.accountBinding || null,
           allowSoleSessionFallback: !anyRouterCredentials || anyRouterCredentials.size <= 1,
           ...(selectedTemplateOption(previous.templateSelection, 'balance')
@@ -1064,13 +1081,88 @@ export class HubService {
   }
 
   #resyncTemplateProvider(provider) {
-    this.refreshes.delete(provider.id);
     this.providerSnapshot = null;
     this.publicProvidersCache = null;
     this.requestUsageEngine?.clearStatusCache?.();
     this.syncProviders();
     this.#writeCache();
     return this.#publicItem(this.items.get(provider.id));
+  }
+
+  async #probeBalanceCandidates(provider, selection, candidates, requestedTemplateId, options = {}) {
+    const results = [];
+    let recommendedTemplateId = '';
+    let fallbackTemplateId = '';
+    if (candidates.length) {
+      const candidateController = new AbortController();
+      const signal = options.signal
+        ? AbortSignal.any([options.signal, candidateController.signal])
+        : candidateController.signal;
+      const run = templateId => this.#probeBalanceTemplate(provider, templateId, {
+        useBuiltin: selection.balanceSource === 'builtin' && selection.balanceTemplateId === templateId,
+        signal,
+        requestCache: options.requestCache,
+      });
+      const first = run(candidates[0]);
+      let remaining = null;
+      const startRemaining = () => {
+        if (!remaining) remaining = candidates.slice(1).map(run);
+        return remaining;
+      };
+      let speculationTimer = null;
+      if (candidates.length > 1 && this.templateProbeSpeculationDelayMs > 0) {
+        speculationTimer = setTimeout(startRemaining, this.templateProbeSpeculationDelayMs);
+      } else if (candidates.length > 1) {
+        startRemaining();
+      }
+      const firstResult = await first;
+      if (speculationTimer) clearTimeout(speculationTimer);
+      results.push(firstResult);
+      if (firstResult.status === 'success') {
+        recommendedTemplateId = candidates[0];
+      } else if (!options.signal?.aborted) {
+        const pending = startRemaining();
+        for (let index = 0; index < pending.length; index += 1) {
+          const result = await pending[index];
+          results.push(result);
+          if (result.status === 'success') {
+            recommendedTemplateId = candidates[index + 1];
+            break;
+          }
+        }
+      }
+      if (recommendedTemplateId) candidateController.abort(new Error('已识别到更高优先级的余额模板'));
+      if (remaining) await Promise.allSettled(remaining);
+    }
+    if (!requestedTemplateId && !recommendedTemplateId && !options.signal?.aborted) {
+      const fallback = await this.#probeBalanceTemplate(provider, 'api-health-local', options);
+      results.push(fallback);
+      if (fallback.status === 'success') fallbackTemplateId = 'api-health-local';
+    }
+    return { recommendedTemplateId, fallbackTemplateId, results };
+  }
+
+  async #probeRequestUsageCandidates(provider, selection, candidates, requestedTemplateId, options = {}) {
+    const results = [];
+    let recommendedTemplateId = '';
+    for (const templateId of candidates) {
+      const result = await this.#probeRequestUsageTemplate(provider, templateId, {
+        ...options,
+        useBuiltin: selection.requestUsageSource === 'builtin'
+          && selection.requestUsageTemplateId === templateId,
+      });
+      results.push(result);
+      if (result.status === 'success') {
+        recommendedTemplateId = templateId;
+        break;
+      }
+    }
+    if (!requestedTemplateId && !recommendedTemplateId && !options.signal?.aborted) {
+      const fallback = await this.#probeRequestUsageTemplate(provider, 'ccswitch-local', options);
+      results.push(fallback);
+      if (fallback.status === 'success') recommendedTemplateId = 'ccswitch-local';
+    }
+    return { recommendedTemplateId, results };
   }
 
   async #probeBalanceTemplate(provider, templateId, options = {}) {
@@ -1084,12 +1176,14 @@ export class HubService {
     };
     if (!template) return { ...base, message: '余额模板不存在' };
     try {
-      const result = await this.queryEngine.query(provider, {
+      const result = await abortableOperation(this.queryEngine.query(provider, {
         ...(options.useBuiltin === true ? {} : { balanceTemplateId: templateId }),
         bypassCache: true,
         timeoutMs: 8_000,
+        signal: options.signal,
+        requestCache: options.requestCache,
         accountBinding: this.items.get(provider.id)?.accountBinding || null,
-      });
+      }), options.signal);
       const source = String(result?.source || '');
       const localFallback = result?.degraded === true
         || source === 'muyuan_local_usage'
@@ -1141,14 +1235,18 @@ export class HubService {
     if (!this.requestUsageEngine?.query) return { ...base, message: '第三方逐请求查询引擎未启用' };
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error('逐请求模板测试超过 8 秒')), 8_000);
+    const signal = options.signal
+      ? AbortSignal.any([options.signal, controller.signal])
+      : controller.signal;
     try {
-      const result = await this.requestUsageEngine.query(provider, {
+      const result = await abortableOperation(this.requestUsageEngine.query(provider, {
         ...(options.useBuiltin === true ? {} : { requestUsageTemplateId: templateId }),
         bypassCache: true,
         limit: 10,
         appType: 'codex',
-        signal: controller.signal,
-      });
+        signal,
+        requestCache: options.requestCache,
+      }), signal);
       if (result?.success === true) {
         return {
           ...base,

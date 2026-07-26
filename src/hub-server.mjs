@@ -218,6 +218,13 @@ export class HubServer {
       });
       return;
     }
+    if (request.method === 'GET' && url.pathname === `${this.apiPath}/companion/status`) {
+      jsonResponse(response, 200, {
+        success: true,
+        companion: this.browserBroker?.getStatus?.() || { connected: false, clients: [], queuedJobs: 0, pendingJobs: 0 },
+      });
+      return;
+    }
     if (request.method === 'GET' && url.pathname === `${this.apiPath}/templates`) {
       const providerSelector = String(url.searchParams.get('providerId') || '').trim();
       try {
