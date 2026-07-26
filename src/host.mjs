@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { BrowserCallbackBroker } from './browser-callback-broker.mjs';
-import { isCodexTargetCandidate, listCdpTargets } from './cdp-client.mjs';
+import { closeCdpHttpClient, isCodexTargetCandidate, listCdpTargets } from './cdp-client.mjs';
 import { ProviderRepository } from './provider-repository.mjs';
 import { ProviderRequestUsageEngine } from './provider-request-usage.mjs';
 import { ProviderTemplateStore } from './provider-templates.mjs';
@@ -23,7 +23,7 @@ const INJECTOR_AUDIT_MS = 300_000;
 const STATUS_HEARTBEAT_MS = 300_000;
 const HUB_RETRY_MS = 5_000;
 const RECENT_REQUEST_LIMIT = 10;
-const CODEX_PROCESS_POLL_MS = 250;
+const CODEX_PROCESS_POLL_MS = 1_000;
 
 function readLocalVersion(relativePath) {
   try {
@@ -195,6 +195,7 @@ function writeStatus(extra = {}) {
     databaseAuditMs: DATABASE_AUDIT_MS,
     targetAuditMs: INJECTOR_AUDIT_MS,
     pageActionPollMs: PAGE_ACTION_POLL_MS,
+    codexProcessPollMs: CODEX_PROCESS_POLL_MS,
     targetInstallFailures: targetInstallBackoff.failures,
     targetInstallRetryMs: targetInstallBackoff.remainingMs(),
     connectedPages: mountedPages,
@@ -879,6 +880,7 @@ function shutdown(reason = null) {
   databaseWatcher = null;
   controlWatcher?.close();
   controlWatcher = null;
+  closeCdpHttpClient();
   mountedPages = 0;
   mountedTargetIds = new Set();
   const auxiliaryShutdown = Promise.allSettled([hubServer.close()]);

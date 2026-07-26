@@ -34,7 +34,7 @@ test('process exit monitor notifies once and releases its timer', () => {
 
   assert.equal(monitor.start(), true);
   assert.equal(scheduled.length, 1);
-  assert.equal(scheduled[0].intervalMs, 250);
+  assert.equal(scheduled[0].intervalMs, 1_000);
   assert.equal(exits, 0);
 
   alive = false;

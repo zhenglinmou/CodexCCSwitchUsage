@@ -12,7 +12,7 @@ export class ProcessExitMonitor {
   constructor({
     processId,
     onExit,
-    intervalMs = 250,
+    intervalMs = 1_000,
     isAlive = isProcessAlive,
     setIntervalFn = setInterval,
     clearIntervalFn = clearInterval,

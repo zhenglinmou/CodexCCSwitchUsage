@@ -2,6 +2,29 @@ import http from 'node:http';
 
 export const CODEX_MAIN_DOCUMENT_URL = 'app://-/index.html';
 
+let cdpHttpAgent = null;
+let cdpHttpClientClosed = false;
+
+function getCdpHttpAgent() {
+  if (cdpHttpClientClosed) throw new Error('Codex 调试 HTTP 客户端已关闭');
+  if (!cdpHttpAgent) {
+    cdpHttpAgent = new http.Agent({
+      keepAlive: true,
+      keepAliveMsecs: 1_000,
+      maxSockets: 1,
+      maxFreeSockets: 1,
+      maxTotalSockets: 1,
+    });
+  }
+  return cdpHttpAgent;
+}
+
+export function closeCdpHttpClient() {
+  cdpHttpClientClosed = true;
+  cdpHttpAgent?.destroy();
+  cdpHttpAgent = null;
+}
+
 export class CdpClient {
   constructor(socket) {
     this.socket = socket;
@@ -141,8 +164,7 @@ function readJson(port, pathname, hostname) {
       hostname,
       port,
       path: pathname,
-      agent: false,
-      headers: { connection: 'close' },
+      agent: getCdpHttpAgent(),
     }, response => {
       const chunks = [];
       let size = 0;
