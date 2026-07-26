@@ -25,6 +25,19 @@ const HUB_RETRY_MS = 5_000;
 const RECENT_REQUEST_LIMIT = 10;
 const CODEX_PROCESS_POLL_MS = 250;
 
+function readLocalVersion(relativePath) {
+  try {
+    const value = JSON.parse(fs.readFileSync(new URL(relativePath, import.meta.url), 'utf8'));
+    return String(value?.version || '').slice(0, 32);
+  } catch {
+    return '';
+  }
+}
+
+const APP_VERSION = readLocalVersion('../package.json');
+const EXPECTED_COMPANION_VERSION = readLocalVersion('../browser-companion/manifest.json');
+const HOST_STARTED_AT = new Date().toISOString();
+
 function parseArgs(argv) {
   const result = { port: 9334, database: path.join(process.env.USERPROFILE, '.cc-switch', 'cc-switch.db'), runtimeDir: path.join(process.cwd(), 'runtime'), codexPid: 0 };
   for (let index = 0; index < argv.length; index += 1) {
@@ -57,6 +70,22 @@ const hubService = new HubService(repository, hubQueryEngine, {
 const hubServer = new HubServer(hubService, {
   tokenPath: path.join(args.runtimeDir, 'hub-token'),
   browserBroker,
+  preferencesPath: path.join(args.runtimeDir, 'hub-preferences.json'),
+  diagnostics: () => ({
+    appVersion: APP_VERSION,
+    injectorVersion: INJECTOR_VERSION,
+    expectedCompanionVersion: EXPECTED_COMPANION_VERSION,
+    codexProcessId: args.codexPid,
+    hostProcessId: process.pid,
+    cdpPort: args.port,
+    connectedPages: mountedPages,
+    connectionError: lastConnectionError,
+    databaseWatch: Boolean(databaseWatcher),
+    controlWatch: Boolean(controlWatcher),
+    hubRunning: Boolean(hubServer.boundPort),
+    hubPort: hubServer.boundPort || 0,
+    startedAt: HOST_STARTED_AT,
+  }),
 });
 const injectorScript = buildInjectorScript();
 const targetInstallBackoff = new KeyedBackoff();

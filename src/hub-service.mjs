@@ -1073,7 +1073,7 @@ export class HubService {
       sessionSyncRequired: Boolean(item.sessionSyncSupported && !action?.opened),
       websiteLoginRequired: action?.opened === true,
       message: safeMessage(action?.message || (action?.opened
-        ? `已在${action?.browser ? ` ${action.browser} 浏览器` : '现有浏览器'}中打开登录页；登录完成后回到 Hub 手动点击刷新`
+        ? `已在${action?.browser ? ` ${action.browser} 浏览器` : '现有浏览器'}中打开登录页；登录完成后回到 Hub 将自动检查一次`
         : '未能同步现有浏览器会话，请先在官网确认登录状态')),
     });
     this.revision += 1;

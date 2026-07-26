@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { buildHubPage } from './hub-page.mjs';
+import { HubPreferences } from './hub-preferences.mjs';
 
 function isLoopbackRequest(request) {
   const value = request?.socket?.remoteAddress || '';
@@ -78,6 +79,8 @@ export class HubServer {
   constructor(service, options = {}) {
     this.service = service;
     this.browserBroker = options.browserBroker || null;
+    this.preferences = options.preferences || new HubPreferences(options.preferencesPath);
+    this.diagnostics = typeof options.diagnostics === 'function' ? options.diagnostics : () => ({});
     this.port = Number.isFinite(Number(options.port)) ? Number(options.port) : 17891;
     this.token = options.token || getOrCreateHubToken(options.tokenPath);
     this.openUrl = options.openUrl || (url => {
@@ -99,6 +102,55 @@ export class HubServer {
 
   get url() {
     return this.boundPort ? `http://127.0.0.1:${this.boundPort}${this.pagePath}` : '';
+  }
+
+  #companionStatus() {
+    return this.browserBroker?.getStatus?.() || { connected: false, clients: [], queuedJobs: 0, pendingJobs: 0 };
+  }
+
+  #diagnosticState() {
+    const value = this.diagnostics() || {};
+    const integer = input => Number.isInteger(Number(input)) && Number(input) >= 0 ? Number(input) : 0;
+    const text = (input, maximum = 240) => String(input || '').replace(/\s+/g, ' ').trim().slice(0, maximum);
+    return {
+      appVersion: text(value.appVersion, 32),
+      injectorVersion: integer(value.injectorVersion),
+      expectedCompanionVersion: text(value.expectedCompanionVersion, 32),
+      codexProcessId: integer(value.codexProcessId),
+      hostProcessId: integer(value.hostProcessId),
+      cdpPort: integer(value.cdpPort),
+      connectedPages: integer(value.connectedPages),
+      connectionError: text(value.connectionError, 500),
+      databaseWatch: value.databaseWatch === true,
+      controlWatch: value.controlWatch === true,
+      hubRunning: value.hubRunning === true,
+      hubPort: integer(value.hubPort),
+      startedAt: text(value.startedAt, 40),
+    };
+  }
+
+  #browserOrigins() {
+    const origins = [];
+    for (const value of this.service.listBrowserOrigins?.() || []) {
+      try {
+        const url = new URL(String(value || ''));
+        if (url.protocol === 'https:' && !url.username && !url.password && !origins.includes(url.origin)) {
+          origins.push(url.origin);
+        }
+      } catch {}
+      if (origins.length >= 64) break;
+    }
+    return origins;
+  }
+
+  #statePayload() {
+    return {
+      ...this.service.getState(),
+      companion: this.#companionStatus(),
+      preferences: this.preferences.get(),
+      diagnostics: this.#diagnosticState(),
+      browserOrigins: this.#browserOrigins(),
+    };
   }
 
   async start() {
@@ -212,17 +264,24 @@ export class HubServer {
       return;
     }
     if (request.method === 'GET' && url.pathname === `${this.apiPath}/state`) {
-      jsonResponse(response, 200, {
-        ...this.service.getState(),
-        companion: this.browserBroker?.getStatus?.() || { connected: false, clients: [], queuedJobs: 0, pendingJobs: 0 },
-      });
+      jsonResponse(response, 200, this.#statePayload());
       return;
     }
     if (request.method === 'GET' && url.pathname === `${this.apiPath}/companion/status`) {
       jsonResponse(response, 200, {
         success: true,
-        companion: this.browserBroker?.getStatus?.() || { connected: false, clients: [], queuedJobs: 0, pendingJobs: 0 },
+        companion: this.#companionStatus(),
+        diagnostics: this.#diagnosticState(),
       });
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === `${this.apiPath}/preferences`) {
+      jsonResponse(response, 200, { success: true, preferences: this.preferences.get() });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === `${this.apiPath}/preferences`) {
+      const body = await readBody(request);
+      jsonResponse(response, 200, { success: true, preferences: this.preferences.update(body) });
       return;
     }
     if (request.method === 'GET' && url.pathname === `${this.apiPath}/templates`) {
