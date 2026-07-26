@@ -27,7 +27,7 @@ build\
 dist\
 ```
 
-The regression suite under `tests\` is intentionally kept only in this development workspace and excluded from Git. Preserve that local directory: `npm test` depends on it, while runtime installation and EXE packaging do not.
+The regression suite under `tests\` is version controlled and runs through both `npm test` and the Windows GitHub Actions workflow. Runtime installation and EXE packaging continue to use explicit payload lists, so tests are not shipped with the application.
 
 Runtime state is intentionally separate:
 

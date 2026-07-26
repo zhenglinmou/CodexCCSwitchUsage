@@ -6,11 +6,12 @@
 
 | 版本 | 分支 | 适用场景 | 用量来源 | All API Hub | 浏览器伴侣 |
 |---|---|---|---|---|---|
-| [v2.0.10](./docs/V2.md) | `v2` | 统一查看和管理全部 Codex / GPT 供应商 | v2 内置适配器与统一 Balance Hub | 支持 | 支持 |
+| [v2.0.11](./docs/V2.md) | `v2` | 统一查看和管理全部 Codex / GPT 供应商 | v2 内置适配器与统一 Balance Hub | 支持 | 支持 |
 | [v1.0.0](./docs/V1.md) | `v1` | 只显示 CCSwitch 当前供应商余额的轻量版本 | 当前供应商已有的 `usage_script` | 不支持 | 不支持 |
 
 - 使用 v2：阅读 [v2 用户文档](./docs/V2.md)；开发与热更新流程见 [v2 开发文档](./DEVELOPMENT.md)。
 - 使用 v1：阅读 [v1 用户文档](./docs/V1.md)；自定义脚本格式见 [v1 `usage_script` 格式说明](./USAGE_SCRIPT_FORMAT.md)。
+- 隐私、安全边界与漏洞报告方式见 [隐私与安全政策](./SECURITY.md)。
 
 ## 分支策略
 

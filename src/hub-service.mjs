@@ -788,10 +788,14 @@ export class HubService {
     return promise;
   }
 
-  refreshAll() {
+  refreshAll(providerSelectors = null) {
     if (this.refreshAllPromise) return this.refreshAllPromise;
     this.syncProviders();
-    const ids = [...this.providers.keys()];
+    const ids = Array.isArray(providerSelectors)
+      ? [...new Set(providerSelectors
+          .map(selector => this.findProvider(selector)?.id || '')
+          .filter(Boolean))]
+      : [...this.providers.keys()];
     this.refreshAllPromise = (async () => {
       const refreshStartedAt = this.now();
       this.cacheBatchDepth += 1;

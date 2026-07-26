@@ -403,6 +403,17 @@ export class HubServer {
           return;
         }
         operation = this.service.refreshProvider(provider.id);
+      } else if (Object.prototype.hasOwnProperty.call(body, 'providerIds')) {
+        if (!Array.isArray(body.providerIds)) {
+          jsonResponse(response, 400, { success: false, message: '供应商列表无效' });
+          return;
+        }
+        const providerIds = [];
+        for (const selector of body.providerIds.slice(0, 256)) {
+          const provider = this.service.findProvider(String(selector || '').trim());
+          if (provider && !providerIds.includes(provider.id)) providerIds.push(provider.id);
+        }
+        operation = this.service.refreshAll(providerIds);
       } else {
         operation = this.service.refreshAll();
       }

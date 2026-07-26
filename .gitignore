@@ -4,8 +4,8 @@ build/
 dist/
 backups/
 node_modules/
-/tests/
 /output/
+/.playwright-cli/
 .firecrawl/
 *.orig
 *.log

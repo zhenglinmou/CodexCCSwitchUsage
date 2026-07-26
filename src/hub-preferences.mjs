@@ -4,6 +4,7 @@ import path from 'node:path';
 const SORT_OPTIONS = new Set(['smart', 'name', 'remaining', 'updated', 'latency']);
 const VIEW_OPTIONS = new Set(['cards', 'compact']);
 const MAX_FAVORITES = 256;
+const MAX_IGNORED_PROVIDERS = 256;
 const MAX_BROWSER_ALIASES = 32;
 const MAX_PROVIDER_BROWSERS = 256;
 
@@ -43,6 +44,16 @@ function normalizeFavorites(values) {
   return favorites;
 }
 
+function normalizeIgnoredProviders(values) {
+  const providers = [];
+  for (const value of Array.isArray(values) ? values : []) {
+    const id = cleanProviderId(value);
+    if (id && !providers.includes(id)) providers.push(id);
+    if (providers.length >= MAX_IGNORED_PROVIDERS) break;
+  }
+  return providers;
+}
+
 function normalizeBrowserAliases(value) {
   const aliases = {};
   if (!value || typeof value !== 'object' || Array.isArray(value)) return aliases;
@@ -72,8 +83,10 @@ export function normalizeHubPreferences(value = {}) {
   const sort = SORT_OPTIONS.has(String(value?.sort || '')) ? String(value.sort) : 'smart';
   const view = VIEW_OPTIONS.has(String(value?.view || '')) ? String(value.view) : 'cards';
   return {
-    version: 2,
+    version: 3,
+    setupComplete: value?.setupComplete === true,
     favorites: normalizeFavorites(value?.favorites),
+    ignoredProviders: normalizeIgnoredProviders(value?.ignoredProviders),
     sort,
     view,
     browserAliases: normalizeBrowserAliases(value?.browserAliases),
@@ -100,6 +113,7 @@ export class HubPreferences {
     return {
       ...this.value,
       favorites: [...this.value.favorites],
+      ignoredProviders: [...this.value.ignoredProviders],
       browserAliases: { ...this.value.browserAliases },
       providerBrowsers: Object.fromEntries(
         Object.entries(this.value.providerBrowsers).map(([providerId, value]) => [providerId, { ...value }]),
@@ -109,8 +123,14 @@ export class HubPreferences {
 
   update(patch = {}) {
     const next = this.get();
+    if (Object.prototype.hasOwnProperty.call(patch, 'setupComplete')) {
+      next.setupComplete = patch.setupComplete === true;
+    }
     if (Object.prototype.hasOwnProperty.call(patch, 'favorites')) {
       next.favorites = normalizeFavorites(patch.favorites);
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'ignoredProviders')) {
+      next.ignoredProviders = normalizeIgnoredProviders(patch.ignoredProviders);
     }
     if (Object.prototype.hasOwnProperty.call(patch, 'sort')) {
       const sort = String(patch.sort || '');
@@ -129,6 +149,14 @@ export class HubPreferences {
       if (patch.favorite.enabled === true) favorites.add(providerId);
       else favorites.delete(providerId);
       next.favorites = normalizeFavorites([...favorites]);
+    }
+    if (patch.ignoredProvider && typeof patch.ignoredProvider === 'object') {
+      const providerId = cleanProviderId(patch.ignoredProvider.providerId);
+      if (!providerId) throw new Error('供应商标识无效');
+      const ignoredProviders = new Set(next.ignoredProviders);
+      if (patch.ignoredProvider.ignored === true) ignoredProviders.add(providerId);
+      else ignoredProviders.delete(providerId);
+      next.ignoredProviders = normalizeIgnoredProviders([...ignoredProviders]);
     }
     if (Object.prototype.hasOwnProperty.call(patch, 'browserAliases')) {
       next.browserAliases = normalizeBrowserAliases(patch.browserAliases);
