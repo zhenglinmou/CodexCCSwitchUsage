@@ -2,14 +2,14 @@
 
 > 此浏览器伴侣仅属于 v2。v1 不包含 All API Hub、WAF 同源查询或浏览器伴侣；版本差异见 [docs/V1.md](../docs/V1.md) 与 [docs/V2.md](../docs/V2.md)。
 
-当前伴侣版本为 `0.1.23`，协议版本为 `1`。
+当前伴侣版本为 `0.1.24`，协议版本为 `1`。
 
 这个 MV3 伴侣扩展安装在用户日常使用的 Edge 或 Chrome profile 中，通过同一个 `127.0.0.1:17891` Balance Hub 接收查询任务并回调结果。Edge 与 Chrome 可以同时安装并使用同一个 Hub 连接码；同一站点存在多个账号时，宿主会把任务定向到各浏览器，核验当前账号是否拥有供应商对应的 API Key 后再采用余额，避免同域名账号串用。
 
 - 不保存或回传 Cookie 原文。
 - 查询只使用当前浏览器已有的 Cookie 与同源页面环境。
-- 站点权限固定限制为 AgentRouter、AnyRouter、ChatGPT、`jianzhile.vip`、`free.lyclaude.site`、`muyuan.do` 和 `welfare.0xpsyche.me`，不会接受任意第三方 origin。
-- 本机 Hub 权限为必需权限；上述第三方站点使用可选权限，只会在用户点击伴侣弹窗中的“授予网站查询权限”后生效。权限被 Edge / Chrome 扣留时会明确提示，不再误报为官网退出登录。
+- 本机 Hub 权限为必需权限；HTTPS 只作为可选权限范围。Hub 按当前模板下发精确供应商 Origin，弹窗只会在用户点击授权按钮后请求这些站点，不会直接申请所有网站权限。
+- 新中转站缺少权限时只会把自己的规范 HTTPS Origin 加入待授权列表。权限被 Edge / Chrome 扣留时会明确提示，不再误报为官网退出登录。
 - 简直了、freely 与无名公益站的有限 API Key 由宿主直接查询；只有无限 Key 才通过伴侣读取官网登录账户的真实总额度，不把负数或超大占位值当作余额。
 - AnyRouter 返回 `arg1` WAF 挑战时，伴侣会在浏览器内为每次查询重新计算并更新该站的 `acw_sc__v2`，随后有限重试；Cookie 原文仍不会离开浏览器。多个 AnyRouter API Key 可在 Hub 中分别绑定到 Edge 或 Chrome，绑定后的刷新只投递到所选浏览器。
 - 余额查询本身不会创建、激活或聚焦第三方标签页。

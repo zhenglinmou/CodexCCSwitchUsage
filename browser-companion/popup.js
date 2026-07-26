@@ -3,10 +3,23 @@ const status = document.getElementById('status');
 const save = document.getElementById('save');
 const openHub = document.getElementById('open-hub');
 const grantSites = document.getElementById('grant-sites');
-const websiteOrigins = Object.freeze(
-  (chrome.runtime.getManifest().optional_host_permissions || [])
-    .filter(value => String(value).startsWith('https://')),
-);
+let websiteOrigins = [];
+
+function normalizeOrigins(values) {
+  const result = [];
+  for (const value of Array.isArray(values) ? values : []) {
+    try {
+      const url = new URL(String(value || ''));
+      if (url.protocol !== 'https:' || url.username || url.password || !url.hostname) continue;
+      if (!result.includes(url.origin)) result.push(url.origin);
+    } catch {}
+  }
+  return result.slice(0, 64);
+}
+
+function permissionOrigins() {
+  return websiteOrigins.map(origin => `${origin}/*`);
+}
 
 function show(message, tone = '') {
   status.textContent = message;
@@ -14,8 +27,10 @@ function show(message, tone = '') {
 }
 
 function hasWebsitePermissions() {
+  const origins = permissionOrigins();
+  if (!origins.length) return Promise.resolve(true);
   return new Promise(resolve => {
-    chrome.permissions.contains({ origins: websiteOrigins }, granted => {
+    chrome.permissions.contains({ origins }, granted => {
       void chrome.runtime.lastError;
       resolve(granted === true);
     });
@@ -23,59 +38,113 @@ function hasWebsitePermissions() {
 }
 
 function updatePermissionButton(granted) {
-  grantSites.disabled = granted;
-  grantSites.textContent = granted ? '网站查询权限已授权' : '授予网站查询权限';
+  const count = websiteOrigins.length;
+  grantSites.disabled = count === 0 || granted;
+  grantSites.textContent = count === 0
+    ? '暂无待授权站点'
+    : granted
+      ? `${count} 个站点已授权`
+      : `授权 ${count} 个供应商站点`;
 }
 
 function requestWebsitePermissions(callback) {
-  chrome.permissions.request({ origins: websiteOrigins }, granted => {
+  const origins = permissionOrigins();
+  if (!origins.length) {
+    callback(false, '当前模板没有需要授权的供应商站点');
+    return;
+  }
+  chrome.permissions.request({ origins }, granted => {
     const error = chrome.runtime.lastError?.message || '';
     callback(granted === true, error);
   });
 }
 
-function wakeHub(successMessage) {
-  chrome.runtime.sendMessage({ type: 'wake' }, result => {
-    if (chrome.runtime.lastError) return show(chrome.runtime.lastError.message, 'error');
-    result?.connected ? show(successMessage, 'ok') : show(`连接失败：${result?.error || '未知错误'}`, 'error');
+function sendRuntimeMessage(message) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(message, result => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve(result || {});
+    });
   });
+}
+
+async function refreshWebsiteOrigins(extra = {}) {
+  const stored = await chrome.storage.local.get(['providerWebsiteOrigins', 'pendingWebsiteOrigins']);
+  websiteOrigins = normalizeOrigins([
+    ...(stored.providerWebsiteOrigins || []),
+    ...(stored.pendingWebsiteOrigins || []),
+    ...(extra.providerOrigins || []),
+    ...(extra.pendingOrigins || []),
+  ]);
+  const granted = await hasWebsitePermissions();
+  updatePermissionButton(granted);
+  return granted;
+}
+
+async function wakeHub() {
+  const result = await sendRuntimeMessage({ type: 'wake' });
+  if (!result.connected) throw new Error(result.error || '未知错误');
+  await refreshWebsiteOrigins(result);
+  return result;
 }
 
 async function load() {
-  const [stored, permissionsGranted] = await Promise.all([
-    chrome.storage.local.get(['hubToken']),
-    hasWebsitePermissions(),
-  ]);
+  const stored = await chrome.storage.local.get(['hubToken']);
   tokenInput.value = stored.hubToken || '';
-  updatePermissionButton(permissionsGranted);
-  chrome.runtime.sendMessage({ type: 'status' }, result => {
-    if (chrome.runtime.lastError) return show(chrome.runtime.lastError.message, 'error');
-    if (!result?.configured) return show('尚未配置 Hub 连接码');
-    if (!permissionsGranted) return show('已连接本机 Hub，但缺少供应商网站查询权限；请点击上方按钮授权', 'error');
-    if (result.lastError) return show(`连接异常：${result.lastError}`, 'error');
-    show(result.lastHeartbeatAt ? `已连接 · ${new Date(result.lastHeartbeatAt).toLocaleTimeString()}` : '已配置，正在连接…', result.lastHeartbeatAt ? 'ok' : '');
-  });
+  let result;
+  try {
+    result = await sendRuntimeMessage({ type: 'status' });
+  } catch (error) {
+    show(error.message, 'error');
+    return;
+  }
+  const permissionsGranted = await refreshWebsiteOrigins(result);
+  if (!result.configured) return show('尚未配置 Hub 连接码');
+  if (websiteOrigins.length && !permissionsGranted) {
+    return show(`已连接本机 Hub，等待授权 ${websiteOrigins.length} 个供应商站点`, 'error');
+  }
+  if (result.lastError) return show(`连接异常：${result.lastError}`, 'error');
+  const permissionText = websiteOrigins.length ? ' · 站点权限正常' : ' · 当前模板无需站点权限';
+  show(result.lastHeartbeatAt
+    ? `已连接 · ${new Date(result.lastHeartbeatAt).toLocaleTimeString()}${permissionText}`
+    : '已配置，正在连接…', result.lastHeartbeatAt ? 'ok' : '');
 }
 
-save.addEventListener('click', () => {
+save.addEventListener('click', async () => {
   const token = tokenInput.value.trim();
   if (!/^[A-Za-z0-9_-]{32,128}$/.test(token)) return show('连接码格式不正确', 'error');
-  requestWebsitePermissions(async (granted, error) => {
-    updatePermissionButton(granted);
-    if (!granted) return show(error || '未授予供应商网站查询权限，余额伴侣只能连接本机 Hub', 'error');
-    await chrome.storage.local.set({ hubToken: token, lastError: '' });
-    show('正在连接…');
-    wakeHub('已连接到本机 Balance Hub，网站查询权限正常');
-  });
+  await chrome.storage.local.set({ hubToken: token, lastError: '' });
+  show('正在连接…');
+  try {
+    await wakeHub();
+    const granted = await hasWebsitePermissions();
+    if (websiteOrigins.length && !granted) {
+      show(`已连接 Hub；请授权 ${websiteOrigins.length} 个当前供应商站点`, 'error');
+    } else {
+      show('已连接到本机 Balance Hub', 'ok');
+    }
+  } catch (error) {
+    show(`连接失败：${error.message}`, 'error');
+  }
 });
 
 grantSites.addEventListener('click', () => {
-  show('等待 Edge 确认网站查询权限…');
-  requestWebsitePermissions((granted, error) => {
+  show('等待浏览器确认当前供应商站点权限…');
+  requestWebsitePermissions(async (granted, error) => {
     updatePermissionButton(granted);
-    if (!granted) return show(error || '未授予网站查询权限，余额查询仍无法访问供应商官网', 'error');
-    if (!tokenInput.value.trim()) return show('网站查询权限已授权；请填写连接码并保存', 'ok');
-    wakeHub('网站查询权限已恢复，可以回到 Hub 刷新余额');
+    if (!granted) return show(error || '未授予供应商网站查询权限', 'error');
+    const stored = await chrome.storage.local.get(['pendingWebsiteOrigins']);
+    const grantedSet = new Set(websiteOrigins);
+    const pendingWebsiteOrigins = normalizeOrigins(stored.pendingWebsiteOrigins)
+      .filter(origin => !grantedSet.has(origin));
+    await chrome.storage.local.set({ pendingWebsiteOrigins });
+    if (!tokenInput.value.trim()) return show('供应商站点权限已授权；请填写连接码并保存', 'ok');
+    try {
+      await wakeHub();
+      show('当前供应商站点权限已授权，可以回到 Hub 刷新', 'ok');
+    } catch (wakeError) {
+      show(`权限已授权，Hub 重连失败：${wakeError.message}`, 'error');
+    }
   });
 });
 
@@ -83,6 +152,11 @@ openHub.addEventListener('click', async () => {
   const token = tokenInput.value.trim();
   if (!token) return show('请先填写连接码', 'error');
   await chrome.tabs.create({ url: `http://127.0.0.1:17891/hub/${encodeURIComponent(token)}` });
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local' || (!changes.providerWebsiteOrigins && !changes.pendingWebsiteOrigins)) return;
+  void refreshWebsiteOrigins();
 });
 
 load();

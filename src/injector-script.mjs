@@ -232,7 +232,7 @@ export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = glob
 }
 
 export { PAGE_ACTION_SENTINEL };
-export const INJECTOR_VERSION = 81;
+export const INJECTOR_VERSION = 82;
 
 function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, formatRequestTime, selectResponsiveUsageMode, calculateResponsiveMeasurements, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, enqueuePageActionTitle, pageActionSentinel, version) {
   const VERSION = version;
@@ -516,9 +516,9 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
         .popover-refresh[data-loading="true"] svg{animation:popover-refresh-spin .9s linear infinite}
         .popover-grid{display:grid;gap:6px;margin-top:8px}
         .popover[data-mode="requests"] .popover-grid{display:none}
-        .popover-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:30px;padding:0 9px;border-radius:8px;background:var(--color-background-button-tertiary,rgba(127,127,127,.04))}
-        .popover-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-token-text-tertiary,currentColor)}
-        .popover-value{flex:0 0 auto;color:var(--color-token-text-primary,currentColor);font:inherit}
+        .popover-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;min-height:30px;padding:6px 9px;border-radius:8px;background:var(--color-background-button-tertiary,rgba(127,127,127,.04))}
+        .popover-label{flex:0 0 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-token-text-tertiary,currentColor)}
+        .popover-value{flex:1 1 auto;min-width:0;max-width:100%;overflow-wrap:anywhere;text-align:right;color:var(--color-token-text-primary,currentColor);font:inherit}
         .request-list{display:none;min-height:0;margin-top:8px;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
         .popover[data-mode="requests"] .request-list{display:block}
         .request-item{padding:9px 4px;border-bottom:1px solid var(--color-token-border,rgba(127,127,127,.12))}

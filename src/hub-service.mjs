@@ -1,7 +1,22 @@
 import fs from 'node:fs';
 import crypto from 'node:crypto';
-import { describeProviderQuery, loginConfiguration, providerAliases, providerKind } from './hub-provider-adapters.mjs';
-import { describeProviderRequestUsage, normalizeRequestUsageLimit } from './provider-request-usage.mjs';
+import {
+  defaultBalanceTemplateId,
+  describeProviderQuery,
+  loginConfiguration,
+  providerAliases,
+  providerKind,
+} from './hub-provider-adapters.mjs';
+import {
+  defaultRequestUsageTemplateId,
+  describeProviderRequestUsage,
+  normalizeRequestUsageLimit,
+} from './provider-request-usage.mjs';
+import {
+  getBalanceTemplate,
+  getRequestUsageTemplate,
+  listProviderTemplates,
+} from './provider-templates.mjs';
 
 const MAX_SAFE_MESSAGE_CHARS = 8_192;
 const LABELED_CREDENTIAL_PATTERN = /(["']?)(openai[_-]api[_-]key|api[_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|cookie|authorization|secret)\1(\s*[=:]\s*)(?:Bearer\s+)?(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\]]+)/gi;
@@ -168,9 +183,9 @@ function ccswitchRequestUsageFallback(provider, rows, remoteResult, limit, now) 
   };
 }
 
-export function providerConfigurationFingerprint(provider) {
+export function providerConfigurationFingerprint(provider, templateSelection = null) {
   if (!provider) return '';
-  const material = JSON.stringify([
+  const fields = [
     provider.id,
     provider.name,
     provider.websiteUrl,
@@ -179,8 +194,64 @@ export function providerConfigurationFingerprint(provider) {
     provider.baseUrl,
     provider.auth,
     provider.usage,
-  ]);
+  ];
+  if (templateSelection && (
+    templateSelection.balanceSource === 'manual'
+    || templateSelection.requestUsageSource === 'manual'
+  )) {
+    fields.push(
+      String(templateSelection.balanceTemplateId || ''),
+      String(templateSelection.balanceSource || ''),
+      String(templateSelection.requestUsageTemplateId || ''),
+      String(templateSelection.requestUsageSource || ''),
+    );
+  }
+  const material = JSON.stringify(fields);
   return crypto.createHash('sha256').update(material).digest('base64url');
+}
+
+function selectedTemplateOption(selection, type) {
+  if (!selection || selection[`${type}Source`] !== 'manual') return '';
+  return String(selection[`${type}TemplateId`] || '');
+}
+
+function templateSelectionFor(provider, templateStore) {
+  const binding = templateStore?.get?.(provider) || null;
+  const manualBalance = getBalanceTemplate(binding?.balanceTemplateId)?.selectable === true
+    ? String(binding.balanceTemplateId)
+    : '';
+  const manualRequestUsage = getRequestUsageTemplate(binding?.requestUsageTemplateId)?.selectable === true
+    ? String(binding.requestUsageTemplateId)
+    : '';
+  return {
+    balanceTemplateId: manualBalance || defaultBalanceTemplateId(provider),
+    balanceSource: manualBalance ? 'manual' : 'builtin',
+    requestUsageTemplateId: manualRequestUsage || defaultRequestUsageTemplateId(provider),
+    requestUsageSource: manualRequestUsage ? 'manual' : 'builtin',
+    updatedAt: binding?.updatedAt || '',
+  };
+}
+
+function safeProbeUsage(usage, source = '') {
+  if (!usage || typeof usage !== 'object') return null;
+  const finiteOrNull = value => value == null || value === '' || !Number.isFinite(Number(value)) ? null : Number(value);
+  return {
+    providerName: String(usage.providerName || '').slice(0, 80),
+    remaining: finiteOrNull(usage.remaining),
+    used: finiteOrNull(usage.used),
+    total: finiteOrNull(usage.total),
+    unit: String(usage.unit || '').slice(0, 24),
+    source: String(source || '').slice(0, 80),
+  };
+}
+
+function safeHttpsOrigin(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return url.protocol === 'https:' ? url.origin : '';
+  } catch {
+    return '';
+  }
 }
 
 function safeAccountBinding(value) {
@@ -291,6 +362,7 @@ export class HubService {
     this.repository = repository;
     this.queryEngine = queryEngine;
     this.requestUsageEngine = options.requestUsageEngine || null;
+    this.templateStore = options.templateStore || null;
     this.cachePath = options.cachePath || '';
     this.concurrency = Math.max(1, Math.min(6, Number(options.concurrency) || 3));
     this.browserConcurrency = Math.max(1, Math.min(this.concurrency, Number(options.browserConcurrency) || 1));
@@ -317,10 +389,12 @@ export class HubService {
     for (const provider of providers) {
       activeIds.add(provider.id);
       this.providers.set(provider.id, provider);
-      const loginConfig = loginConfiguration(provider);
+      const templateSelection = templateSelectionFor(provider, this.templateStore);
+      const balanceTemplateOption = selectedTemplateOption(templateSelection, 'balance');
+      const loginConfig = loginConfiguration(provider, balanceTemplateOption);
       const livePrevious = this.items.get(provider.id);
       const savedPrevious = livePrevious || this.cachedItems[provider.id] || {};
-      const providerFingerprint = providerConfigurationFingerprint(provider);
+      const providerFingerprint = providerConfigurationFingerprint(provider, templateSelection);
       const hasSavedState = Boolean(savedPrevious.id || savedPrevious.usage || savedPrevious.status);
       const configurationChanged = hasSavedState
         && String(savedPrevious.providerFingerprint || '') !== providerFingerprint;
@@ -373,7 +447,8 @@ export class HubService {
         accountBindingSupported: providerKind(provider) === 'anyrouter',
         accountBindingRequired: configurationChanged ? false : previous.accountBindingRequired === true,
         accountBinding,
-        queryMethod: describeProviderQuery(provider),
+        templateSelection,
+        queryMethod: describeProviderQuery(provider, balanceTemplateOption),
         usage: previous.usage || null,
         updatedAt: lastSuccessAt,
         lastSuccessAt,
@@ -417,7 +492,9 @@ export class HubService {
   listPublicProviders() {
     if (this.publicProvidersCache) return this.publicProvidersCache;
     this.publicProvidersCache = [...this.providers.values()].map(provider => {
-      const loginConfig = loginConfiguration(provider);
+      const templateSelection = templateSelectionFor(provider, this.templateStore);
+      const balanceTemplateOption = selectedTemplateOption(templateSelection, 'balance');
+      const loginConfig = loginConfiguration(provider, balanceTemplateOption);
       return {
         id: provider.id,
         name: provider.name,
@@ -427,11 +504,164 @@ export class HubService {
         loginUrl: safeWebsiteUrl(loginConfig?.loginUrl),
         sessionSyncSupported: Boolean(loginConfig?.userHeader),
         accountBindingSupported: providerKind(provider) === 'anyrouter',
-        queryMethod: describeProviderQuery(provider),
+        templateSelection,
+        queryMethod: describeProviderQuery(provider, balanceTemplateOption),
         balanceUrl: `/v1/balance/${encodeURIComponent(provider.id)}`,
       };
     });
     return this.publicProvidersCache;
+  }
+
+  listTemplates(providerSelector = '') {
+    const catalog = listProviderTemplates();
+    if (!providerSelector) return catalog;
+    const provider = this.findProvider(providerSelector);
+    if (!provider) throw new Error('CCSwitch 中不存在这个 Codex 供应商');
+    return {
+      ...catalog,
+      providerId: provider.id,
+      selection: this.items.get(provider.id)?.templateSelection || templateSelectionFor(provider, this.templateStore),
+    };
+  }
+
+  saveTemplateSelection(providerSelector, selection = {}) {
+    const provider = this.findProvider(providerSelector);
+    if (!provider) throw new Error('CCSwitch 中不存在这个 Codex 供应商');
+    if (!this.templateStore?.set) throw new Error('当前 Hub 没有启用模板绑定存储');
+    const currentBinding = this.templateStore.get?.(provider) || null;
+    const hasBalance = Object.prototype.hasOwnProperty.call(selection, 'balanceTemplateId');
+    const hasRequestUsage = Object.prototype.hasOwnProperty.call(selection, 'requestUsageTemplateId');
+    const balanceTemplateId = hasBalance
+      ? String(selection.balanceTemplateId || '')
+      : String(currentBinding?.balanceTemplateId || '');
+    const requestUsageTemplateId = hasRequestUsage
+      ? String(selection.requestUsageTemplateId || '')
+      : String(currentBinding?.requestUsageTemplateId || '');
+    if (balanceTemplateId && getBalanceTemplate(balanceTemplateId)?.selectable !== true) {
+      throw new Error('这个余额模板不能手动绑定');
+    }
+    if (requestUsageTemplateId && getRequestUsageTemplate(requestUsageTemplateId)?.selectable !== true) {
+      throw new Error('这个逐请求用量模板不能手动绑定');
+    }
+    this.templateStore.set(provider, { balanceTemplateId, requestUsageTemplateId });
+    return this.#resyncTemplateProvider(provider);
+  }
+
+  clearTemplateSelection(providerSelector) {
+    const provider = this.findProvider(providerSelector);
+    if (!provider) throw new Error('CCSwitch 中不存在这个 Codex 供应商');
+    if (!this.templateStore?.clear) throw new Error('当前 Hub 没有启用模板绑定存储');
+    this.templateStore.clear(provider.id);
+    return this.#resyncTemplateProvider(provider);
+  }
+
+  async probeTemplates(providerSelector, options = {}) {
+    const provider = this.findProvider(providerSelector);
+    if (!provider) throw new Error('CCSwitch 中不存在这个 Codex 供应商');
+    const selection = this.items.get(provider.id)?.templateSelection || templateSelectionFor(provider, this.templateStore);
+    const requestedBalance = String(options.balanceTemplateId || '');
+    const requestedRequestUsage = String(options.requestUsageTemplateId || '');
+    if (requestedBalance && getBalanceTemplate(requestedBalance)?.selectable !== true) {
+      throw new Error('这个余额模板不能手动测试');
+    }
+    if (requestedRequestUsage && getRequestUsageTemplate(requestedRequestUsage)?.selectable !== true) {
+      throw new Error('这个逐请求用量模板不能手动测试');
+    }
+
+    // Packy-style responses are a more specific New API capability and overlap the standard token schema.
+    const balanceOrder = ['packy-balance', 'new-api-key-quota', 'deepseek-balance', 'window-balance', 'new-api-browser-account'];
+    const currentBalance = getBalanceTemplate(selection.balanceTemplateId);
+    const preferredBalance = currentBalance?.autoDetect
+      ? selection.balanceTemplateId === 'new-api-key-quota'
+        ? ['packy-balance', selection.balanceTemplateId]
+        : [selection.balanceTemplateId]
+      : [];
+    const balanceCandidates = requestedBalance
+      ? [requestedBalance]
+      : currentBalance?.selectable !== true
+        ? [selection.balanceTemplateId]
+        : [...new Set([
+            ...preferredBalance,
+            ...balanceOrder.filter(id => getBalanceTemplate(id)?.autoDetect),
+          ])];
+    const balanceResults = [];
+    let balanceTemplateId = '';
+    for (const templateId of balanceCandidates) {
+      const useBuiltin = selection.balanceSource === 'builtin'
+        && selection.balanceTemplateId === templateId;
+      const result = await this.#probeBalanceTemplate(provider, templateId, { useBuiltin });
+      balanceResults.push(result);
+      if (result.status === 'success') {
+        balanceTemplateId = templateId;
+        break;
+      }
+    }
+    let fallbackBalanceTemplateId = '';
+    if (!requestedBalance && !balanceTemplateId) {
+      const fallback = await this.#probeBalanceTemplate(provider, 'api-health-local');
+      balanceResults.push(fallback);
+      if (fallback.status === 'success') fallbackBalanceTemplateId = 'api-health-local';
+    }
+
+    const requestCandidates = requestedRequestUsage
+      ? [requestedRequestUsage]
+      : ['new-api-token-log'];
+    const requestUsageResults = [];
+    let requestUsageTemplateId = '';
+    for (const templateId of requestCandidates) {
+      const useBuiltin = selection.requestUsageSource === 'builtin'
+        && selection.requestUsageTemplateId === templateId;
+      const result = await this.#probeRequestUsageTemplate(provider, templateId, { useBuiltin });
+      requestUsageResults.push(result);
+      if (result.status === 'success') {
+        requestUsageTemplateId = templateId;
+        break;
+      }
+    }
+    if (!requestedRequestUsage && !requestUsageTemplateId) {
+      const fallback = await this.#probeRequestUsageTemplate(provider, 'ccswitch-local');
+      requestUsageResults.push(fallback);
+      if (fallback.status === 'success') requestUsageTemplateId = 'ccswitch-local';
+    }
+
+    return {
+      success: Boolean(balanceTemplateId || fallbackBalanceTemplateId || requestUsageTemplateId),
+      providerId: provider.id,
+      testedAt: new Date(this.now()).toISOString(),
+      balance: {
+        recommendedTemplateId: balanceTemplateId,
+        fallbackTemplateId: fallbackBalanceTemplateId,
+        results: balanceResults,
+      },
+      requestUsage: {
+        recommendedTemplateId: requestUsageTemplateId,
+        results: requestUsageResults,
+      },
+    };
+  }
+
+  listBrowserOrigins() {
+    const origins = new Set();
+    for (const provider of this.providers.values()) {
+      const selection = this.items.get(provider.id)?.templateSelection || templateSelectionFor(provider, this.templateStore);
+      const balanceOption = selectedTemplateOption(selection, 'balance');
+      const requestOption = selectedTemplateOption(selection, 'requestUsage');
+      const loginConfig = loginConfiguration(provider, balanceOption);
+      const queryMethod = describeProviderQuery(provider, balanceOption);
+      const requestMethod = describeProviderRequestUsage(provider, requestOption);
+      for (const value of [
+        loginConfig?.baseUrl,
+        loginConfig?.loginUrl,
+        ...(queryMethod?.requiresBrowser === true || queryMethod?.waf === true ? [queryMethod?.requestUrl] : []),
+        ...(requestMethod?.requiresBrowser === true
+          ? [requestMethod?.requestUrl, requestMethod?.configurationUrl]
+          : []),
+      ]) {
+        const origin = safeHttpsOrigin(value);
+        if (origin) origins.add(origin);
+      }
+    }
+    return [...origins].sort();
   }
 
   refreshProvider(providerSelector) {
@@ -445,11 +675,14 @@ export class HubService {
     }
     const provider = resolved;
     const previous = this.items.get(id);
+    const refreshFingerprint = String(previous?.providerFingerprint || '');
     const queryStartedAt = this.now();
     this.items.set(id, { ...previous, status: previous.usage ? previous.status : 'loading', message: '' });
     this.revision += 1;
     const refresh = { provider, promise: null };
-    const isCurrentSnapshot = () => this.providers.get(id) === provider && this.items.has(id);
+    const isCurrentSnapshot = () => this.providers.get(id) === provider
+      && this.items.has(id)
+      && String(this.items.get(id)?.providerFingerprint || '') === refreshFingerprint;
     const promise = Promise.resolve().then(async () => {
       try {
         const anyRouterCredentials = providerKind(provider) === 'anyrouter'
@@ -460,6 +693,9 @@ export class HubService {
         const result = await this.queryEngine.query(provider, {
           accountBinding: previous.accountBinding || null,
           allowSoleSessionFallback: !anyRouterCredentials || anyRouterCredentials.size <= 1,
+          ...(selectedTemplateOption(previous.templateSelection, 'balance')
+            ? { balanceTemplateId: selectedTemplateOption(previous.templateSelection, 'balance') }
+            : {}),
         });
         if (!isCurrentSnapshot()) return this.items.get(id) || null;
         const attemptedAt = new Date(this.now()).toISOString();
@@ -468,6 +704,9 @@ export class HubService {
           ? [...this.providers.values()].filter(candidate => {
               if (candidate.id === provider.id) return true;
               if (providerKind(candidate) !== 'anyrouter' || !sameAnyRouterCredential(provider, candidate)) return false;
+              const candidateSelection = this.items.get(candidate.id)?.templateSelection;
+              if (candidateSelection?.balanceTemplateId !== previous.templateSelection?.balanceTemplateId
+                || candidateSelection?.balanceSource !== previous.templateSelection?.balanceSource) return false;
               return sameAccountBinding(previous.accountBinding, this.items.get(candidate.id)?.accountBinding);
             })
           : [provider];
@@ -612,6 +851,8 @@ export class HubService {
       };
     }
     const limit = normalizeRequestUsageLimit(options.limit);
+    const templateSelection = this.items.get(provider.id)?.templateSelection || templateSelectionFor(provider, this.templateStore);
+    const requestUsageTemplateOption = selectedTemplateOption(templateSelection, 'requestUsage');
     let credentialAppTypes = ['codex'];
     try {
       if (typeof this.repository?.getCredentialAppTypes === 'function') {
@@ -628,7 +869,7 @@ export class HubService {
         providerName: provider.name,
         providerKind: providerKind(provider),
         source: 'unavailable',
-        interface: describeProviderRequestUsage(provider),
+        interface: describeProviderRequestUsage(provider, requestUsageTemplateOption),
         limit,
         fetchedAt: new Date(this.now()).toISOString(),
         items: [],
@@ -641,6 +882,7 @@ export class HubService {
           limit,
           appType: 'codex',
           strictAppType: sharedAcrossApps,
+          ...(requestUsageTemplateOption ? { requestUsageTemplateId: requestUsageTemplateOption } : {}),
         });
       } catch (error) {
         remoteResult = {
@@ -650,7 +892,7 @@ export class HubService {
           providerName: provider.name,
           providerKind: providerKind(provider),
           source: 'provider_log',
-          interface: describeProviderRequestUsage(provider),
+          interface: describeProviderRequestUsage(provider, requestUsageTemplateOption),
           limit,
           fetchedAt: new Date(this.now()).toISOString(),
           items: [],
@@ -793,8 +1035,13 @@ export class HubService {
     const provider = this.findProvider(providerSelector);
     if (!provider) throw new Error('CCSwitch 中不存在这个 Codex 供应商');
     const id = provider.id;
-    if (!loginConfiguration(provider)) throw new Error('该供应商不支持网页登录修复');
-    const action = await this.queryEngine.openLogin(provider, options);
+    const templateSelection = this.items.get(id)?.templateSelection || templateSelectionFor(provider, this.templateStore);
+    const balanceTemplateId = selectedTemplateOption(templateSelection, 'balance');
+    if (!loginConfiguration(provider, balanceTemplateId)) throw new Error('该供应商不支持网页登录修复');
+    const action = await this.queryEngine.openLogin(provider, {
+      ...options,
+      ...(balanceTemplateId ? { balanceTemplateId } : {}),
+    });
     if (this.providers.get(id) !== provider || !this.items.has(id)) {
       throw new Error('供应商在登录操作期间已变更');
     }
@@ -814,6 +1061,113 @@ export class HubService {
     });
     this.revision += 1;
     return this.#publicItem(this.items.get(id));
+  }
+
+  #resyncTemplateProvider(provider) {
+    this.refreshes.delete(provider.id);
+    this.providerSnapshot = null;
+    this.publicProvidersCache = null;
+    this.requestUsageEngine?.clearStatusCache?.();
+    this.syncProviders();
+    this.#writeCache();
+    return this.#publicItem(this.items.get(provider.id));
+  }
+
+  async #probeBalanceTemplate(provider, templateId, options = {}) {
+    const template = getBalanceTemplate(templateId);
+    const base = {
+      templateId,
+      label: String(template?.label || templateId),
+      status: 'failed',
+      message: '',
+      preview: null,
+    };
+    if (!template) return { ...base, message: '余额模板不存在' };
+    try {
+      const result = await this.queryEngine.query(provider, {
+        ...(options.useBuiltin === true ? {} : { balanceTemplateId: templateId }),
+        bypassCache: true,
+        timeoutMs: 8_000,
+        accountBinding: this.items.get(provider.id)?.accountBinding || null,
+      });
+      const source = String(result?.source || '');
+      const localFallback = result?.degraded === true
+        || source === 'muyuan_local_usage'
+        || source === 'api_health_and_local_usage';
+      const usage = safeProbeUsage(result?.usage, source);
+      if (usage && (!localFallback || templateId === 'api-health-local')) {
+        return { ...base, status: 'success', message: '调用成功', preview: usage };
+      }
+      const needsAction = result?.loginRequired === true
+        || result?.sessionSyncRequired === true
+        || result?.websiteLoginRequired === true
+        || result?.accountBindingRequired === true;
+      return {
+        ...base,
+        status: needsAction ? 'needs-action' : 'failed',
+        message: safeMessage(result?.message || (localFallback ? '只取得本地回退数据，未验证远端额度结构' : '没有返回可验证的额度数据')),
+      };
+    } catch (error) {
+      return { ...base, message: safeMessage(error) };
+    }
+  }
+
+  async #probeRequestUsageTemplate(provider, templateId, options = {}) {
+    const template = getRequestUsageTemplate(templateId);
+    const base = {
+      templateId,
+      label: String(template?.label || templateId),
+      status: 'failed',
+      message: '',
+      preview: null,
+    };
+    if (!template) return { ...base, message: '逐请求用量模板不存在' };
+    if (templateId === 'ccswitch-local') {
+      try {
+        const rows = typeof this.repository?.getRecentRequests === 'function'
+          ? this.repository.getRecentRequests(provider.id, 10)
+          : [];
+        const requestCount = Array.isArray(rows) ? rows.length : 0;
+        return {
+          ...base,
+          status: 'success',
+          message: '本地请求记录可用',
+          preview: { requestCount, source: 'ccswitch_local', costExact: false },
+        };
+      } catch (error) {
+        return { ...base, message: safeMessage(error) };
+      }
+    }
+    if (!this.requestUsageEngine?.query) return { ...base, message: '第三方逐请求查询引擎未启用' };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error('逐请求模板测试超过 8 秒')), 8_000);
+    try {
+      const result = await this.requestUsageEngine.query(provider, {
+        ...(options.useBuiltin === true ? {} : { requestUsageTemplateId: templateId }),
+        bypassCache: true,
+        limit: 10,
+        appType: 'codex',
+        signal: controller.signal,
+      });
+      if (result?.success === true) {
+        return {
+          ...base,
+          status: 'success',
+          message: result?.degraded ? safeMessage(result.message || '调用成功，但计费配置不完整') : '调用成功',
+          preview: {
+            requestCount: Math.max(0, Number(result.requestCount) || 0),
+            source: String(result.source || '').slice(0, 80),
+            costUnit: String(result.billing?.unit || '').slice(0, 24),
+            costExact: result.billing?.exact === true,
+          },
+        };
+      }
+      return { ...base, message: safeMessage(result?.message || '没有返回可验证的逐请求日志') };
+    } catch (error) {
+      return { ...base, message: safeMessage(error) };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   #publicItem(item, refreshing = false) {

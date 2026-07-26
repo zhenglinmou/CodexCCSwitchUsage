@@ -4,6 +4,7 @@ import { BrowserCallbackBroker } from './browser-callback-broker.mjs';
 import { isCodexTargetCandidate, listCdpTargets } from './cdp-client.mjs';
 import { ProviderRepository } from './provider-repository.mjs';
 import { ProviderRequestUsageEngine } from './provider-request-usage.mjs';
+import { ProviderTemplateStore } from './provider-templates.mjs';
 import { HubServer } from './hub-server.mjs';
 import { ProviderQueryEngine } from './hub-provider-adapters.mjs';
 import { hubItemToUsagePayload, HubService, providerConfigurationFingerprint, safeHubMessage } from './hub-service.mjs';
@@ -47,9 +48,11 @@ const repository = new ProviderRepository(args.database);
 const browserBroker = new BrowserCallbackBroker();
 const hubQueryEngine = new ProviderQueryEngine(repository, browserBroker);
 const providerRequestUsageEngine = new ProviderRequestUsageEngine({ browserBroker });
+const providerTemplateStore = new ProviderTemplateStore(path.join(args.runtimeDir, 'hub-template-bindings.json'));
 const hubService = new HubService(repository, hubQueryEngine, {
   cachePath: path.join(args.runtimeDir, 'hub-cache.json'),
   requestUsageEngine: providerRequestUsageEngine,
+  templateStore: providerTemplateStore,
 });
 const hubServer = new HubServer(hubService, {
   tokenPath: path.join(args.runtimeDir, 'hub-token'),

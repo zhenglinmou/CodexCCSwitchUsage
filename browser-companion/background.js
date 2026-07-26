@@ -30,6 +30,8 @@ const HEARTBEAT_DEBOUNCE_MS = 350;
 const HUB_REQUEST_TIMEOUT_MS = 10_000;
 const HUB_POLL_TIMEOUT_MS = 30_000;
 const POLL_BATCH_SIZE = 120;
+const PROVIDER_ORIGINS_KEY = 'providerWebsiteOrigins';
+const PENDING_ORIGINS_KEY = 'pendingWebsiteOrigins';
 const manifest = chrome.runtime.getManifest();
 const sessionHints = new SessionHintStore(chrome.storage.local);
 const sessionIdentities = new SessionIdentityStore(chrome.storage.local);
@@ -37,6 +39,7 @@ const instanceId = crypto.randomUUID();
 let polling = false;
 let lastErrorValue;
 let statusUpdateChain = Promise.resolve();
+let originUpdateChain = Promise.resolve();
 
 function delay(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -97,6 +100,48 @@ function apiUrl(token, path) {
   return `${HUB_ORIGIN}/api/${encodeURIComponent(token)}${path}`;
 }
 
+function sameOrigins(left, right) {
+  return left.length === right.length && left.every((origin, index) => origin === right[index]);
+}
+
+function replaceStoredOrigins(key, values) {
+  const normalized = normalizeSessionOrigins(values);
+  originUpdateChain = originUpdateChain.catch(() => {}).then(async () => {
+    const stored = await chrome.storage.local.get([key]);
+    const current = normalizeSessionOrigins(stored?.[key]);
+    if (!sameOrigins(current, normalized) || !Array.isArray(stored?.[key])) {
+      await chrome.storage.local.set({ [key]: normalized });
+    }
+    return normalized;
+  });
+  return originUpdateChain;
+}
+
+function rememberPendingWebsiteOrigin(origin) {
+  originUpdateChain = originUpdateChain.catch(() => {}).then(async () => {
+    const stored = await chrome.storage.local.get([PENDING_ORIGINS_KEY]);
+    const current = normalizeSessionOrigins(stored?.[PENDING_ORIGINS_KEY]);
+    const next = normalizeSessionOrigins([...current, origin]);
+    if (!sameOrigins(current, next) || !Array.isArray(stored?.[PENDING_ORIGINS_KEY])) {
+      await chrome.storage.local.set({ [PENDING_ORIGINS_KEY]: next });
+    }
+    return next;
+  });
+  return originUpdateChain;
+}
+
+async function watchedSessionOrigins() {
+  const [hints, stored] = await Promise.all([
+    sessionHints.list(),
+    chrome.storage.local.get([PROVIDER_ORIGINS_KEY]),
+  ]);
+  return normalizeSessionOrigins([
+    ...SESSION_ORIGINS,
+    ...hints,
+    ...(stored?.[PROVIDER_ORIGINS_KEY] || []),
+  ]);
+}
+
 async function requestHub(url, options = {}, timeoutMs = HUB_REQUEST_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -151,8 +196,11 @@ async function performHeartbeat(current) {
     sessions: await knownSessions(),
   };
   const result = await post(resolved.token, '/companion/heartbeat', payload);
+  const providerOrigins = Array.isArray(result?.providerOrigins)
+    ? await replaceStoredOrigins(PROVIDER_ORIGINS_KEY, result.providerOrigins)
+    : normalizeSessionOrigins((await chrome.storage.local.get([PROVIDER_ORIGINS_KEY]))?.[PROVIDER_ORIGINS_KEY]);
   await updateStatus({ lastHeartbeatAt: new Date().toISOString(), lastError: '' });
-  return { connected: true, configured: true, companion: result.companion };
+  return { connected: true, configured: true, companion: result.companion, providerOrigins };
 }
 
 const heartbeatControl = new TrailingSingleFlight(performHeartbeat, HEARTBEAT_DEBOUNCE_MS);
@@ -390,6 +438,7 @@ async function fetchFromExtension(request, userId, timeoutMs) {
 async function syncNewApiSession(request, deadline) {
   const origin = new URL(request.baseUrl).origin;
   if (!await hasWebsitePermission(origin)) {
+    await rememberPendingWebsiteOrigin(origin);
     return {
       synced: false,
       opened: false,
@@ -439,7 +488,10 @@ async function focusLoginPage(request) {
 
 async function queryThroughCurrentBrowser(request, deadline) {
   const origin = new URL(request.baseUrl).origin;
-  if (!await hasWebsitePermission(origin)) return websitePermissionFailure(origin);
+  if (!await hasWebsitePermission(origin)) {
+    await rememberPendingWebsiteOrigin(origin);
+    return websitePermissionFailure(origin);
+  }
   const userId = await sessionIdentities.get(origin);
   const direct = await fetchFromExtension(request, userId, browserAttemptTime(deadline));
   const directOutcome = browserSessionOutcome(request, direct);
@@ -588,14 +640,18 @@ chrome.alarms.onAlarm.addListener(alarm => {
 });
 chrome.cookies.onChanged.addListener(change => {
   const domain = String(change.cookie?.domain || '').replace(/^\./, '');
-  const origin = SESSION_ORIGINS.find(value => new URL(value).hostname === domain || new URL(value).hostname.endsWith(`.${domain}`));
-  if (origin) scheduleHeartbeat();
+  void watchedSessionOrigins().then(origins => {
+    const origin = origins.find(value => new URL(value).hostname === domain || new URL(value).hostname.endsWith(`.${domain}`));
+    if (origin) scheduleHeartbeat();
+  });
 });
 chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
   if (changeInfo.status !== 'complete' || !tab.url) return;
   try {
     const origin = new URL(tab.url).origin;
-    if (SESSION_ORIGINS.includes(origin)) scheduleHeartbeat();
+    void watchedSessionOrigins().then(origins => {
+      if (origins.includes(origin)) scheduleHeartbeat();
+    });
   } catch {}
 });
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -604,8 +660,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
   if (message?.type === 'status') {
-    Promise.all([config(), chrome.storage.local.get(['lastHeartbeatAt'])]).then(([current, state]) => {
-      sendResponse({ configured: Boolean(current.token), lastHeartbeatAt: state.lastHeartbeatAt || '', lastError: current.lastError });
+    Promise.all([config(), chrome.storage.local.get(['lastHeartbeatAt', PROVIDER_ORIGINS_KEY, PENDING_ORIGINS_KEY])]).then(([current, state]) => {
+      sendResponse({
+        configured: Boolean(current.token),
+        lastHeartbeatAt: state.lastHeartbeatAt || '',
+        lastError: current.lastError,
+        providerOrigins: normalizeSessionOrigins(state[PROVIDER_ORIGINS_KEY]),
+        pendingOrigins: normalizeSessionOrigins(state[PENDING_ORIGINS_KEY]),
+      });
     });
     return true;
   }

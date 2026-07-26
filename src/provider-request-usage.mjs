@@ -1,4 +1,5 @@
 import { fetchJson, parseBrowserJson, providerKind } from './hub-provider-adapters.mjs';
+import { getRequestUsageTemplate } from './provider-templates.mjs';
 
 export const DEFAULT_REQUEST_USAGE_LIMIT = 10;
 export const MAX_REQUEST_USAGE_LIMIT = 50;
@@ -95,27 +96,55 @@ function redactedMessage(value, secrets = []) {
   return message;
 }
 
-function providerBackend(provider) {
+export function defaultRequestUsageTemplateId(provider) {
   const kind = providerKind(provider);
-  if (EXCLUDED_PROVIDER_KINDS.has(kind)) {
+  if (kind === 'deepseek') return 'response-usage-only';
+  if (kind === 'paid') return 'website-session-only';
+  if (EXCLUDED_PROVIDER_KINDS.has(kind)) return 'ccswitch-local';
+  const configured = configuredOrigin(provider);
+  if (!configured) return 'ccswitch-local';
+  const adapter = NEW_API_LOG_ADAPTERS.find(item => item.domains.some(domain => hostnameMatches(configured.hostname, domain)));
+  return adapter ? 'new-api-token-log' : 'ccswitch-local';
+}
+
+function providerBackend(provider, templateId = '') {
+  const requestedTemplateId = String(templateId || '');
+  const selectedTemplateId = requestedTemplateId || defaultRequestUsageTemplateId(provider);
+  const template = getRequestUsageTemplate(selectedTemplateId);
+  if (!template) {
     return {
       supported: false,
-      adapter: 'excluded',
-      reason: '当前阶段暂不查询这个供应商的第三方逐请求用量',
+      adapter: 'invalid-template',
+      templateId: selectedTemplateId,
+      explicitTemplateId: requestedTemplateId,
+      reason: '选择的逐请求用量模板不存在',
     };
   }
-  if (kind === 'deepseek') {
+  if (selectedTemplateId === 'response-usage-only') {
     return {
       supported: false,
       adapter: 'response-usage-only',
+      templateId: selectedTemplateId,
+      explicitTemplateId: requestedTemplateId,
       reason: 'DeepSeek 官方没有按 API Key 查询历史逐请求用量的接口；只能在模型响应中读取 usage',
     };
   }
-  if (kind === 'paid') {
+  if (selectedTemplateId === 'website-session-only') {
     return {
       supported: false,
       adapter: 'website-session-only',
+      templateId: selectedTemplateId,
+      explicitTemplateId: requestedTemplateId,
       reason: '付费站真实消费记录只提供官网登录会话接口；当前不读取网页登录态，改用 CCSwitch 本地记录',
+    };
+  }
+  if (selectedTemplateId === 'ccswitch-local') {
+    return {
+      supported: false,
+      adapter: 'ccswitch-local',
+      templateId: selectedTemplateId,
+      explicitTemplateId: requestedTemplateId,
+      reason: '已选择 CCSwitch 本地请求记录，不查询第三方逐请求接口',
     };
   }
 
@@ -124,27 +153,25 @@ function providerBackend(provider) {
     return {
       supported: false,
       adapter: 'unconfigured',
+      templateId: selectedTemplateId,
+      explicitTemplateId: requestedTemplateId,
       reason: '供应商没有可安全查询的 HTTPS Base URL',
     };
   }
   const adapter = NEW_API_LOG_ADAPTERS.find(item => item.domains.some(domain => hostnameMatches(configured.hostname, domain)));
-  if (!adapter) {
-    return {
-      supported: false,
-      adapter: 'unknown',
-      reason: '尚未确认该供应商提供按 API Key 查询的逐请求用量接口',
-    };
-  }
+  const explicitlySelected = Boolean(requestedTemplateId);
   return {
     supported: true,
     adapter: 'new-api-token-log',
-    adapterId: adapter.id,
-    label: adapter.label,
+    templateId: selectedTemplateId,
+    explicitTemplateId: requestedTemplateId,
+    adapterId: adapter?.id || 'configured-new-api',
+    label: adapter?.label || cleanText(provider?.name || '供应商', 80) || '供应商',
     logPath: '/api/log/token',
     statusPath: '/api/status',
-    origin: adapter.origin || configured.origin,
+    origin: explicitlySelected ? configured.origin : (adapter?.origin || configured.origin),
     hostname: configured.hostname,
-    browserFallback: adapter.browserFallback === true,
+    browserFallback: explicitlySelected || adapter?.browserFallback === true,
   };
 }
 
@@ -154,16 +181,18 @@ export function normalizeRequestUsageLimit(value = DEFAULT_REQUEST_USAGE_LIMIT) 
   return Math.max(1, Math.min(MAX_REQUEST_USAGE_LIMIT, Math.trunc(parsed)));
 }
 
-export function describeProviderRequestUsage(provider) {
-  const backend = providerBackend(provider);
+export function describeProviderRequestUsage(provider, templateId = '') {
+  const backend = providerBackend(provider, templateId);
   const common = {
     supported: backend.supported === true,
     adapter: backend.adapter,
+    templateId: backend.templateId || '',
     providerAdapter: backend.adapterId || '',
     method: backend.supported ? 'GET' : '',
     requestUrl: backend.supported ? `${backend.origin}${backend.logPath}` : '',
     configurationUrl: backend.supported ? `${backend.origin}${backend.statusPath}` : '',
     authentication: backend.supported ? 'Bearer API Key' : '',
+    requiresBrowser: backend.browserFallback === true,
     executor: backend.supported
       ? (backend.browserFallback ? 'Balance Hub 直接请求；遇到 WAF 时通过浏览器伴侣转发' : 'Balance Hub 直接请求第三方接口')
       : '',
@@ -194,6 +223,10 @@ function parseNewApiDisplayPayload(payload, providerLabel) {
   const displayType = String(data.quota_display_type || '').trim().toUpperCase();
   if (!displayType) {
     // Older New API installations only expose display_in_currency.
+    const hasLegacyDisplayFlag = typeof data.display_in_currency === 'boolean';
+    if (!hasLegacyDisplayFlag) {
+      throw new Error(`${providerLabel}站点配置缺少 New API 计费字段`);
+    }
     const quotaPerUnit = positiveNumber(data.quota_per_unit, DEFAULT_QUOTA_PER_UNIT);
     if (data.display_in_currency === false) {
       return {
@@ -284,6 +317,22 @@ function parseCacheCreationTokens(other) {
   );
 }
 
+export function isProviderRequestLogRow(row) {
+  if (!row || typeof row !== 'object' || Array.isArray(row)) return false;
+  const type = Number(row.type);
+  if (!Number.isSafeInteger(type) || !Object.hasOwn(RECORD_TYPE_NAMES, type)) return false;
+  const hasIdentity = ['id', 'request_id', 'created_at'].some(key => {
+    if (!Object.hasOwn(row, key)) return false;
+    const value = row[key];
+    return value != null && String(value).trim() !== '';
+  });
+  const hasLogData = [
+    'content', 'model_name', 'model', 'quota', 'prompt_tokens', 'completion_tokens',
+    'use_time', 'token_name', 'channel_name', 'other',
+  ].some(key => Object.hasOwn(row, key));
+  return hasIdentity && hasLogData;
+}
+
 export function classifyProviderRequestLogApp(row) {
   const source = row && typeof row === 'object' ? row : {};
   const other = parseOther(source.other);
@@ -358,8 +407,11 @@ export function parseProviderRequestLogs(payload, display, limit = DEFAULT_REQUE
   }
   const appType = String(options.appType || '').trim().toLowerCase();
   const strictAppType = options.strictAppType === true;
+  if (payload.data.length > 0 && !payload.data.some(isProviderRequestLogRow)) {
+    throw new Error('第三方逐请求用量响应没有可识别的 New API 日志行');
+  }
   const rows = payload.data
-    .filter(row => row && typeof row === 'object')
+    .filter(isProviderRequestLogRow)
     .filter(row => {
       if (!appType) return true;
       const detected = classifyProviderRequestLogApp(row);
@@ -402,7 +454,7 @@ function failureResult(provider, config, limit, now, message, extra = {}) {
     providerName: providerLabel(provider),
     providerKind: providerKind(provider),
     source: config.adapter,
-    interface: describeProviderRequestUsage(provider),
+    interface: describeProviderRequestUsage(provider, config.explicitTemplateId),
     limit,
     fetchedAt: new Date(now()).toISOString(),
     items: [],
@@ -427,14 +479,14 @@ export class ProviderRequestUsageEngine {
   }
 
   async query(provider, options = {}) {
-    const config = providerBackend(provider);
+    const config = providerBackend(provider, options.requestUsageTemplateId);
     const limit = normalizeRequestUsageLimit(options.limit);
     const base = {
       providerId: String(provider?.id || ''),
       providerName: providerLabel(provider),
       providerKind: providerKind(provider),
       source: config.adapter,
-      interface: describeProviderRequestUsage(provider),
+      interface: describeProviderRequestUsage(provider, config.explicitTemplateId),
       limit,
       fetchedAt: new Date(this.now()).toISOString(),
       appType: String(options.appType || 'codex'),
@@ -465,7 +517,7 @@ export class ProviderRequestUsageEngine {
         { Authorization: `Bearer ${provider.apiKey}`, Accept: 'application/json' },
         signal,
       );
-      const statusPromise = this.#getStatus(config, signal);
+      const statusPromise = this.#getStatus(config, signal, options.bypassCache === true);
       const [logsResult, statusResult] = await Promise.allSettled([logsPromise, statusPromise]);
 
       if (logsResult.status === 'rejected') {
@@ -507,10 +559,26 @@ export class ProviderRequestUsageEngine {
         billing = fallbackBilling(`站点计费配置接口返回 HTTP ${statusResult.value.status}`, [provider.apiKey]);
       }
 
-      const items = parseProviderRequestLogs(logs.payload, display, limit, {
-        appType: base.appType,
-        strictAppType: options.strictAppType === true,
-      });
+      let items;
+      try {
+        items = parseProviderRequestLogs(logs.payload, display, limit, {
+          appType: base.appType,
+          strictAppType: options.strictAppType === true,
+        });
+      } catch (error) {
+        return failureResult(provider, config, limit, this.now, error, {
+          supported: true,
+          httpStatus: logs.status,
+          errorType: 'schema',
+        });
+      }
+      if (logs.payload.data.length === 0 && !billing.available) {
+        return failureResult(provider, config, limit, this.now, '逐请求日志为空，且站点配置无法验证 New API 响应结构', {
+          supported: true,
+          httpStatus: logs.status,
+          errorType: 'schema',
+        });
+      }
       const statusWarning = billing.available ? '' : billing.warning;
       return {
         ...base,
@@ -520,6 +588,7 @@ export class ProviderRequestUsageEngine {
         requestCount: items.length,
         totalRemoteRecords: Array.isArray(logs.payload.data) ? logs.payload.data.length : items.length,
         appTypeFilter: options.strictAppType === true ? 'strict' : 'compatible',
+        schemaValidated: true,
         billing,
         ...(statusWarning ? { message: statusWarning, degraded: true } : {}),
         items,
@@ -575,9 +644,9 @@ export class ProviderRequestUsageEngine {
     };
   }
 
-  async #getStatus(config, signal) {
+  async #getStatus(config, signal, bypassCache = false) {
     const cached = this.statusCache.get(config.origin);
-    if (cached && cached.expiresAt > this.now()) return { status: 200, payload: cached.payload, cached: true };
+    if (!bypassCache && cached && cached.expiresAt > this.now()) return { status: 200, payload: cached.payload, cached: true };
     const result = await this.#fetchProviderJson(config, config.statusPath, { Accept: 'application/json' }, signal);
     if (result.status === 200 && result.payload?.success === true) {
       this.statusCache.set(config.origin, { payload: result.payload, expiresAt: this.now() + this.statusCacheTtlMs });

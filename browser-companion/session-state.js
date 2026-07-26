@@ -13,9 +13,9 @@ export const SESSION_ORIGINS = Object.freeze([
   'https://welfare.0xpsyche.me',
 ]);
 
-const SESSION_ORIGIN_SET = new Set(SESSION_ORIGINS);
 const DEFAULT_STORAGE_KEY = 'validatedSessionOrigins';
 const DEFAULT_IDENTITY_STORAGE_KEY = 'sessionUserIds';
+const MAX_SESSION_ORIGINS = 64;
 export const MAX_BROWSER_RESPONSE_BYTES = 2_000_000;
 
 export function browserResponseMetadata(status, contentType, cfMitigated) {
@@ -100,14 +100,16 @@ export async function readLimitedResponseText(response, maximumBytes = MAX_BROWS
 function normalizeSessionOrigin(value) {
   try {
     const url = new URL(String(value || ''));
-    return url.protocol === 'https:' && SESSION_ORIGIN_SET.has(url.origin) ? url.origin : '';
+    if (url.protocol !== 'https:' || url.username || url.password || !url.hostname) return '';
+    return url.origin.length <= 512 ? url.origin : '';
   } catch {
     return '';
   }
 }
 
 export function normalizeSessionOrigins(values) {
-  return [...new Set((Array.isArray(values) ? values : []).map(normalizeSessionOrigin).filter(Boolean))];
+  return [...new Set((Array.isArray(values) ? values : []).map(normalizeSessionOrigin).filter(Boolean))]
+    .slice(0, MAX_SESSION_ORIGINS);
 }
 
 function hasCanonicalSessionOrigins(value, normalized) {
@@ -234,9 +236,11 @@ function normalizeSessionUserId(value) {
 function normalizeSessionUserIds(value) {
   const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
   const result = {};
-  for (const origin of SESSION_ORIGINS) {
-    const userId = normalizeSessionUserId(source[origin]);
-    if (userId) result[origin] = userId;
+  for (const [rawOrigin, rawUserId] of Object.entries(source)) {
+    const origin = normalizeSessionOrigin(rawOrigin);
+    const userId = normalizeSessionUserId(rawUserId);
+    if (origin && userId && !(origin in result)) result[origin] = userId;
+    if (Object.keys(result).length >= MAX_SESSION_ORIGINS) break;
   }
   return result;
 }
@@ -331,7 +335,10 @@ export class SessionIdentityStore {
       const raw = stored?.[this.key];
       const current = normalizeSessionUserIds(raw);
       const next = normalizeSessionUserIds(transform(current));
-      const unchanged = SESSION_ORIGINS.every(origin => current[origin] === next[origin]);
+      const currentKeys = Object.keys(current);
+      const nextKeys = Object.keys(next);
+      const unchanged = currentKeys.length === nextKeys.length
+        && currentKeys.every(origin => current[origin] === next[origin]);
       if (unchanged && hasCanonicalSessionUserIds(raw, current)) return current;
       await this.storage.set({ [this.key]: next });
       return next;

@@ -100,6 +100,8 @@ CCSwitch 本地回退固定查询 `app_type = 'codex'`。如果同一个 API Key
 - PackyCode
 - 无名公益站
 
+其他 CCSwitch 中转站可在 All API Hub 的“模板”弹窗中测试并选择 `New API 逐请求日志`。手动模板始终请求该供应商自己配置的 HTTPS Origin，不会因显示名称把 API Key 转发到上述固定站点；测试成功后仍需显式保存。
+
 其中 PackyCode 当前远端接口返回 `record not found` 时会自动回退 CCSwitch，并明确标记为非精确。CHY 当前若受地区限制，同样回退 CCSwitch。
 
 `rawchat.cn` / `sharedchat.top` 的精确消费记录位于官网登录会话接口 `/frontend-api/vibe-code/records`，API Key 不能直接调用。当前遵循“不读取网页登录态”的约束，因此这两项直接走 CCSwitch 回退。

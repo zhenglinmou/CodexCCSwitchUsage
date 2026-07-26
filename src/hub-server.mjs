@@ -156,7 +156,12 @@ export class HubServer {
       jsonResponse(response, 403, { success: false, message: 'Cross-site browser requests are not allowed' });
       return;
     }
-    if (crossSite && request.method === 'POST' && url.pathname === `${this.apiPath}/request-usage`) {
+    if (
+      crossSite
+      && request.method === 'POST'
+      && url.pathname.startsWith(`${this.apiPath}/`)
+      && !url.pathname.startsWith(`${this.apiPath}/companion/`)
+    ) {
       jsonResponse(response, 403, { success: false, message: 'Cross-site browser requests are not allowed' });
       return;
     }
@@ -213,6 +218,40 @@ export class HubServer {
       });
       return;
     }
+    if (request.method === 'GET' && url.pathname === `${this.apiPath}/templates`) {
+      const providerSelector = String(url.searchParams.get('providerId') || '').trim();
+      try {
+        jsonResponse(response, 200, { success: true, ...this.service.listTemplates(providerSelector) });
+      } catch (error) {
+        jsonResponse(response, 404, { success: false, message: error.message });
+      }
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === `${this.apiPath}/template-probe`) {
+      const body = await readBody(request);
+      const result = await this.service.probeTemplates(String(body.providerId || '').trim(), {
+        balanceTemplateId: body.balanceTemplateId,
+        requestUsageTemplateId: body.requestUsageTemplateId,
+      });
+      jsonResponse(response, 200, result);
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === `${this.apiPath}/template-selection`) {
+      const body = await readBody(request);
+      const providerId = String(body.providerId || '').trim();
+      const selection = {};
+      if (Object.prototype.hasOwnProperty.call(body, 'balanceTemplateId')) {
+        selection.balanceTemplateId = body.balanceTemplateId;
+      }
+      if (Object.prototype.hasOwnProperty.call(body, 'requestUsageTemplateId')) {
+        selection.requestUsageTemplateId = body.requestUsageTemplateId;
+      }
+      const item = String(body.action || '').trim().toLowerCase() === 'clear'
+        ? this.service.clearTemplateSelection(providerId)
+        : this.service.saveTemplateSelection(providerId, selection);
+      jsonResponse(response, 200, { success: true, provider: item });
+      return;
+    }
     if (request.method === 'POST' && url.pathname === `${this.apiPath}/request-usage`) {
       const body = await readBody(request);
       const providerSelector = String(body.providerId || body.provider || '').trim();
@@ -229,7 +268,11 @@ export class HubServer {
     if (request.method === 'POST' && url.pathname === `${this.apiPath}/companion/heartbeat`) {
       if (!this.browserBroker) throw new Error('浏览器伴侣回调未启用');
       const body = await readBody(request);
-      jsonResponse(response, 200, { success: true, companion: this.browserBroker.heartbeat(body) });
+      jsonResponse(response, 200, {
+        success: true,
+        companion: this.browserBroker.heartbeat(body),
+        providerOrigins: this.service.listBrowserOrigins?.() || [],
+      });
       return;
     }
     if (request.method === 'POST' && url.pathname === `${this.apiPath}/companion/session`) {
