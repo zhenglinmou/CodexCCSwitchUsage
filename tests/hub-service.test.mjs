@@ -104,6 +104,41 @@ test('Hub full refresh can target only active workspace providers', async () => 
   assert.equal(service.getState().providers.find(item => item.id === 'two').status, 'idle');
 });
 
+test('a full refresh queued behind a scoped refresh still covers every provider once', async () => {
+  const providers = [provider('one', 'DeepSeek', true), provider('two', 'PackyCode'), provider('three', '付费站')];
+  const queried = [];
+  let releaseFirst;
+  let markFirstStarted;
+  const firstStarted = new Promise(resolve => { markFirstStarted = resolve; });
+  const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+  const service = new HubService({ getAll: () => providers }, {
+    async query(item) {
+      queried.push(item.id);
+      if (item.id === 'one') {
+        markFirstStarted();
+        await firstGate;
+      }
+      return {
+        source: 'test',
+        usage: {
+          status: 'ok', providerId: item.id, providerName: item.name, used: 1, remaining: 9, total: 10,
+          unit: 'USD', extra: '', updatedAt: '2026-07-28T00:00:00.000Z', refreshIntervalMinutes: 5,
+        },
+      };
+    },
+  }, { concurrency: 2 });
+
+  const scoped = service.refreshAll(['one']);
+  await firstStarted;
+  const full = service.refreshAll();
+  releaseFirst();
+  await Promise.all([scoped, full]);
+
+  assert.deepEqual(queried.sort(), ['one', 'three', 'two']);
+  assert.ok(service.getState().lastFullRefreshAt);
+  assert.equal(service.getState().providers.every(item => item.status === 'ok'), true);
+});
+
 test('Hub preserves an adapter-specific message for degraded local usage', async () => {
   const item = provider('muyuan', '君的公益');
   const service = new HubService({ getAll: () => [item] }, {

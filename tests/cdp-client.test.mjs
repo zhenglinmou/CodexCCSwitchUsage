@@ -2,7 +2,27 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import http from 'node:http';
 import test from 'node:test';
-import { closeCdpHttpClient, listCdpTargets } from '../src/cdp-client.mjs';
+import { CdpClient, closeCdpHttpClient, listCdpTargets } from '../src/cdp-client.mjs';
+
+test('CDP calls release pending state when WebSocket send fails synchronously', async () => {
+  class ThrowingSocket extends EventTarget {
+    send() {
+      throw new Error('socket send failed');
+    }
+
+    close() {
+      this.dispatchEvent(new Event('close'));
+    }
+  }
+
+  const client = new CdpClient(new ThrowingSocket());
+  try {
+    await assert.rejects(client.call('Runtime.evaluate'), /socket send failed/);
+    assert.equal(client.pending.size, 0);
+  } finally {
+    client.close();
+  }
+});
 
 test('CDP target snapshots reuse one bounded HTTP connection and release it on close', async () => {
   let connections = 0;

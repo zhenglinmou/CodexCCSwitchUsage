@@ -396,6 +396,11 @@ export class HubService {
     this.providers = new Map();
     this.refreshes = new Map();
     this.refreshAllPromise = null;
+    this.refreshAllPendingIds = new Set();
+    this.refreshAllPendingFull = false;
+    this.refreshAllPendingFullStartedAt = null;
+    this.refreshAllActiveIds = new Set();
+    this.refreshAllActiveFull = false;
     this.cacheBatchDepth = 0;
     this.cacheDirty = false;
     this.revision = 0;
@@ -789,60 +794,95 @@ export class HubService {
   }
 
   refreshAll(providerSelectors = null) {
-    if (this.refreshAllPromise) return this.refreshAllPromise;
     this.syncProviders();
+    const fullRefresh = !Array.isArray(providerSelectors);
     const ids = Array.isArray(providerSelectors)
       ? [...new Set(providerSelectors
           .map(selector => this.findProvider(selector)?.id || '')
           .filter(Boolean))]
       : [...this.providers.keys()];
+    const uncoveredIds = ids.filter(id => !this.refreshAllActiveIds.has(id));
+    for (const id of uncoveredIds) this.refreshAllPendingIds.add(id);
+    if (fullRefresh && (!this.refreshAllActiveFull || uncoveredIds.length > 0)) {
+      this.refreshAllPendingFull = true;
+      this.refreshAllPendingFullStartedAt ??= this.now();
+    }
+    return this.#startRefreshAllDrain();
+  }
+
+  #startRefreshAllDrain() {
+    if (this.refreshAllPromise) return this.refreshAllPromise;
     this.refreshAllPromise = (async () => {
-      const refreshStartedAt = this.now();
       this.cacheBatchDepth += 1;
-      const runPool = async (poolIds, concurrency) => {
-        let cursor = 0;
-        const worker = async () => {
-          while (cursor < poolIds.length) {
-            const id = poolIds[cursor];
-            cursor += 1;
-            const provider = this.providers.get(id);
-            if (!provider) continue;
-            try {
-              await this.refreshProvider(id);
-            } catch (error) {
-              if (this.providers.get(id) !== provider) continue;
-              throw error;
-            }
+      try {
+        while (this.refreshAllPendingFull || this.refreshAllPendingIds.size > 0) {
+          const batchStartedAt = this.now();
+          const batchIsFull = this.refreshAllPendingFull;
+          const fullRefreshStartedAt = batchIsFull
+            ? (this.refreshAllPendingFullStartedAt ?? batchStartedAt)
+            : null;
+          const batchIds = [...this.refreshAllPendingIds];
+          this.refreshAllPendingFull = false;
+          this.refreshAllPendingFullStartedAt = null;
+          this.refreshAllPendingIds.clear();
+          this.refreshAllActiveFull = batchIsFull;
+          this.refreshAllActiveIds = new Set(batchIds);
+          const runPool = async (poolIds, concurrency) => {
+            let cursor = 0;
+            const worker = async () => {
+              while (cursor < poolIds.length) {
+                const id = poolIds[cursor];
+                cursor += 1;
+                const provider = this.providers.get(id);
+                if (!provider) continue;
+                try {
+                  await this.refreshProvider(id);
+                } catch (error) {
+                  if (this.providers.get(id) !== provider) continue;
+                  throw error;
+                }
+              }
+            };
+            await Promise.all(Array.from({ length: Math.min(concurrency, poolIds.length) }, worker));
+          };
+          const browserIds = batchIds.filter(id => {
+            const method = this.items.get(id)?.queryMethod;
+            return method?.requiresBrowser === true || method?.type === 'api-key-with-account-fallback';
+          });
+          const browserIdSet = new Set(browserIds);
+          const directIds = batchIds.filter(id => !browserIdSet.has(id));
+          if (browserIds.length > 0 && directIds.length > 0 && this.concurrency > 1) {
+            const browserSlots = Math.min(this.browserConcurrency, this.concurrency - 1, browserIds.length);
+            const directSlots = this.concurrency - browserSlots;
+            await Promise.all([
+              runPool(directIds, directSlots),
+              runPool(browserIds, browserSlots),
+            ]);
+          } else if (browserIds.length > 0 && directIds.length === 0) {
+            await runPool(browserIds, this.browserConcurrency);
+          } else {
+            await runPool(batchIds, this.concurrency);
           }
-        };
-        await Promise.all(Array.from({ length: Math.min(concurrency, poolIds.length) }, worker));
-      };
-      const browserIds = ids.filter(id => {
-        const method = this.items.get(id)?.queryMethod;
-        return method?.requiresBrowser === true || method?.type === 'api-key-with-account-fallback';
-      });
-      const browserIdSet = new Set(browserIds);
-      const directIds = ids.filter(id => !browserIdSet.has(id));
-      if (browserIds.length > 0 && directIds.length > 0 && this.concurrency > 1) {
-        const browserSlots = Math.min(this.browserConcurrency, this.concurrency - 1, browserIds.length);
-        const directSlots = this.concurrency - browserSlots;
-        await Promise.all([
-          runPool(directIds, directSlots),
-          runPool(browserIds, browserSlots),
-        ]);
-      } else if (browserIds.length > 0 && directIds.length === 0) {
-        await runPool(browserIds, this.browserConcurrency);
-      } else {
-        await runPool(ids, this.concurrency);
+          if (batchIsFull) {
+            this.lastFullRefreshAt = new Date(this.now()).toISOString();
+            this.lastFullRefreshDurationMs = Math.max(0, this.now() - fullRefreshStartedAt);
+          }
+          this.refreshAllActiveFull = false;
+          this.refreshAllActiveIds.clear();
+          this.revision += 1;
+        }
+        return this.getState();
+      } finally {
+        this.refreshAllActiveFull = false;
+        this.refreshAllActiveIds.clear();
+        this.cacheBatchDepth = Math.max(0, this.cacheBatchDepth - 1);
+        if (this.cacheDirty) this.#writeCache();
       }
-      this.lastFullRefreshAt = new Date(this.now()).toISOString();
-      this.lastFullRefreshDurationMs = Math.max(0, this.now() - refreshStartedAt);
-      this.revision += 1;
-      return this.getState();
     })().finally(() => {
-      this.cacheBatchDepth = Math.max(0, this.cacheBatchDepth - 1);
-      if (this.cacheDirty) this.#writeCache();
       this.refreshAllPromise = null;
+      if (this.refreshAllPendingFull || this.refreshAllPendingIds.size > 0) {
+        return this.#startRefreshAllDrain();
+      }
     });
     return this.refreshAllPromise;
   }

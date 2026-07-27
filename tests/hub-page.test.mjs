@@ -259,6 +259,8 @@ test('Hub groups browser tasks and supports scoped batch processing', () => {
   assert.match(page, /requestLogin\(task\.item\.id,group\.target\.ref,group\.target\.browser\)/);
   assert.match(page, /requestBinding\(task\.item\.id,group\.target\.ref,group\.target\.browser\)/);
   assert.match(page, /group\.tasks\.map\(task=>task\.item\.id\)/);
+  assert.match(page, /unique\.length===1.*post\('refresh',\{providerIds:unique\}\)/);
+  assert.doesNotMatch(page, /unique\.map\(providerId=>post\('refresh',\{providerId\}\)\)/);
   assert.match(page, /处理全部/);
   assert.match(page, /重新检查全部/);
 });
