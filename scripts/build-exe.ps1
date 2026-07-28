@@ -42,7 +42,7 @@ if ($nodeProbe.arch -ne 'x64' -or [int]$nodeProbe.major -lt 22 -or -not $nodePro
 $payloadFiles = @(
     'package.json', '.gitignore', 'README.md', 'assets\codex.ico',
     'src\provider-repository.mjs', 'src\evaluator-worker.mjs', 'src\evaluator.mjs',
-    'src\usage-client.mjs', 'src\cdp-client.mjs', 'src\injector-script.mjs',
+    'src\usage-client.mjs', 'src\http-allowlist.mjs', 'src\cdp-client.mjs', 'src\injector-script.mjs',
     'src\browser-callback-broker.mjs', 'src\hub-provider-adapters.mjs', 'src\provider-request-usage.mjs', 'src\provider-templates.mjs', 'src\hub-service.mjs',
     'src\hub-page.mjs', 'src\hub-preferences.mjs', 'src\hub-server.mjs',
     'src\keyed-backoff.mjs', 'src\page-action-channel.mjs', 'src\process-lifecycle.mjs', 'src\target-session.mjs', 'src\host.mjs',

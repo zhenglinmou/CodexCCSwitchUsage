@@ -332,6 +332,13 @@ test('balance schemas preserve real zeroes and reject missing or malformed value
     },
   }).daily, { remaining: 6, used: 4, total: 10 });
   assert.throws(() => parseWindowBalancePayload({
+    status: 'ok',
+    quota: {
+      '3h': { remaining: 90, used: 80, total: 100 },
+      daily: { remaining: 400, used: 20, total: 300 },
+    },
+  }), /total.*used.*remaining|总额/);
+  assert.throws(() => parseWindowBalancePayload({
     status: 'ok', balance_1d: 9, used_1d: 1, limit_1d: 10,
   }), /3h/);
   assert.throws(() => parseWindowBalancePayload({
@@ -342,6 +349,10 @@ test('balance schemas preserve real zeroes and reject missing or malformed value
     code: true,
     data: { name: 'finite', unlimited_quota: false, total_available: 4_000_000, total_used: '1000000', total_granted: 5_000_000 },
   }), { name: 'finite', unlimited: false, remaining: 8, used: 2, total: 10 });
+  assert.throws(() => parseJianzhileTokenPayload({
+    code: true,
+    data: { name: 'inconsistent', unlimited_quota: false, total_available: 4_000_000, total_used: 1_000_000, total_granted: 6_000_000 },
+  }), /total_granted/);
   assert.deepEqual(parseJianzhileTokenPayload({
     code: true,
     data: { name: 'unlimited', unlimited_quota: true, total_available: -5, total_used: 10, total_granted: 5 },
@@ -350,6 +361,14 @@ test('balance schemas preserve real zeroes and reject missing or malformed value
 
   const cny = parseJianzhileDisplayPayload(jianzhileStatusPayload({ quota_display_type: 'CNY', usd_exchange_rate: 7.2 }));
   assert.deepEqual(cny, { quotaPerUnit: 500_000, multiplier: 7.2, unit: 'CNY' });
+  assert.deepEqual(parseJianzhileDisplayPayload({
+    success: true,
+    data: { display_in_currency: true, quota_per_unit: 500_000 },
+  }), { quotaPerUnit: 500_000, multiplier: 1, unit: 'USD' });
+  assert.deepEqual(parseJianzhileDisplayPayload({
+    success: true,
+    data: { display_in_currency: false, quota_per_unit: 500_000 },
+  }), { quotaPerUnit: 1, multiplier: 1, unit: 'quota' });
   assert.deepEqual(parseJianzhileTokenPayload({
     code: true,
     data: { name: 'finite-cny', unlimited_quota: false, total_available: 4_000_000, total_used: 1_000_000, total_granted: 5_000_000 },
@@ -1172,6 +1191,30 @@ test('an explicit New API balance template probes only an unknown provider confi
     { url: 'https://relay.example/api/usage/token/', authorization: 'Bearer private-key' },
     { url: 'https://relay.example/api/status', authorization: undefined },
   ]);
+});
+
+test('an unlimited unknown New API key preserves schema validation when browser account access is unavailable', async () => {
+  const provider = {
+    id: 'unlimited-new-relay', name: '新无限额度中转', websiteUrl: 'https://relay.example', usage: null, auth: {},
+    apiKey: 'private-key', apiBaseUrl: 'https://relay.example/v1', baseUrl: '',
+  };
+  const engine = new ProviderQueryEngine({}, { isConnected: () => false }, {
+    fetchImpl: async url => new Response(JSON.stringify(String(url).endsWith('/api/status')
+      ? jianzhileStatusPayload()
+      : {
+          code: true,
+          data: {
+            name: 'unlimited', unlimited_quota: true, total_available: 0, total_used: 0, total_granted: 0,
+          },
+        }), { status: 200 }),
+  });
+
+  const result = await engine.query(provider, { balanceTemplateId: 'new-api-key-quota', bypassCache: true });
+
+  assert.equal(result.schemaValidated, true);
+  assert.equal(result.sessionSyncRequired, true);
+  assert.equal(result.loginRequired, true);
+  assert.equal(result.usage, undefined);
 });
 
 test('an explicit DeepSeek template never falls back to the fixed DeepSeek origin for a generic provider', async () => {

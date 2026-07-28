@@ -333,7 +333,7 @@ function syncRecentRequests(providerOverride = undefined, options = {}) {
       options.force !== true
       && providerId
       && providerId === recentRequestProviderId
-      && recentRequestsSource === 'provider_log'
+      && ['provider_log', 'provider_account_log', 'openai_codex_session'].includes(recentRequestsSource)
     ) return false;
     const nextRequests = providerId ? repository.getRecentRequests(providerId, RECENT_REQUEST_LIMIT) : [];
     return updateRecentRequestsState(provider, nextRequests, {

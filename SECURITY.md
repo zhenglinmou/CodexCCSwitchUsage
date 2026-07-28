@@ -8,11 +8,12 @@ Codex CCSwitch Usage 是一个仅在本机运行的 Windows 扩展。它读取 C
 - API Key、账户 Token 和其他供应商认证信息只在本机宿主内存中用于访问用户配置的供应商接口，不发送到 Hub 页面，也不写入本项目的偏好、模板绑定或余额缓存。
 - Balance Hub 只监听 `127.0.0.1:17891`。页面和写操作使用首次运行时生成的随机路径令牌，并拒绝跨站浏览器请求。
 - CDP 操作只连接经过校验的 Codex 主文档，不连接外部网页、Browser Use、MCP App 或辅助 WebView。
+- OpenAI Official 的逐请求 Token 只从本机 `~/.codex/sessions` 与 `~/.codex/archived_sessions` 读取。读取器仅解析会话元数据、模型上下文和 `token_count` 事件，跳过对话正文；仅在供应商账户 ID 与当前 `~/.codex/auth.json` 账户一致时返回数据，并且不会向 Hub 暴露账户 ID、访问令牌或消息内容。
 - 项目不包含产品遥测、分析 SDK 或云同步。除用户配置的供应商接口外，不主动上传用量、诊断或身份数据。
 
 ## 浏览器伴侣
 
-浏览器伴侣只在用户明确配对和授权后工作。它按当前供应商模板申请精确的 HTTPS 站点权限，复用用户现有 Edge 或 Chrome profile 的登录状态。
+浏览器伴侣只在用户明确配对和授权后工作。它按当前供应商模板申请精确的 HTTPS 站点权限，复用用户现有 Edge 或 Chrome profile 的登录状态。公司内部 HTTP 供应商只能通过本机配置按供应商 ID 和精确 Origin 单独允许，并且只由 Node 宿主直连，不会扩展浏览器伴侣的站点权限。
 
 Cookie 原文始终保留在浏览器中。伴侣的本机存储仅包含配对令牌、浏览器实例标识、已授权 Origin、协议状态，以及部分 New API 站点请求所需的数字用户 ID；不保存 Cookie、API Key、Bearer Token 或网页 localStorage 原文。
 

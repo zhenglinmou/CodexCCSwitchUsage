@@ -10,6 +10,7 @@ import {
   safeHubMessage,
   sanitizeHubUsage,
 } from '../src/hub-service.mjs';
+import { ProviderQueryEngine } from '../src/hub-provider-adapters.mjs';
 import { ProviderTemplateStore } from '../src/provider-templates.mjs';
 
 function provider(id, name, current = false) {
@@ -198,7 +199,9 @@ test('request usage prefers exact provider logs without reading CCSwitch fallbac
   assert.equal(result.preciseCostAvailable, true);
   assert.equal(result.appType, 'codex');
   assert.equal(result.credentialSharedAcrossApps, true);
-  assert.deepEqual(requestOptions, { limit: 10, appType: 'codex', strictAppType: true });
+  const { getLocalRequestRows, ...staticRequestOptions } = requestOptions;
+  assert.equal(typeof getLocalRequestRows, 'function');
+  assert.deepEqual(staticRequestOptions, { limit: 10, appType: 'codex', strictAppType: true });
   assert.equal(localReads, 0);
 });
 
@@ -260,6 +263,58 @@ test('request usage falls back to marked CCSwitch estimates when provider logs a
   assert.equal(result.items[0].costExact, false);
   assert.equal(result.items[0].costSource, 'ccswitch_local');
   assert.equal(result.items[0].rawQuota, null);
+});
+
+test('request usage shares one lazy local read between account-log detection and CCSwitch fallback', async () => {
+  const item = provider('relay', 'agentrouter');
+  const localRows = [{
+    model: 'gpt-5.6-sol',
+    requestModel: 'gpt-5.6-sol',
+    inputTokens: 120,
+    outputTokens: 8,
+    cacheReadTokens: 4,
+    cacheCreationTokens: 2,
+    totalCostUsd: 0.25,
+    latencyMs: 1500,
+    firstTokenMs: 300,
+    statusCode: 200,
+    createdAt: '2026-07-25T01:02:03.000Z',
+  }];
+  const localLimits = [];
+  const service = new HubService({
+    getAll: () => [item],
+    getRecentRequests(providerId, limit) {
+      assert.equal(providerId, item.id);
+      localLimits.push(limit);
+      return localRows;
+    },
+  }, { async query() { return {}; } }, {
+    requestUsageEngine: {
+      async query(_provider, options) {
+        assert.equal(options.getLocalRequestRows(50), localRows);
+        assert.equal(options.getLocalRequestRows(10), localRows);
+        return {
+          success: false,
+          supported: true,
+          providerId: item.id,
+          providerName: item.name,
+          source: 'new-api-token-log',
+          interface: { supported: true, adapter: 'new-api-token-log' },
+          items: [],
+          errorType: 'account_scope',
+          message: '浏览器账户日志无法归属到当前供应商 API Key',
+        };
+      },
+    },
+  });
+
+  const result = await service.queryRequestUsage(item.id, { limit: 10 });
+
+  assert.deepEqual(localLimits, [50]);
+  assert.equal(result.success, true);
+  assert.equal(result.source, 'ccswitch_local');
+  assert.equal(result.remoteErrorType, 'account_scope');
+  assert.equal(result.items.length, 1);
 });
 
 test('Hub persists independent manual templates and routes later queries through them', async t => {
@@ -363,6 +418,47 @@ test('Hub template detection stops at the first validated response shape', async
   assert.doesNotMatch(JSON.stringify(result), /probe-private-key/);
 });
 
+test('Hub probes the built-in OpenAI official session Token template', async () => {
+  const item = {
+    ...provider('openai-owned', 'OpenAI Official-我自己的'),
+    websiteUrl: 'https://chatgpt.com/codex',
+    auth: { tokens: { account_id: 'official-account-one' } },
+  };
+  const requestCalls = [];
+  const service = new HubService({ getAll: () => [item], getRecentRequests: () => [] }, {
+    async query() {
+      return {
+        source: 'openai_wham',
+        usage: { providerName: item.name, remaining: 80, used: 20, total: 100, unit: 'percent' },
+      };
+    },
+  }, {
+    requestUsageEngine: {
+      async query(_provider, options) {
+        requestCalls.push(options);
+        return {
+          success: true,
+          source: 'openai_codex_session',
+          requestCount: 4,
+          degraded: true,
+          message: '官方 Token 精确；ChatGPT 套餐不提供逐请求金额',
+          billing: { available: false, exact: false, unit: 'subscription' },
+          items: [],
+        };
+      },
+    },
+  });
+
+  const state = service.getState().providers[0];
+  assert.equal(state.templateSelection.requestUsageTemplateId, 'openai-codex-session');
+  assert.equal(state.templateSelection.requestUsageSource, 'builtin');
+  const result = await service.probeTemplates(item.id);
+  assert.equal(result.requestUsage.recommendedTemplateId, 'openai-codex-session');
+  assert.equal(result.requestUsage.results[0].status, 'success');
+  assert.equal(result.requestUsage.results[0].preview.requestCount, 4);
+  assert.equal(Object.hasOwn(requestCalls[0], 'requestUsageTemplateId'), false);
+});
+
 test('Hub overlaps slow template probes while preserving recommendation priority', async () => {
   const item = {
     ...provider('parallel-probe', '并行识别中转'),
@@ -410,6 +506,155 @@ test('Hub overlaps slow template probes while preserving recommendation priority
     'deepseek-balance',
     'window-balance',
   ]);
+});
+
+test('Hub aborts speculative shared network probes after a higher-priority template wins', async () => {
+  const item = {
+    ...provider('cancel-speculative-probe', '新中转'),
+    apiBaseUrl: 'https://cancel-probe.example/v1',
+    baseUrl: 'https://cancel-probe.example/v1',
+    apiKey: 'cancel-private-key',
+  };
+  const providers = [item];
+  let slowStarts = 0;
+  let slowAborts = 0;
+  const queryEngine = new ProviderQueryEngine({ getAll: () => providers }, { isConnected: () => false }, {
+    fetchImpl: async (url, options) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === '/api/usage/token/') {
+        return new Response(JSON.stringify({
+          code: true,
+          data: {
+            total_available: 10_000_000,
+            total_used: 2_000_000,
+            quota_reset_period: 'daily',
+            unlimited_quota: true,
+          },
+        }), { status: 200 });
+      }
+      if (pathname === '/api/status') {
+        return new Response(JSON.stringify({
+          success: true,
+          data: { quota_display_type: 'USD', quota_per_unit: 500_000 },
+        }), { status: 200 });
+      }
+      if (pathname.endsWith('/user/balance')) {
+        slowStarts += 1;
+        return new Promise((resolve, reject) => {
+          const abort = () => {
+            slowAborts += 1;
+            reject(options.signal.reason || new Error('aborted'));
+          };
+          if (options.signal.aborted) abort();
+          else options.signal.addEventListener('abort', abort, { once: true });
+        });
+      }
+      return new Response('{}', { status: 404 });
+    },
+  });
+  const service = new HubService({ getAll: () => providers, getRecentRequests: () => [] }, queryEngine, {
+    templateProbeSpeculationDelayMs: 0,
+    requestUsageEngine: { async query() { return { success: false, message: 'not supported' }; } },
+  });
+
+  const result = await service.probeTemplates(item.id);
+
+  assert.equal(result.balance.recommendedTemplateId, 'packy-balance');
+  assert.ok(slowStarts >= 1);
+  assert.equal(slowAborts, slowStarts);
+});
+
+test('Hub automatic detection is not biased by a stale manual balance binding', async () => {
+  const item = {
+    ...provider('manual-browser-probe', '曾经手动绑定的中转'),
+    apiBaseUrl: 'https://manual-probe.example/v1',
+    baseUrl: 'https://manual-probe.example/v1',
+    apiKey: 'manual-probe-private-key',
+  };
+  const balanceCalls = [];
+  const service = new HubService({ getAll: () => [item], getRecentRequests: () => [] }, {
+    async query(_provider, options) {
+      balanceCalls.push(options.balanceTemplateId);
+      if (!['packy-balance', 'new-api-browser-account'].includes(options.balanceTemplateId)) {
+        return { message: 'shape mismatch' };
+      }
+      return {
+        source: 'provider_api',
+        usage: { providerName: item.name, remaining: 7, used: 3, total: 10, unit: 'USD' },
+      };
+    },
+  }, {
+    templateStore: {
+      get() {
+        return { balanceTemplateId: 'new-api-browser-account' };
+      },
+    },
+    requestUsageEngine: { async query() { return { success: false, message: 'not supported' }; } },
+  });
+
+  const result = await service.probeTemplates(item.id);
+
+  assert.equal(result.balance.recommendedTemplateId, 'packy-balance');
+  assert.deepEqual(balanceCalls, ['packy-balance']);
+});
+
+test('Hub checks key-scoped New API capabilities before a built-in browser-account default', async () => {
+  const item = {
+    ...provider('browser-default-probe', 'any的国外我自己的'),
+    apiBaseUrl: 'https://anyrouter.top/v1',
+    baseUrl: 'https://anyrouter.top/v1',
+    apiKey: 'browser-default-private-key',
+  };
+  const balanceCalls = [];
+  const service = new HubService({ getAll: () => [item], getRecentRequests: () => [] }, {
+    async query(_provider, options) {
+      const templateId = options.balanceTemplateId || 'new-api-browser-account';
+      balanceCalls.push(templateId);
+      if (!['packy-balance', 'new-api-browser-account'].includes(templateId)) {
+        return { message: 'shape mismatch' };
+      }
+      return {
+        source: templateId === 'packy-balance' ? 'packy_api_key' : 'new_api_account',
+        usage: { providerName: item.name, remaining: 7, used: 3, total: 10, unit: 'USD' },
+      };
+    },
+  }, {
+    requestUsageEngine: { async query() { return { success: false, message: 'not supported' }; } },
+  });
+
+  const result = await service.probeTemplates(item.id);
+
+  assert.equal(result.balance.recommendedTemplateId, 'packy-balance');
+  assert.deepEqual(balanceCalls, ['packy-balance']);
+});
+
+test('Hub recommends a schema-validated unlimited New API template even when browser login is still required', async () => {
+  const item = {
+    ...provider('unlimited-auto-probe', '新无限额度中转'),
+    apiBaseUrl: 'https://unlimited-probe.example/v1',
+    baseUrl: 'https://unlimited-probe.example/v1',
+    apiKey: 'unlimited-private-key',
+  };
+  const service = new HubService({ getAll: () => [item], getRecentRequests: () => [] }, {
+    async query(_provider, options) {
+      if (options.balanceTemplateId !== 'new-api-key-quota') return { message: 'shape mismatch' };
+      return {
+        source: 'new_api_account',
+        schemaValidated: true,
+        loginRequired: true,
+        sessionSyncRequired: true,
+        message: 'API Key 为无限额度；需要同步官网登录态读取账户总额度',
+      };
+    },
+  }, {
+    requestUsageEngine: { async query() { return { success: false, message: 'not supported' }; } },
+  });
+
+  const result = await service.probeTemplates(item.id);
+
+  assert.equal(result.balance.recommendedTemplateId, 'new-api-key-quota');
+  assert.equal(result.balance.fallbackTemplateId, '');
+  assert.equal(result.balance.results.find(entry => entry.templateId === 'new-api-key-quota').status, 'needs-action');
 });
 
 test('Hub checks the more specific New API reset-period capability before a standard built-in template', async () => {

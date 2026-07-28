@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import {
   classifyProviderRequestLogApp,
+  CodexSessionUsageReader,
+  defaultRequestUsageTemplateId,
   describeProviderRequestUsage,
   isProviderRequestLogRow,
   normalizeRequestUsageLimit,
@@ -9,6 +14,11 @@ import {
   parseProviderRequestLogs,
   ProviderRequestUsageEngine,
 } from '../src/provider-request-usage.mjs';
+
+function writeJsonLines(filename, events) {
+  fs.mkdirSync(path.dirname(filename), { recursive: true });
+  fs.writeFileSync(filename, `${events.map(event => JSON.stringify(event)).join('\n')}\n`, 'utf8');
+}
 
 function statusPayload(overrides = {}) {
   return {
@@ -25,6 +35,129 @@ function statusPayload(overrides = {}) {
 function logPayload(rows) {
   return { success: true, message: '', data: rows };
 }
+
+function accountLogPayload(rows, total = rows.length) {
+  return {
+    success: true,
+    message: '',
+    data: {
+      page: 1,
+      page_size: 100,
+      total,
+      items: rows,
+    },
+  };
+}
+
+test('OpenAI Official reads per-request Token usage from account-scoped Codex session events', async t => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-session-'));
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
+    tokens: { account_id: 'official-account-one', access_token: 'must-never-be-returned' },
+  }), 'utf8');
+
+  writeJsonLines(path.join(codexHome, 'sessions', '2026', '07', '09', 'official.jsonl'), [
+    { timestamp: '2026-07-09T08:35:17.000Z', type: 'session_meta', payload: { id: 'official-session', model_provider: 'openai' } },
+    { timestamp: '2026-07-09T08:35:18.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'private conversation text' } },
+    { timestamp: '2026-07-09T08:35:19.000Z', type: 'turn_context', payload: { turn_id: 'turn-one', model: 'gpt-5.5' } },
+    {
+      timestamp: '2026-07-09T08:36:16.000Z', type: 'event_msg', payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { input_tokens: 10, cached_input_tokens: 4, output_tokens: 3, reasoning_output_tokens: 1, total_tokens: 13 },
+          last_token_usage: { input_tokens: 10, cached_input_tokens: 4, output_tokens: 3, reasoning_output_tokens: 1, total_tokens: 13 },
+        },
+        rate_limits: { plan_type: 'plus' },
+      },
+    },
+    {
+      timestamp: '2026-07-09T08:36:17.000Z', type: 'event_msg', payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { input_tokens: 10, cached_input_tokens: 4, output_tokens: 3, reasoning_output_tokens: 1, total_tokens: 13 },
+          last_token_usage: { input_tokens: 999, cached_input_tokens: 999, output_tokens: 999, reasoning_output_tokens: 999, total_tokens: 1998 },
+        },
+        rate_limits: { plan_type: 'plus' },
+      },
+    },
+    {
+      timestamp: '2026-07-09T08:37:04.000Z', type: 'event_msg', payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { input_tokens: 25, cached_input_tokens: 14, output_tokens: 8, reasoning_output_tokens: 2, total_tokens: 33 },
+          last_token_usage: { input_tokens: 15, cached_input_tokens: 10, output_tokens: 5, reasoning_output_tokens: 1, total_tokens: 20 },
+        },
+        rate_limits: { plan_type: 'plus' },
+      },
+    },
+  ]);
+  writeJsonLines(path.join(codexHome, 'sessions', '2026', '07', '10', 'custom.jsonl'), [
+    { timestamp: '2026-07-10T00:00:00.000Z', type: 'session_meta', payload: { id: 'custom-session', model_provider: 'custom' } },
+    { timestamp: '2026-07-10T00:00:01.000Z', type: 'turn_context', payload: { turn_id: 'turn-custom', model: 'gpt-5.6-sol' } },
+    {
+      timestamp: '2026-07-10T00:00:02.000Z', type: 'event_msg', payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { input_tokens: 9999, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0, total_tokens: 10000 },
+          last_token_usage: { input_tokens: 9999, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0, total_tokens: 10000 },
+        },
+      },
+    },
+  ]);
+
+  const provider = {
+    id: 'openai-owned',
+    name: 'OpenAI Official-我自己的',
+    websiteUrl: 'https://chatgpt.com/codex',
+    auth: { tokens: { account_id: 'official-account-one' } },
+  };
+  assert.equal(defaultRequestUsageTemplateId(provider), 'openai-codex-session');
+  const description = describeProviderRequestUsage(provider);
+  assert.equal(description.supported, true);
+  assert.equal(description.adapter, 'openai-codex-session');
+  assert.equal(description.method, 'LOCAL');
+
+  const engine = new ProviderRequestUsageEngine({
+    codexSessionUsageReader: new CodexSessionUsageReader({ codexHome }),
+  });
+  const result = await engine.query(provider, { limit: 10 });
+  assert.equal(result.success, true);
+  assert.equal(result.source, 'openai_codex_session');
+  assert.equal(result.requestCount, 2);
+  assert.equal(result.billing.available, false);
+  assert.equal(result.billing.exact, false);
+  assert.equal(result.billing.unit, 'subscription');
+  assert.deepEqual(result.items.map(item => ({
+    createdAt: item.createdAt,
+    model: item.model,
+    inputTokens: item.inputTokens,
+    cacheReadTokens: item.cacheReadTokens,
+    outputTokens: item.outputTokens,
+    totalTokens: item.totalTokens,
+    totalCost: item.totalCost,
+    costExact: item.costExact,
+  })), [
+    {
+      createdAt: '2026-07-09T08:37:04.000Z', model: 'gpt-5.5', inputTokens: 15,
+      cacheReadTokens: 10, outputTokens: 5, totalTokens: 20, totalCost: null, costExact: false,
+    },
+    {
+      createdAt: '2026-07-09T08:36:16.000Z', model: 'gpt-5.5', inputTokens: 10,
+      cacheReadTokens: 4, outputTokens: 3, totalTokens: 13, totalCost: null, costExact: false,
+    },
+  ]);
+  assert.doesNotMatch(JSON.stringify(result), /private conversation text|must-never-be-returned|official-account-one/);
+
+  const mismatched = await engine.query({
+    ...provider,
+    id: 'openai-other',
+    name: 'OpenAI Official',
+    auth: { tokens: { account_id: 'different-account' } },
+  });
+  assert.equal(mismatched.success, false);
+  assert.equal(mismatched.errorType, 'account_scope');
+  assert.match(mismatched.message, /当前 Codex 登录账号不匹配/);
+});
 
 test('request-usage descriptions are domain-pinned and do not expose credentials', () => {
   const supported = describeProviderRequestUsage({
@@ -251,6 +384,363 @@ test('request-usage rejects nonempty arrays without recognizable New API log row
   assert.match(result.message, /New API 日志行/);
 });
 
+test('request-usage auto-detection rejects New API arrays without a request activity row', async () => {
+  const engine = new ProviderRequestUsageEngine({
+    fetchImpl: async url => new Response(JSON.stringify(String(url).endsWith('/api/status')
+      ? statusPayload()
+      : logPayload([
+          { id: 3, created_at: 30, type: 1, content: 'top up' },
+          { id: 2, created_at: 20, type: 3, content: 'manage token' },
+          { id: 1, created_at: 10, type: 4, content: 'system event' },
+        ])), { status: 200 }),
+  });
+  const result = await engine.query({
+    id: 'non-consumption-lookalike',
+    name: '只有账户事件的伪逐请求接口',
+    apiBaseUrl: 'https://lookalike.example/v1',
+    apiKey: 'private-key',
+  }, { requestUsageTemplateId: 'new-api-token-log' });
+
+  assert.equal(result.success, false);
+  assert.equal(result.errorType, 'schema');
+  assert.match(result.message, /请求日志/);
+});
+
+test('request-usage auto-detection rejects content-only type-2 lookalikes', async () => {
+  const engine = new ProviderRequestUsageEngine({
+    fetchImpl: async url => new Response(JSON.stringify(String(url).endsWith('/api/status')
+      ? { success: true, data: {} }
+      : logPayload([{ id: 1, created_at: 10, type: 2, content: 'looks like a request' }])), { status: 200 }),
+  });
+  const result = await engine.query({
+    id: 'content-only-lookalike',
+    name: '内容字段伪装的逐请求接口',
+    apiBaseUrl: 'https://lookalike.example/v1',
+    apiKey: 'private-key',
+  }, { requestUsageTemplateId: 'new-api-token-log' });
+
+  assert.equal(result.success, false);
+  assert.equal(result.errorType, 'schema');
+  assert.match(result.message, /请求日志/);
+});
+
+test('request-usage auto-detection rejects request-type rows whose evidence fields are only empty placeholders', async () => {
+  const engine = new ProviderRequestUsageEngine({
+    fetchImpl: async url => new Response(JSON.stringify(String(url).endsWith('/api/status')
+      ? statusPayload()
+      : logPayload([
+          {
+            id: 2, created_at: 20, type: 2, content: '', model_name: '', quota: null,
+            prompt_tokens: null, completion_tokens: null, use_time: null, token_name: '', channel_name: '', other: '',
+          },
+          {
+            id: 1, created_at: 10, type: 5, content: '', model_name: '', quota: null,
+            prompt_tokens: null, completion_tokens: null, use_time: null, token_name: '', channel_name: '', other: '{}',
+          },
+        ])), { status: 200 }),
+  });
+  const result = await engine.query({
+    id: 'empty-placeholder-lookalike',
+    name: '空占位字段伪逐请求接口',
+    apiBaseUrl: 'https://lookalike.example/v1',
+    apiKey: 'private-key',
+  }, { requestUsageTemplateId: 'new-api-token-log' });
+
+  assert.equal(result.success, false);
+  assert.equal(result.errorType, 'schema');
+  assert.match(result.message, /请求日志/);
+});
+
+test('request-usage accepts error-only request logs with zero tokens and cost', async () => {
+  const engine = new ProviderRequestUsageEngine({
+    fetchImpl: async url => new Response(JSON.stringify(String(url).endsWith('/api/status')
+      ? statusPayload()
+      : logPayload([
+          {
+            id: 2, created_at: 20, type: 5, model_name: 'gpt-5.6-sol', quota: 0,
+            prompt_tokens: 0, completion_tokens: 0,
+            other: JSON.stringify({ status_code: 503, request_path: '/v1/responses' }),
+          },
+          {
+            id: 1, created_at: 10, type: 5, model_name: 'gpt-5.6-sol', quota: 0,
+            prompt_tokens: 0, completion_tokens: 0,
+            other: JSON.stringify({ status_code: 503, request_path: '/v1/responses' }),
+          },
+        ])), { status: 200 }),
+  });
+
+  const result = await engine.query({
+    id: 'error-only-new-api',
+    name: '只有失败请求的 New API 站',
+    apiBaseUrl: 'https://relay.example/v1',
+    apiKey: 'private-key',
+  }, { requestUsageTemplateId: 'new-api-token-log', appType: 'codex', strictAppType: true });
+
+  assert.equal(result.success, true);
+  assert.equal(result.source, 'provider_log');
+  assert.equal(result.requestCount, 2);
+  assert.equal(result.items.every(item => item.recordType === 'error' && item.statusCode === 503), true);
+  assert.equal(result.items.every(item => item.totalTokens === 0 && item.totalCost === 0), true);
+});
+
+test('empty Token logs auto-detect safely correlated browser account logs on any New API origin', async () => {
+  const browserCalls = [];
+  let localReads = 0;
+  const engine = new ProviderRequestUsageEngine({
+    now: () => 1_700_000_100_000,
+    fetchImpl: async url => new Response(JSON.stringify(String(url).endsWith('/api/status')
+      ? statusPayload()
+      : logPayload([])), { status: 200 }),
+    browserBroker: {
+      isConnected: () => true,
+      listQueryClients(origin) {
+        assert.equal(origin, 'https://relay.example');
+        return [{ clientRef: 'edge-account-one', browser: 'Edge', hasSession: true }];
+      },
+      async queryJsonOnClient(clientRef, request) {
+        browserCalls.push({ clientRef, request });
+        return {
+          status: 200,
+          text: JSON.stringify(accountLogPayload([
+            {
+              id: 14, created_at: 1_700_000_099, type: 2, token_name: 'current-key', model_name: 'gpt-5.6-sol',
+              quota: 90_000, prompt_tokens: 9_000, completion_tokens: 90,
+              other: JSON.stringify({ request_path: '/v1/responses' }),
+            },
+            {
+              id: 13, created_at: 1_700_000_098, type: 2, token_name: 'current-key', model_name: 'claude-sonnet-4',
+              quota: 80_000, prompt_tokens: 800, completion_tokens: 80,
+              other: JSON.stringify({ request_path: '/v1/messages' }),
+            },
+            {
+              id: 12, created_at: 1_700_000_097, type: 2, token_name: 'current-key', model_name: 'gpt-5.6-sol',
+              quota: 50_000, prompt_tokens: 5_000, completion_tokens: 50,
+              other: JSON.stringify({ request_path: '/v1/responses' }),
+            },
+            {
+              id: 11, created_at: 1_700_000_090, type: 2, token_name: 'current-key', model_name: 'gpt-5.6-sol',
+              quota: 40_000, prompt_tokens: 4_000, completion_tokens: 40,
+              other: JSON.stringify({ request_path: '/v1/responses' }),
+            },
+          ], 4)),
+        };
+      },
+    },
+  });
+
+  const result = await engine.query({
+    id: 'future-new-api',
+    name: '未来 New API 站',
+    apiBaseUrl: 'https://relay.example/v1',
+    apiKey: 'relay-private-key',
+  }, {
+    requestUsageTemplateId: 'new-api-token-log',
+    appType: 'codex',
+    strictAppType: true,
+    getLocalRequestRows() {
+      localReads += 1;
+      return [
+        {
+          createdAt: '2023-11-14T22:14:57.000Z', model: 'gpt-5.6-sol', requestModel: 'gpt-5.6-sol',
+          inputTokens: 5_000, outputTokens: 50, statusCode: 200,
+        },
+        {
+          createdAt: '2023-11-14T22:14:50.000Z', model: 'gpt-5.6-sol', requestModel: 'gpt-5.6-sol',
+          inputTokens: 4_000, outputTokens: 40, statusCode: 200,
+        },
+      ];
+    },
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.source, 'provider_account_log');
+  assert.equal(result.accountLogAutoDetected, true);
+  assert.equal(result.keyAssociation, 'local-correlation');
+  assert.equal(result.requestCount, 2);
+  assert.deepEqual(result.items.map(item => item.id), ['12', '11']);
+  assert.equal(localReads, 1);
+  assert.equal(browserCalls.length, 1);
+  assert.equal(browserCalls[0].clientRef, 'edge-account-one');
+  assert.equal(browserCalls[0].request.userHeader, 'New-Api-User');
+  assert.equal(browserCalls[0].request.headers.Authorization, undefined);
+  assert.match(browserCalls[0].request.requestPath, /^\/api\/log\/self\/\?/);
+  assert.match(browserCalls[0].request.requestPath, /page_size=100/);
+});
+
+test('Token-log WAF failures use the same safely correlated browser account-log fallback', async () => {
+  let tokenBrowserCalls = 0;
+  let accountBrowserCalls = 0;
+  const engine = new ProviderRequestUsageEngine({
+    fetchImpl: async url => {
+      if (String(url).endsWith('/api/status')) {
+        return new Response(JSON.stringify(statusPayload()), { status: 200 });
+      }
+      return new Response('<html>challenge</html>', {
+        status: 403,
+        headers: { 'content-type': 'text/html' },
+      });
+    },
+    browserBroker: {
+      isConnected: () => true,
+      async queryJson() {
+        tokenBrowserCalls += 1;
+        return { status: 403, text: '<html>challenge</html>' };
+      },
+      listQueryClients: () => [{ clientRef: 'edge-account-one', browser: 'Edge', hasSession: true }],
+      async queryJsonOnClient() {
+        accountBrowserCalls += 1;
+        return {
+          status: 200,
+          text: JSON.stringify(accountLogPayload([
+            {
+              id: 32, token_id: 7, created_at: 1_700_000_097, type: 2, token_name: 'current-key',
+              model_name: 'gpt-5.6-sol', quota: 50_000, prompt_tokens: 5_000, completion_tokens: 50,
+              other: JSON.stringify({ request_path: '/v1/responses' }),
+            },
+            {
+              id: 31, token_id: 7, created_at: 1_700_000_090, type: 2, token_name: 'current-key',
+              model_name: 'gpt-5.6-sol', quota: 40_000, prompt_tokens: 4_000, completion_tokens: 40,
+              other: JSON.stringify({ request_path: '/v1/responses' }),
+            },
+          ])),
+        };
+      },
+    },
+  });
+
+  const result = await engine.query({
+    id: 'waf-new-api',
+    name: 'WAF New API 站',
+    apiBaseUrl: 'https://relay.example/v1',
+    apiKey: 'relay-private-key',
+  }, {
+    requestUsageTemplateId: 'new-api-token-log',
+    appType: 'codex',
+    strictAppType: true,
+    getLocalRequestRows: () => [
+      {
+        createdAt: '2023-11-14T22:14:57.000Z', model: 'gpt-5.6-sol', requestModel: 'gpt-5.6-sol',
+        inputTokens: 5_000, outputTokens: 50, statusCode: 200,
+      },
+      {
+        createdAt: '2023-11-14T22:14:50.000Z', model: 'gpt-5.6-sol', requestModel: 'gpt-5.6-sol',
+        inputTokens: 4_000, outputTokens: 40, statusCode: 200,
+      },
+    ],
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.source, 'provider_account_log');
+  assert.equal(result.correlationIdentity, 'token-id');
+  assert.equal(result.requestCount, 2);
+  assert.equal(tokenBrowserCalls, 1);
+  assert.equal(accountBrowserCalls, 1);
+});
+
+test('correlated account logs remain usable when the billing status endpoint is also WAF-blocked', async () => {
+  let accountBrowserCalls = 0;
+  const engine = new ProviderRequestUsageEngine({
+    fetchImpl: async url => new Response('<html>challenge</html>', {
+      status: String(url).endsWith('/api/status') ? 200 : 403,
+      headers: { 'content-type': 'text/html' },
+    }),
+    browserBroker: {
+      isConnected: () => true,
+      async queryJson() {
+        return { status: 403, text: '<html>challenge</html>' };
+      },
+      listQueryClients: () => [{ clientRef: 'edge-account-one', browser: 'Edge', hasSession: true }],
+      async queryJsonOnClient() {
+        accountBrowserCalls += 1;
+        return {
+          status: 200,
+          text: JSON.stringify(accountLogPayload([
+            {
+              id: 42, token_id: 7, created_at: 1_700_000_097, type: 2, token_name: 'current-key',
+              model_name: 'gpt-5.6-sol', quota: 50_000, prompt_tokens: 5_000, completion_tokens: 50,
+              other: JSON.stringify({ request_path: '/v1/responses' }),
+            },
+            {
+              id: 41, token_id: 7, created_at: 1_700_000_090, type: 2, token_name: 'current-key',
+              model_name: 'gpt-5.6-sol', quota: 40_000, prompt_tokens: 4_000, completion_tokens: 40,
+              other: JSON.stringify({ request_path: '/v1/responses' }),
+            },
+          ])),
+        };
+      },
+    },
+  });
+
+  const result = await engine.query({
+    id: 'fully-waf-blocked',
+    name: '完全受 WAF 保护的 New API 站',
+    apiBaseUrl: 'https://relay.example/v1',
+    apiKey: 'relay-private-key',
+  }, {
+    requestUsageTemplateId: 'new-api-token-log',
+    appType: 'codex',
+    strictAppType: true,
+    getLocalRequestRows: () => [
+      {
+        createdAt: '2023-11-14T22:14:57.000Z', model: 'gpt-5.6-sol', requestModel: 'gpt-5.6-sol',
+        inputTokens: 5_000, outputTokens: 50, statusCode: 200,
+      },
+      {
+        createdAt: '2023-11-14T22:14:50.000Z', model: 'gpt-5.6-sol', requestModel: 'gpt-5.6-sol',
+        inputTokens: 4_000, outputTokens: 40, statusCode: 200,
+      },
+    ],
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.source, 'provider_account_log');
+  assert.equal(result.billing.available, false);
+  assert.equal(result.degraded, true);
+  assert.equal(result.requestCount, 2);
+  assert.equal(result.items.every(item => item.costExact === false), true);
+  assert.equal(accountBrowserCalls, 1);
+});
+
+test('account-log auto-detection refuses rows that cannot be attributed to the current provider Key', async () => {
+  const engine = new ProviderRequestUsageEngine({
+    fetchImpl: async url => new Response(JSON.stringify(String(url).endsWith('/api/status')
+      ? statusPayload()
+      : logPayload([])), { status: 200 }),
+    browserBroker: {
+      isConnected: () => true,
+      listQueryClients: () => [{ clientRef: 'edge-account-one', browser: 'Edge', hasSession: true }],
+      async queryJsonOnClient() {
+        return {
+          status: 200,
+          text: JSON.stringify(accountLogPayload([
+            {
+              id: 21, created_at: 1_700_000_000, type: 2, token_name: 'another-key', model_name: 'gpt-5.6-sol',
+              quota: 5_000, prompt_tokens: 500, completion_tokens: 5,
+            },
+          ])),
+        };
+      },
+    },
+  });
+
+  const result = await engine.query({
+    id: 'future-new-api',
+    name: '未来 New API 站',
+    apiBaseUrl: 'https://relay.example/v1',
+    apiKey: 'relay-private-key',
+  }, {
+    requestUsageTemplateId: 'new-api-token-log',
+    getLocalRequestRows: () => [{
+      createdAt: '2023-11-14T22:13:20.000Z', model: 'gpt-5.6-sol', requestModel: 'gpt-5.6-sol',
+      inputTokens: 999, outputTokens: 9, statusCode: 200,
+    }],
+  });
+
+  assert.equal(result.success, false);
+  assert.equal(result.errorType, 'account_scope');
+  assert.match(result.message, /无法归属到当前供应商 API Key/);
+});
+
 test('remote request logs separate Codex from Claude before selecting the latest ten', () => {
   const rows = [
     { id: 4, created_at: 40, type: 2, model_name: 'claude-sonnet-4', quota: 4, other: JSON.stringify({ request_path: '/v1/messages' }) },
@@ -416,6 +906,47 @@ test('legacy New API status without quota_display_type falls back to USD', async
   assert.equal(result.success, true);
   assert.equal(result.billing.unit, 'USD');
   assert.equal(result.items[0].totalCost, 1);
+});
+
+test('request-usage authentication failures never fall through to browser account logs', async () => {
+  let browserCalls = 0;
+  const engine = new ProviderRequestUsageEngine({
+    fetchImpl: async url => new Response(JSON.stringify(String(url).endsWith('/api/status')
+      ? statusPayload()
+      : { success: false, message: 'invalid API key' }), {
+      status: String(url).endsWith('/api/status') ? 200 : 401,
+    }),
+    browserBroker: {
+      isConnected: () => true,
+      async queryJson() {
+        browserCalls += 1;
+        throw new Error('401 must not enter browser fallback');
+      },
+      listQueryClients: () => [{ clientRef: 'edge-account-one', browser: 'Edge', hasSession: true }],
+      async queryJsonOnClient() {
+        browserCalls += 1;
+        throw new Error('401 must not enter account-log fallback');
+      },
+    },
+  });
+
+  const result = await engine.query({
+    id: 'invalid-key',
+    name: '鉴权失败的 New API 站',
+    apiBaseUrl: 'https://relay.example/v1',
+    apiKey: 'invalid-private-key',
+  }, {
+    requestUsageTemplateId: 'new-api-token-log',
+    getLocalRequestRows: () => [{
+      createdAt: '2023-11-14T22:13:20.000Z', model: 'gpt-5.6-sol', requestModel: 'gpt-5.6-sol',
+      inputTokens: 999, outputTokens: 9, statusCode: 200,
+    }],
+  });
+
+  assert.equal(result.success, false);
+  assert.equal(result.httpStatus, 401);
+  assert.equal(result.errorType, 'authentication');
+  assert.equal(browserCalls, 0);
 });
 
 test('request-usage engine returns structured unsupported results without probing official or website-session-only sites', async () => {

@@ -186,6 +186,30 @@ function ccswitchRequestUsageFallback(provider, rows, remoteResult, limit, now) 
   };
 }
 
+function createLocalRequestRowsReader(repository, providerId, minimumLimit = 10) {
+  if (typeof repository?.getRecentRequests !== 'function') return null;
+  let rows;
+  let loadedLimit = 0;
+  let readError = null;
+  return requestedLimit => {
+    if (readError) throw readError;
+    const boundedLimit = Math.max(
+      normalizeRequestUsageLimit(minimumLimit),
+      normalizeRequestUsageLimit(requestedLimit),
+    );
+    if (rows === undefined || boundedLimit > loadedLimit) {
+      try {
+        rows = repository.getRecentRequests(providerId, boundedLimit);
+        loadedLimit = boundedLimit;
+      } catch (error) {
+        readError = error;
+        throw error;
+      }
+    }
+    return rows;
+  };
+}
+
 export function providerConfigurationFingerprint(provider, templateSelection = null) {
   if (!provider) return '';
   const fields = [
@@ -614,10 +638,12 @@ export class HubService {
     // Packy-style responses are a more specific New API capability and overlap the standard token schema.
     const balanceOrder = ['packy-balance', 'new-api-key-quota', 'deepseek-balance', 'window-balance', 'new-api-browser-account'];
     const currentBalance = getBalanceTemplate(selection.balanceTemplateId);
-    const preferredBalance = currentBalance?.autoDetect
+    const preferredBalance = selection.balanceSource === 'builtin' && currentBalance?.autoDetect
       ? selection.balanceTemplateId === 'new-api-key-quota'
         ? ['packy-balance', selection.balanceTemplateId]
-        : [selection.balanceTemplateId]
+        : selection.balanceTemplateId === 'new-api-browser-account'
+          ? ['packy-balance', 'new-api-key-quota', selection.balanceTemplateId]
+          : [selection.balanceTemplateId]
       : [];
     const balanceCandidates = requestedBalance
       ? [requestedBalance]
@@ -627,9 +653,12 @@ export class HubService {
             ...preferredBalance,
             ...balanceOrder.filter(id => getBalanceTemplate(id)?.autoDetect),
           ])];
+    const currentRequestUsage = getRequestUsageTemplate(selection.requestUsageTemplateId);
     const requestCandidates = requestedRequestUsage
       ? [requestedRequestUsage]
-      : ['new-api-token-log'];
+      : currentRequestUsage?.selectable !== true
+        ? [selection.requestUsageTemplateId]
+        : ['new-api-token-log'];
     const controller = new AbortController();
     const timeoutError = new Error(`模板自动识别超过 ${Math.ceil(this.templateProbeTimeoutMs / 1_000)} 秒`);
     const timer = setTimeout(() => controller.abort(timeoutError), this.templateProbeTimeoutMs);
@@ -653,6 +682,7 @@ export class HubService {
         requestUsage,
       };
     } finally {
+      if (!controller.signal.aborted) controller.abort(new Error('模板探测已完成'));
       clearTimeout(timer);
     }
   }
@@ -921,6 +951,8 @@ export class HubService {
       }
     } catch {}
     const sharedAcrossApps = credentialAppTypes.some(appType => appType !== 'codex');
+    const getLocalRequestRows = createLocalRequestRowsReader(this.repository, provider.id, limit);
+    const accountBinding = this.items.get(provider.id)?.accountBinding || null;
     let remoteResult;
     if (!this.requestUsageEngine || typeof this.requestUsageEngine.query !== 'function') {
       remoteResult = {
@@ -943,6 +975,8 @@ export class HubService {
           limit,
           appType: 'codex',
           strictAppType: sharedAcrossApps,
+          ...(getLocalRequestRows ? { getLocalRequestRows } : {}),
+          ...(accountBinding ? { accountBinding } : {}),
           ...(requestUsageTemplateOption ? { requestUsageTemplateId: requestUsageTemplateOption } : {}),
         });
       } catch (error) {
@@ -973,7 +1007,7 @@ export class HubService {
     }
     if (typeof this.repository?.getRecentRequests !== 'function') return remoteResult;
     try {
-      const rows = this.repository.getRecentRequests(provider.id, limit);
+      const rows = getLocalRequestRows ? getLocalRequestRows(limit) : this.repository.getRecentRequests(provider.id, limit);
       if (!Array.isArray(rows)) return remoteResult;
       return ccswitchRequestUsageFallback(provider, rows, remoteResult, limit, this.now);
     } catch (error) {
@@ -1137,6 +1171,7 @@ export class HubService {
     const results = [];
     let recommendedTemplateId = '';
     let fallbackTemplateId = '';
+    const matchesTemplate = result => result?.status === 'success' || result?.schemaValidated === true;
     if (candidates.length) {
       const candidateController = new AbortController();
       const signal = options.signal
@@ -1162,14 +1197,14 @@ export class HubService {
       const firstResult = await first;
       if (speculationTimer) clearTimeout(speculationTimer);
       results.push(firstResult);
-      if (firstResult.status === 'success') {
+      if (matchesTemplate(firstResult)) {
         recommendedTemplateId = candidates[0];
       } else if (!options.signal?.aborted) {
         const pending = startRemaining();
         for (let index = 0; index < pending.length; index += 1) {
           const result = await pending[index];
           results.push(result);
-          if (result.status === 'success') {
+          if (matchesTemplate(result)) {
             recommendedTemplateId = candidates[index + 1];
             break;
           }
@@ -1244,6 +1279,7 @@ export class HubService {
         ...base,
         status: needsAction ? 'needs-action' : 'failed',
         message: safeMessage(result?.message || (localFallback ? '只取得本地回退数据，未验证远端额度结构' : '没有返回可验证的额度数据')),
+        ...(result?.schemaValidated === true ? { schemaValidated: true } : {}),
       };
     } catch (error) {
       return { ...base, message: safeMessage(error) };
@@ -1283,6 +1319,7 @@ export class HubService {
       ? AbortSignal.any([options.signal, controller.signal])
       : controller.signal;
     try {
+      const getLocalRequestRows = createLocalRequestRowsReader(this.repository, provider.id, 10);
       const result = await abortableOperation(this.requestUsageEngine.query(provider, {
         ...(options.useBuiltin === true ? {} : { requestUsageTemplateId: templateId }),
         bypassCache: true,
@@ -1290,6 +1327,8 @@ export class HubService {
         appType: 'codex',
         signal,
         requestCache: options.requestCache,
+        ...(getLocalRequestRows ? { getLocalRequestRows } : {}),
+        accountBinding: this.items.get(provider.id)?.accountBinding || null,
       }), signal);
       if (result?.success === true) {
         return {

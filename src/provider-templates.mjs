@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { isTrustedHttpUrl } from './http-allowlist.mjs';
 
-export const PROVIDER_TEMPLATE_REGISTRY_VERSION = 1;
+export const PROVIDER_TEMPLATE_REGISTRY_VERSION = 2;
 
 const BALANCE_TEMPLATES = Object.freeze([
   Object.freeze({
@@ -79,9 +80,19 @@ const BALANCE_TEMPLATES = Object.freeze([
 
 const REQUEST_USAGE_TEMPLATES = Object.freeze([
   Object.freeze({
+    id: 'openai-codex-session',
+    label: 'Codex 官方会话 Token',
+    description: '读取本机 Codex 官方会话 token_count；Token 精确，ChatGPT 套餐不提供逐请求金额。',
+    family: 'openai',
+    variant: 'codex-session-token-count',
+    selectable: false,
+    autoDetect: false,
+    requiresBrowser: false,
+  }),
+  Object.freeze({
     id: 'new-api-token-log',
     label: 'New API 逐请求日志',
-    description: '使用 /api/log/token 与 /api/status 读取真实 Token 和扣费。',
+    description: '优先使用 /api/log/token 与 /api/status；仅在账户日志可严格归属到同一 Token 时回退 /api/log/self。',
     family: 'new-api',
     variant: 'token-request-log',
     selectable: true,
@@ -143,9 +154,7 @@ export function normalizeProviderTemplateOrigin(provider) {
   if (!value) return '';
   try {
     const url = new URL(value);
-    const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
-    const loopback = ['127.0.0.1', 'localhost', '::1'].includes(hostname);
-    if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) return '';
+    if (url.protocol !== 'https:' && !isTrustedHttpUrl(url, provider)) return '';
     return url.origin;
   } catch {
     return '';

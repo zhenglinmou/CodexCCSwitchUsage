@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import { PROVIDER_QUERY_TIMEOUT_MS } from '../browser-companion/protocol.js';
 import { normalizeUsage, readResponseTextLimited } from './usage-client.mjs';
 import { getBalanceTemplate, normalizeProviderTemplateOrigin } from './provider-templates.mjs';
+import { isTrustedHttpUrl } from './http-allowlist.mjs';
 
 const WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage';
 const QUOTA_PER_USD = 500_000;
@@ -135,6 +136,11 @@ function parseQuotaWindow(value, label) {
   const used = schemaNumber(source.used, `${label}.used`);
   const remaining = schemaNumber(source.remaining, `${label}.remaining`);
   if (total <= 0) throw new Error(`窗口额度响应中的 ${label}.total 必须大于 0`);
+  const expectedTotal = used + remaining;
+  const totalTolerance = Math.max(1e-6, Math.abs(total) * 1e-9);
+  if (Math.abs(total - expectedTotal) > totalTolerance) {
+    throw new Error(`窗口额度响应中的 ${label}.total 必须等于 used + remaining`);
+  }
   return { total, used, remaining };
 }
 
@@ -166,6 +172,17 @@ function parseKnownNewApiDisplayPayload(payload, providerLabel) {
   const data = record(root?.data);
   if (root?.success !== true || !data) throw new Error(String(root?.message || `${providerLabel}站点配置响应缺少 success/data`));
   const displayType = String(data.quota_display_type || '').trim().toUpperCase();
+  if (!displayType) {
+    if (typeof data.display_in_currency !== 'boolean') {
+      throw new Error(`${providerLabel}站点配置缺少有效 quota_display_type`);
+    }
+    if (data.display_in_currency === false) return { quotaPerUnit: 1, multiplier: 1, unit: 'quota' };
+    const legacyQuotaPerUnit = data.quota_per_unit == null
+      ? QUOTA_PER_USD
+      : schemaNumber(data.quota_per_unit, 'quota_per_unit');
+    if (legacyQuotaPerUnit <= 0) throw new Error(`${providerLabel}站点配置中的 quota_per_unit 必须大于 0`);
+    return { quotaPerUnit: legacyQuotaPerUnit, multiplier: 1, unit: 'USD' };
+  }
   if (!['USD', 'CNY', 'CUSTOM', 'TOKENS'].includes(displayType)) throw new Error(`${providerLabel}站点配置缺少有效 quota_display_type`);
   if (displayType === 'TOKENS') return { quotaPerUnit: 1, multiplier: 1, unit: 'tokens' };
   const quotaPerUnit = schemaNumber(data.quota_per_unit, 'quota_per_unit');
@@ -215,6 +232,11 @@ function parseKnownNewApiTokenPayload(payload, display, providerLabel) {
   const remainingQuota = schemaNumber(data.total_available, 'total_available');
   const usedQuota = schemaNumber(data.total_used, 'total_used');
   const totalQuota = schemaNumber(data.total_granted, 'total_granted');
+  const expectedTotalQuota = remainingQuota + usedQuota;
+  const totalTolerance = Math.max(1e-6, Math.abs(totalQuota) * 1e-9);
+  if (Math.abs(totalQuota - expectedTotalQuota) > totalTolerance) {
+    throw new Error(`${providerLabel} API Key 额度响应中的 total_granted 与 total_available + total_used 不一致`);
+  }
   return {
     name,
     unlimited: false,
@@ -348,8 +370,7 @@ function providerApiBase(provider) {
   if (!value) return '';
   try {
     const url = new URL(value);
-    const loopback = ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(url.hostname.toLowerCase());
-    if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) return '';
+    if (url.protocol !== 'https:' && !isTrustedHttpUrl(url, provider)) return '';
     return value;
   } catch {
     return '';
@@ -781,17 +802,24 @@ export function describeProviderQuery(provider, templateId = '') {
       jianzhile: '简直了', freely: 'freely', muyuan: '君的公益', welfare: '无名公益站', mofa: '魔方公益站',
     };
     const label = labels[kind] || provider.name || 'New API';
+    const browserFallbackAllowed = origin.startsWith('https://');
     return {
       ...common,
       type: 'api-key-with-account-fallback',
       label: `${label} API Key / 账户总额度`,
       requestUrl: safeRequestUrl(origin, '/api/usage/token/'),
-      authentication: `有限 Key 使用 Bearer API Key，无需官网登录；无限 Key 使用 ${label} 官网登录态`,
-      executor: '有限 Key 直接查询；WAF 或无限 Key 时由 Edge/Chrome 浏览器伴侣执行同源查询',
-      waf: true,
+      authentication: browserFallbackAllowed
+        ? `有限 Key 使用 Bearer API Key，无需官网登录；无限 Key 使用 ${label} 官网登录态`
+        : '有限 Key 使用 Bearer API Key；该 HTTP 例外不使用浏览器登录态',
+      executor: browserFallbackAllowed
+        ? '有限 Key 直接查询；WAF 或无限 Key 时由 Edge/Chrome 浏览器伴侣执行同源查询'
+        : 'Balance Hub 本机宿主直接查询；HTTP 例外不进入浏览器伴侣',
+      waf: browserFallbackAllowed,
       notes: [
         '有限 API Key 显示 Key 自身额度；无限 API Key 不显示占位额度',
-        '浏览器回退只访问 CCSwitch 配置的同一 HTTPS Origin',
+        browserFallbackAllowed
+          ? '浏览器回退只访问 CCSwitch 配置的同一 HTTPS Origin'
+          : 'HTTP 例外只匹配本机允许列表中的供应商 ID 与精确 Origin',
         'Cookie 和 Token 原文不进入 Hub 页面',
       ],
     };
@@ -1307,7 +1335,8 @@ export class ProviderQueryEngine {
       case 'freely': return this.#queryFreely(provider, signal, requestCache);
       case 'muyuan': return this.#queryMuyuan(provider, signal, requestCache);
       case 'welfare': return this.#queryWelfare(provider, signal, requestCache);
-      default:
+      default: {
+        const browserApiFallback = normalizeProviderTemplateOrigin(provider).startsWith('https://');
         return this.#queryKnownNewApi(provider, signal, {
           label: provider.name || 'New API 供应商',
           apiKeySource: 'new_api_key',
@@ -1315,12 +1344,13 @@ export class ProviderQueryEngine {
           browserSource: 'new_api_browser',
           finiteExtra: '',
           accountExtra: '',
-          browserApiFallback: true,
-          verifyAccountOwnership: true,
+          browserApiFallback,
+          verifyAccountOwnership: browserApiFallback,
           directTimeoutMs: 8_000,
           directAttempts: 1,
-          loginConfig: loginConfiguration(provider, 'new-api-key-quota'),
+          loginConfig: browserApiFallback ? loginConfiguration(provider, 'new-api-key-quota') : null,
         }, requestCache);
+      }
     }
   }
 
@@ -1462,6 +1492,7 @@ export class ProviderQueryEngine {
     if (typeof this.browserBroker?.isConnected !== 'function' || !this.browserBroker.isConnected()) {
       return {
         source: site.accountSource,
+        schemaValidated: true,
         loginRequired: true,
         sessionSyncRequired: true,
         message: `${site.label} API Key 为无限额度；请连接并同步 ${site.label} 官网登录态，以读取账户总额度`,

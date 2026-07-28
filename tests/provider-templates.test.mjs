@@ -23,7 +23,7 @@ function provider(overrides = {}) {
 
 test('provider template catalog exposes independent balance and request usage choices', () => {
   const catalog = listProviderTemplates();
-  assert.equal(catalog.version, 1);
+  assert.equal(catalog.version, 2);
   assert.equal(getBalanceTemplate('new-api-key-quota')?.selectable, true);
   assert.equal(getBalanceTemplate('new-api-key-quota')?.family, 'new-api');
   assert.equal(getBalanceTemplate('new-api-key-quota')?.variant, 'standard-key-quota');
@@ -32,6 +32,7 @@ test('provider template catalog exposes independent balance and request usage ch
   assert.equal(getBalanceTemplate('openai-wham')?.selectable, false);
   assert.equal(getRequestUsageTemplate('new-api-token-log')?.autoDetect, true);
   assert.equal(getRequestUsageTemplate('new-api-token-log')?.family, 'new-api');
+  assert.equal(getRequestUsageTemplate('openai-codex-session')?.selectable, false);
   assert.equal(getRequestUsageTemplate('ccswitch-local')?.fallback, true);
   assert.ok(catalog.balance.length >= 6);
   assert.ok(catalog.requestUsage.length >= 2);

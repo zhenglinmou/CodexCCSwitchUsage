@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { createUsageEvaluator } from './evaluator.mjs';
+import { isTrustedHttpUrl } from './http-allowlist.mjs';
 
 export const MAX_USAGE_RESPONSE_BYTES = 2_000_000;
 
@@ -113,7 +114,7 @@ export async function queryUsage(provider, options = {}) {
 
     const url = new URL(request.url);
     if (!['https:', 'http:'].includes(url.protocol)) throw new Error('额度接口协议不受支持');
-    if (url.protocol === 'http:' && !['127.0.0.1', 'localhost', '::1'].includes(url.hostname)) {
+    if (url.protocol === 'http:' && !isTrustedHttpUrl(url, provider)) {
       throw new Error('非本地额度接口必须使用 HTTPS');
     }
 
