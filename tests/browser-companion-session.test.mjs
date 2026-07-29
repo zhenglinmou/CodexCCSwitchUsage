@@ -303,7 +303,7 @@ test('browser companion bounds a whole provider job and the in-page fetch', () =
   assert.match(source, /signal: controller\.signal/);
   assert.match(source, /maximumBytes: MAX_BROWSER_RESPONSE_BYTES/);
   assert.match(source, /await withTimeout\(\s*chrome\.scripting\.executeScript\(/);
-  assert.match(source, /const expectedBytes =/);
+  assert.doesNotMatch(source, /const expectedBytes =/);
   assert.match(source, /JSON\.parse\(trimmedText\)/);
   assert.match(source, /cancel\('response complete'\)/);
   assert.match(source, /world: 'ISOLATED'/);
@@ -319,7 +319,14 @@ test('companion and host negotiate an explicit protocol and capability set', () 
   assert.equal(companionCompatibility(handshake).compatible, true);
   assert.equal(companionCompatibility({ protocolVersion: COMPANION_PROTOCOL_VERSION, capabilities: [] }).compatible, false);
   assert.throws(() => assertHostJobCompatibility({ protocolVersion: COMPANION_PROTOCOL_VERSION + 1 }), /协议不兼容/);
-  assert.equal(assertHostJobCompatibility({ protocolVersion: COMPANION_PROTOCOL_VERSION }), true);
+  assert.equal(assertHostJobCompatibility({
+    protocolVersion: COMPANION_PROTOCOL_VERSION,
+    claimToken: 'a'.repeat(32),
+  }), true);
+  assert.throws(
+    () => assertHostJobCompatibility({ protocolVersion: COMPANION_PROTOCOL_VERSION }),
+    /领取凭据/,
+  );
 });
 
 test('browser response reading rejects early and cancels an oversized byte stream', async () => {
@@ -382,6 +389,34 @@ test('browser response reading returns complete JSON without waiting for an endl
   assert.equal(result, '{"success":true,"data":{"quota":1}}');
   assert.equal(reads, 1);
   assert.equal(cancelled, true);
+});
+
+test('compressed response length never truncates the decoded JSON stream', async () => {
+  const encoder = new TextEncoder();
+  const chunks = [encoder.encode('{"success":'), encoder.encode('true,"data":{"quota":1}}')];
+  let reads = 0;
+  const response = {
+    // Fetch exposes decoded body bytes while Content-Length may describe the
+    // smaller compressed transfer representation.
+    headers: { get: name => name === 'content-length' ? String(chunks[0].byteLength) : null },
+    body: {
+      getReader() {
+        return {
+          async read() {
+            const value = chunks[reads];
+            reads += 1;
+            return value ? { done: false, value } : { done: true, value: undefined };
+          },
+          async cancel() {},
+          releaseLock() {},
+        };
+      },
+    },
+  };
+
+  const text = await readLimitedResponseText(response);
+  assert.deepEqual(JSON.parse(text), { success: true, data: { quota: 1 } });
+  assert.equal(reads, 2, 'the decoded stream must continue beyond the transfer Content-Length');
 });
 
 test('browser companion bounds loopback traffic, transport attempts, and result delivery', () => {
@@ -450,13 +485,14 @@ test('successful browser queries remember user identity and explicit auth failur
 test('a successful browser job never submits a synthetic failure when result delivery fails', () => {
   const source = fs.readFileSync(new URL('../browser-companion/background.js', import.meta.url), 'utf8');
   const poll = source.slice(source.indexOf('async function pollOnce('), source.indexOf('async function startPolling('));
-  const successPost = poll.indexOf("{ ok: true, value }");
-  const failurePost = poll.indexOf("{\n      ok: false,");
+  const successPost = poll.indexOf("{ ...claim, ok: true, value }");
+  const failurePost = poll.indexOf("{\n      ...claim,\n      ok: false,");
 
   assert.ok(successPost >= 0, 'successful jobs must submit their actual value');
   assert.ok(failurePost >= 0, 'execution failures must still be reported');
   assert.ok(failurePost < successPost, 'the failure handler must be limited to execution, before success delivery');
   assert.doesNotMatch(poll.slice(successPost), /catch \(error\)[\s\S]*ok: false/);
+  assert.match(poll, /const claim = \{[\s\S]*clientId: current\.clientId,[\s\S]*instanceId,[\s\S]*claimToken: job\.claimToken/);
 });
 
 test('idle job polling announces persisted sessions once instead of re-reading them for every long poll', () => {

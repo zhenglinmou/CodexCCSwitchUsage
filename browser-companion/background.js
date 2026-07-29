@@ -271,7 +271,6 @@ async function fetchInsideTab(tabId, request, timeoutMs) {
         const contentLength = contentLengthHeader == null || String(contentLengthHeader).trim() === ''
           ? null
           : Number(contentLengthHeader);
-        const expectedBytes = Number.isFinite(contentLength) && contentLength >= 0 ? contentLength : null;
         if (Number.isFinite(contentLength) && contentLength > settings.maximumBytes) throw new Error('第三方网站响应过大');
         if (!response.body || typeof response.body.getReader !== 'function') {
           const text = await response.text();
@@ -300,11 +299,6 @@ async function fetchInsideTab(tabId, request, timeoutMs) {
               throw error;
             }
             text += decoder.decode(bytes, { stream: true });
-            if (expectedBytes != null && receivedBytes >= expectedBytes) {
-              text += decoder.decode();
-              cancel('response complete');
-              return text;
-            }
             const trimmedText = text.trim();
             if (trimmedText.startsWith('{') || trimmedText.startsWith('[')) {
               try {
@@ -554,6 +548,12 @@ async function pollOnce(current) {
     ? Math.min(localDeadline, hostExpiresAt - BROWSER_RESULT_DELIVERY_RESERVE_MS)
     : localDeadline;
   const executionTimeoutMs = deadline - startedAt;
+  const claim = {
+    clientId: current.clientId,
+    instanceId,
+    browser: current.browser,
+    claimToken: job.claimToken,
+  };
   let value;
   let outcome = null;
   try {
@@ -572,13 +572,14 @@ async function pollOnce(current) {
     }
   } catch (error) {
     await post(current.token, `/companion/result/${encodeURIComponent(job.id)}`, {
+      ...claim,
       ok: false,
       message: error instanceof Error ? error.message : String(error),
     });
     scheduleHeartbeat();
     return true;
   }
-  await post(current.token, `/companion/result/${encodeURIComponent(job.id)}`, { ok: true, value });
+  await post(current.token, `/companion/result/${encodeURIComponent(job.id)}`, { ...claim, ok: true, value });
   if (outcome) scheduleHeartbeat();
   return true;
 }

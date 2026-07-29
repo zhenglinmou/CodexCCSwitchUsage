@@ -13,6 +13,9 @@ if ($packageMarker.name -ne 'codex-ccswitch-usage') { throw '扩展安装标识�
 
 $runtime = Join-Path $root 'runtime'
 [IO.Directory]::CreateDirectory($runtime) | Out-Null
+$aclScript = Join-Path $root 'scripts\harden-acl.ps1'
+if (-not (Test-Path -LiteralPath $aclScript -PathType Leaf)) { throw "缺少 ACL 加固脚本：$aclScript" }
+& $aclScript -InstallRoot $root -RuntimeOnly
 
 function ConvertTo-NodeProxyUrl {
     param([string]$Value)

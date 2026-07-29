@@ -245,7 +245,7 @@ export class HubServer {
     const legacyBalanceMatch = url.pathname.match(/^\/usage\/([^/]+)$/);
     if (request.method === 'GET' && legacyBalanceMatch) {
       const selector = decodeURIComponent(legacyBalanceMatch[1]);
-      jsonResponse(response, 200, await this.service.queryBalance(selector));
+      jsonResponse(response, 200, this.service.getBalance(selector));
       return;
     }
     if (request.method === 'GET' && url.pathname === this.pagePath) {
@@ -388,7 +388,12 @@ export class HubServer {
     if (request.method === 'POST' && companionResultMatch) {
       if (!this.browserBroker) throw new Error('浏览器伴侣回调未启用');
       const body = await readBody(request, 2_100_000);
-      const accepted = this.browserBroker.complete(decodeURIComponent(companionResultMatch[1]), body);
+      const { clientId, instanceId, browser, claimToken, ...result } = body;
+      const accepted = this.browserBroker.complete(
+        decodeURIComponent(companionResultMatch[1]),
+        result,
+        { clientId, instanceId, browser, claimToken },
+      );
       jsonResponse(response, accepted ? 200 : 404, { success: accepted });
       return;
     }

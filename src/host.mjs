@@ -60,7 +60,10 @@ const cachePath = path.join(args.runtimeDir, 'usage-cache.json');
 const repository = new ProviderRepository(args.database);
 const browserBroker = new BrowserCallbackBroker();
 const hubQueryEngine = new ProviderQueryEngine(repository, browserBroker);
-const providerRequestUsageEngine = new ProviderRequestUsageEngine({ browserBroker });
+const providerRequestUsageEngine = new ProviderRequestUsageEngine({
+  browserBroker,
+  codexSessionUsageOptions: { indexPath: path.join(args.runtimeDir, 'codex-session-index.json') },
+});
 const providerTemplateStore = new ProviderTemplateStore(path.join(args.runtimeDir, 'hub-template-bindings.json'));
 const hubService = new HubService(repository, hubQueryEngine, {
   cachePath: path.join(args.runtimeDir, 'hub-cache.json'),

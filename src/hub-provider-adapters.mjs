@@ -469,6 +469,27 @@ function abortable(operation, signal) {
   });
 }
 
+function abortableDelay(delayMs, signal) {
+  const duration = Math.max(0, Number(delayMs) || 0);
+  if (signal?.aborted) return Promise.reject(signal.reason || new Error('请求已取消'));
+  if (duration === 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal?.removeEventListener('abort', abort);
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cleanup();
+      callback(value);
+    };
+    const abort = () => finish(reject, signal.reason || new Error('请求已取消'));
+    const timer = setTimeout(() => finish(resolve), duration);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+  });
+}
+
 function sharedJsonRequestKey(url, headers = {}) {
   const normalizedHeaders = Object.entries(headers || {})
     .filter(([name]) => String(name).toLowerCase() !== 'user-agent')
@@ -541,7 +562,10 @@ export async function fetchJson(fetchImpl, url, headers, timeoutMs = 40_000, att
     }
     const remainingAfterAttemptMs = deadline - Date.now();
     if (remainingAfterAttemptMs <= 1) break;
-    await new Promise(resolve => setTimeout(resolve, Math.min(Math.max(0, retryDelayMs), remainingAfterAttemptMs - 1)));
+    await abortableDelay(
+      Math.min(Math.max(0, retryDelayMs), remainingAfterAttemptMs - 1),
+      externalSignal,
+    );
   }
   if (lastResult) return lastResult;
   throw lastError || new Error(`余额接口请求超过 ${Math.ceil(totalTimeoutMs / 1_000)} 秒`);

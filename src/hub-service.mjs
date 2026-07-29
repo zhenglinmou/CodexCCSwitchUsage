@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import path from 'node:path';
 import {
   defaultBalanceTemplateId,
   describeProviderQuery,
@@ -327,6 +328,18 @@ function sameAnyRouterCredential(left, right) {
   return Boolean(apiKey && apiKey === String(right?.apiKey || ''));
 }
 
+function canonicalAnyRouterRequestProvider(provider, providers) {
+  if (providerKind(provider) !== 'anyrouter') return provider;
+  return [...providers].find(candidate => {
+    if (providerKind(candidate) !== 'anyrouter' || !sameAnyRouterCredential(provider, candidate)) return false;
+    try {
+      return new URL(String(candidate.apiBaseUrl || candidate.baseUrl || '')).hostname.toLowerCase() === 'anyrouter.top';
+    } catch {
+      return false;
+    }
+  }) || provider;
+}
+
 function sameAccountBinding(left, right) {
   const first = safeAccountBinding(left);
   const second = safeAccountBinding(right);
@@ -427,6 +440,7 @@ export class HubService {
     this.refreshAllActiveFull = false;
     this.cacheBatchDepth = 0;
     this.cacheDirty = false;
+    this.cacheError = '';
     this.revision = 0;
     this.providerSnapshot = null;
     this.publicProvidersCache = null;
@@ -537,6 +551,7 @@ export class HubService {
       refreshing: this.refreshes.size > 0,
       lastFullRefreshAt: this.lastFullRefreshAt,
       lastFullRefreshDurationMs: this.lastFullRefreshDurationMs,
+      cacheError: this.cacheError,
       providers: [...this.items.values()].map(item => this.#publicItem(item, this.refreshes.has(item.id))),
     };
   }
@@ -718,7 +733,11 @@ export class HubService {
     const activeRefresh = this.refreshes.get(id);
     const currentFingerprint = String(this.items.get(id)?.providerFingerprint || '');
     if (activeRefresh) {
-      if (activeRefresh.provider === resolved && activeRefresh.fingerprint === currentFingerprint) {
+      if (
+        activeRefresh.provider === resolved
+        && activeRefresh.fingerprint === currentFingerprint
+        && sameAccountBinding(activeRefresh.accountBinding, this.items.get(id)?.accountBinding)
+      ) {
         return activeRefresh.promise;
       }
       return activeRefresh.promise.catch(() => null).then(() => this.refreshProvider(id));
@@ -730,10 +749,17 @@ export class HubService {
     this.items.set(id, { ...previous, status: previous.usage ? previous.status : 'loading', message: '' });
     this.revision += 1;
     const controller = new AbortController();
-    const refresh = { provider, fingerprint: refreshFingerprint, controller, promise: null };
+    const refresh = {
+      provider,
+      fingerprint: refreshFingerprint,
+      accountBinding: previous.accountBinding || null,
+      controller,
+      promise: null,
+    };
     const isCurrentSnapshot = () => this.providers.get(id) === provider
       && this.items.has(id)
-      && String(this.items.get(id)?.providerFingerprint || '') === refreshFingerprint;
+      && String(this.items.get(id)?.providerFingerprint || '') === refreshFingerprint
+      && sameAccountBinding(previous.accountBinding, this.items.get(id)?.accountBinding);
     const promise = Promise.resolve().then(async () => {
       try {
         const anyRouterCredentials = providerKind(provider) === 'anyrouter'
@@ -941,18 +967,20 @@ export class HubService {
         message: `Unknown provider: ${String(providerSelector || '')}`,
       };
     }
+    const requestProvider = canonicalAnyRouterRequestProvider(provider, this.providers.values());
     const limit = normalizeRequestUsageLimit(options.limit);
-    const templateSelection = this.items.get(provider.id)?.templateSelection || templateSelectionFor(provider, this.templateStore);
+    const templateSelection = this.items.get(requestProvider.id)?.templateSelection
+      || templateSelectionFor(requestProvider, this.templateStore);
     const requestUsageTemplateOption = selectedTemplateOption(templateSelection, 'requestUsage');
     let credentialAppTypes = ['codex'];
     try {
       if (typeof this.repository?.getCredentialAppTypes === 'function') {
-        credentialAppTypes = this.repository.getCredentialAppTypes(provider.apiKey);
+        credentialAppTypes = this.repository.getCredentialAppTypes(requestProvider.apiKey);
       }
     } catch {}
     const sharedAcrossApps = credentialAppTypes.some(appType => appType !== 'codex');
-    const getLocalRequestRows = createLocalRequestRowsReader(this.repository, provider.id, limit);
-    const accountBinding = this.items.get(provider.id)?.accountBinding || null;
+    const getLocalRequestRows = createLocalRequestRowsReader(this.repository, requestProvider.id, limit);
+    const accountBinding = this.items.get(requestProvider.id)?.accountBinding || null;
     let remoteResult;
     if (!this.requestUsageEngine || typeof this.requestUsageEngine.query !== 'function') {
       remoteResult = {
@@ -970,7 +998,7 @@ export class HubService {
       };
     } else {
       try {
-        remoteResult = await this.requestUsageEngine.query(provider, {
+        remoteResult = await this.requestUsageEngine.query(requestProvider, {
           ...options,
           limit,
           appType: 'codex',
@@ -979,6 +1007,13 @@ export class HubService {
           ...(accountBinding ? { accountBinding } : {}),
           ...(requestUsageTemplateOption ? { requestUsageTemplateId: requestUsageTemplateOption } : {}),
         });
+        if (requestProvider.id !== provider.id) {
+          remoteResult = {
+            ...remoteResult,
+            providerId: provider.id,
+            providerName: provider.name,
+          };
+        }
       } catch (error) {
         remoteResult = {
           success: false,
@@ -1057,7 +1092,16 @@ export class HubService {
     if (!provider) throw new Error('CCSwitch 中不存在这个 Codex 供应商');
     if (providerKind(provider) !== 'anyrouter') throw new Error('只有 AnyRouter 支持显式浏览器账号绑定');
     if (typeof this.queryEngine?.bindBrowserAccount !== 'function') throw new Error('当前余额适配器不支持浏览器账号绑定');
+    const id = provider.id;
+    const fingerprint = this.getProviderConfigurationFingerprint(provider);
     const result = await this.queryEngine.bindBrowserAccount(provider, { clientRef: String(options.clientRef || '').trim() });
+    this.syncProviders();
+    const currentProvider = this.providers.get(id);
+    if (
+      currentProvider !== provider
+      || !this.items.has(id)
+      || this.getProviderConfigurationFingerprint(currentProvider) !== fingerprint
+    ) throw new Error('供应商在账号绑定期间已变更');
     if (result?.failure) {
       return {
         ...this.#publicItem(this.items.get(provider.id)),
@@ -1067,6 +1111,7 @@ export class HubService {
     }
     const binding = safeAccountBinding(result?.binding);
     if (!binding) throw new Error('AnyRouter 账号绑定结果无效');
+    const previousItems = new Map(this.items);
     const targets = [...this.providers.values()].filter(candidate => (
       providerKind(candidate) === 'anyrouter'
       && (candidate.id === provider.id || sameAnyRouterCredential(provider, candidate))
@@ -1088,7 +1133,11 @@ export class HubService {
       });
     }
     this.revision += 1;
-    this.#writeCache();
+    if (!this.#writeCache(true)) {
+      this.items = previousItems;
+      this.revision += 1;
+      throw new Error(`AnyRouter 账号绑定未能保存：${this.cacheError || 'Hub 缓存不可写'}`);
+    }
     await this.refreshProvider(provider.id);
     return this.#publicItem(this.items.get(provider.id));
   }
@@ -1098,6 +1147,7 @@ export class HubService {
     if (!provider) throw new Error('CCSwitch 中不存在这个 Codex 供应商');
     if (providerKind(provider) !== 'anyrouter') throw new Error('只有 AnyRouter 支持显式浏览器账号绑定');
     const selected = this.items.get(provider.id);
+    const previousItems = new Map(this.items);
     const targets = [...this.providers.values()].filter(candidate => (
       providerKind(candidate) === 'anyrouter'
       && (candidate.id === provider.id || (
@@ -1122,7 +1172,11 @@ export class HubService {
       });
     }
     this.revision += 1;
-    this.#writeCache();
+    if (!this.#writeCache(true)) {
+      this.items = previousItems;
+      this.revision += 1;
+      throw new Error(`AnyRouter 账号解绑未能保存：${this.cacheError || 'Hub 缓存不可写'}`);
+    }
     return this.#publicItem(this.items.get(provider.id));
   }
 
@@ -1397,18 +1451,26 @@ export class HubService {
     };
   }
 
-  #writeCache() {
-    if (!this.cachePath) return;
-    if (this.cacheBatchDepth > 0) {
+  #writeCache(force = false) {
+    if (!this.cachePath) return true;
+    if (this.cacheBatchDepth > 0 && !force) {
       this.cacheDirty = true;
-      return;
+      return true;
     }
+    const temporary = `${this.cachePath}.tmp`;
     try {
-      const temporary = `${this.cachePath}.tmp`;
+      fs.mkdirSync(path.dirname(this.cachePath), { recursive: true });
       fs.writeFileSync(temporary, JSON.stringify({ version: 2, providers: [...this.items.values()] }), 'utf8');
       fs.renameSync(temporary, this.cachePath);
       this.cacheDirty = false;
-    } catch {}
+      this.cacheError = '';
+      return true;
+    } catch (error) {
+      this.cacheDirty = true;
+      this.cacheError = safeMessage(error);
+      try { fs.rmSync(temporary, { force: true }); } catch {}
+      return false;
+    }
   }
 }
 

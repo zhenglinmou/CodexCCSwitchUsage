@@ -285,8 +285,10 @@ test('Hub server protects its local page and API with an unguessable path token'
   const providers = await fetch(`http://127.0.0.1:${server.boundPort}/v1/providers`);
   assert.equal((await providers.json()).providers[0].aliases[1], 'agentrouter');
   const balance = await fetch(`http://127.0.0.1:${server.boundPort}/usage/agentrouter`);
-  assert.equal((await balance.json()).data.remaining, 9);
-  assert.deepEqual(balanceCalls, ['agentrouter']);
+  const legacyPayload = await balance.json();
+  assert.equal(legacyPayload.data.remaining, 8);
+  assert.equal(legacyPayload.cache_only, true);
+  assert.deepEqual(balanceCalls, []);
 
   const cachedBalance = await fetch(`http://127.0.0.1:${server.boundPort}/v1/balance/agentrouter`);
   const cachedPayload = await cachedBalance.json();
@@ -294,8 +296,8 @@ test('Hub server protects its local page and API with an unguessable path token'
   assert.equal(cachedPayload.cache_only, true);
   const cachedBalances = await fetch(`http://127.0.0.1:${server.boundPort}/v1/balances`);
   assert.equal((await cachedBalances.json()).cache_only, true);
-  assert.deepEqual(cachedBalanceCalls, ['agentrouter']);
-  assert.deepEqual(balanceCalls, ['agentrouter'], 'v1 cache reads must not trigger provider queries');
+  assert.deepEqual(cachedBalanceCalls, ['agentrouter', 'agentrouter']);
+  assert.deepEqual(balanceCalls, [], 'public cache reads must not trigger provider queries');
 
   const crossSite = await fetch(`http://127.0.0.1:${server.boundPort}/v1/balance/agentrouter`, {
     headers: { 'sec-fetch-site': 'cross-site' },
@@ -391,7 +393,10 @@ test('browser companion jobs and callbacks share the Hub server and token', asyn
   assert.equal(broker.hasSession('https://chatgpt.com'), true);
   const callback = await fetch(`${api}/companion/result/${job.id}`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ ok: true, value: { status: 200, text: '{"success":true}' } }),
+    body: JSON.stringify({
+      clientId: 'edge-client-one', instanceId: 'edge-worker-one', browser: 'Edge', claimToken: job.claimToken,
+      ok: true, value: { status: 200, text: '{"success":true}' },
+    }),
   });
   assert.equal(callback.status, 200);
   assert.deepEqual(await resultPromise, { status: 200, text: '{"success":true}' });

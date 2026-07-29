@@ -4,24 +4,28 @@ $ErrorActionPreference = 'Stop'
 $source = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')).TrimEnd('\')
 $target = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
 if ($source -eq $target) { throw '源目录和安装目录不能相同。' }
+$aclScript = Join-Path $source 'scripts\harden-acl.ps1'
+$stopHostScript = Join-Path $source 'scripts\stop-host.ps1'
+if (-not (Test-Path -LiteralPath $aclScript -PathType Leaf)) { throw "缺少 ACL 加固脚本：$aclScript" }
+if (-not (Test-Path -LiteralPath $stopHostScript -PathType Leaf)) { throw "缺少宿主停止脚本：$stopHostScript" }
 
 $marker = Join-Path $target 'package.json'
 if (Test-Path -LiteralPath $target) {
     if (-not (Test-Path -LiteralPath $marker)) { throw "安装目录已存在且不是本扩展：$target" }
     $existing = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
     if ($existing.name -ne 'codex-ccswitch-usage') { throw "安装目录标识不匹配：$target" }
-    $stopScript = Join-Path $target 'scripts\stop.ps1'
-    if (Test-Path -LiteralPath $stopScript) { & $stopScript -InstallRoot $target | Out-Null }
+    & $stopHostScript -InstallRoot $target -AllInstances | Out-Null
 }
 
 [IO.Directory]::CreateDirectory($target) | Out-Null
+& $aclScript -InstallRoot $target
 $files = @(
     'package.json', '.gitignore', 'README.md',
     'src\provider-repository.mjs', 'src\evaluator-worker.mjs', 'src\evaluator.mjs',
     'src\usage-client.mjs', 'src\http-allowlist.mjs', 'src\cdp-client.mjs', 'src\browser-callback-broker.mjs', 'src\hub-provider-adapters.mjs', 'src\provider-request-usage.mjs', 'src\provider-templates.mjs',
     'src\hub-service.mjs', 'src\hub-page.mjs', 'src\hub-server.mjs',
     'src\injector-script.mjs', 'src\keyed-backoff.mjs', 'src\page-action-channel.mjs', 'src\process-lifecycle.mjs', 'src\target-session.mjs', 'src\host.mjs',
-    'scripts\install.ps1', 'scripts\launch.ps1', 'scripts\stop.ps1', 'scripts\check-current.mjs',
+    'scripts\install.ps1', 'scripts\launch.ps1', 'scripts\stop.ps1', 'scripts\stop-host.ps1', 'scripts\harden-acl.ps1', 'scripts\check-current.mjs',
     'scripts\status.ps1', 'scripts\uninstall.ps1',
     'browser-companion\manifest.json', 'browser-companion\background.js', 'browser-companion\session-state.js',
     'browser-companion\anyrouter-waf.js', 'browser-companion\protocol.js',

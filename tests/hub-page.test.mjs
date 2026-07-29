@@ -142,6 +142,29 @@ test('visible Hub pages refresh companion status without polling full provider s
   assert.doesNotMatch(page, /setInterval\(load/);
 });
 
+test('Hub operation monitoring is single-chain and cancels stale async callbacks', () => {
+  const page = buildHubPage({ apiBase: '/api/test-token', nonce: 'test-nonce' });
+
+  assert.match(page, /let operationMonitorGeneration=0/);
+  assert.match(page, /function cancelOperationMonitor\(\)\{operationMonitorGeneration\+=1;clearTimeout\(operationMonitorTimer\)/);
+  assert.match(page, /const generation=operationMonitorGeneration/);
+  assert.ok(
+    (page.match(/generation!==operationMonitorGeneration/g) || []).length >= 2,
+    'a callback must validate its generation both before and after awaiting state',
+  );
+  assert.match(page, /visibilityState==='hidden'\)\{markHubLeft\(\);cancelOperationMonitor\(\)/);
+});
+
+test('Hub refreshes relative age labels while provider state is otherwise idle', () => {
+  const page = buildHubPage({ apiBase: '/api/test-token', nonce: 'test-nonce' });
+  const companionLoad = page.slice(page.indexOf('async function loadCompanionStatus()'), page.indexOf('function cancelOperationMonitor()'));
+
+  assert.match(companionLoad, /Date\.now\(\)-lastRenderedAt>=60000/);
+  assert.match(companionLoad, /if\(shouldRender\)\{renderKey=nextRenderKey;render\(\)\}/);
+  assert.match(page, /title:'Hub 状态持久化'/);
+  assert.match(page, /state\.cacheError\?\'error\':\'ok\'/);
+});
+
 test('Hub resumes operation monitoring when loaded during an active refresh', () => {
   const page = buildHubPage({ apiBase: '/api/test-token', nonce: 'test-nonce' });
 

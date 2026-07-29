@@ -1,8 +1,9 @@
-export const COMPANION_PROTOCOL_VERSION = 1;
+export const COMPANION_PROTOCOL_VERSION = 2;
 export const COMPANION_CAPABILITIES = Object.freeze([
   'query-json-v1',
   'open-login-v1',
   'session-hints-v1',
+  'job-claim-proof-v1',
 ]);
 
 // One provider query owns 45 seconds. The broker stops waiting at 44 seconds,
@@ -53,6 +54,9 @@ export function companionCompatibility(payload = {}) {
 export function assertHostJobCompatibility(job = {}) {
   if (Number(job.protocolVersion) !== COMPANION_PROTOCOL_VERSION) {
     throw new Error(`Balance Hub 任务协议不兼容：伴侣需要 v${COMPANION_PROTOCOL_VERSION}`);
+  }
+  if (!/^[A-Za-z0-9_-]{32,128}$/.test(String(job.claimToken || ''))) {
+    throw new Error('Balance Hub 任务缺少有效的领取凭据');
   }
   return true;
 }

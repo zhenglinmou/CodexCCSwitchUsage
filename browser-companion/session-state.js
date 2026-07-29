@@ -42,7 +42,6 @@ export async function readLimitedResponseText(response, maximumBytes = MAX_BROWS
   const contentLength = contentLengthHeader == null || String(contentLengthHeader).trim() === ''
     ? null
     : Number(contentLengthHeader);
-  const expectedBytes = Number.isFinite(contentLength) && contentLength >= 0 ? contentLength : null;
   if (Number.isFinite(contentLength) && contentLength > limit) throw new Error('第三方网站响应过大');
 
   if (!response?.body || typeof response.body.getReader !== 'function') {
@@ -73,11 +72,6 @@ export async function readLimitedResponseText(response, maximumBytes = MAX_BROWS
         throw error;
       }
       text += decoder.decode(bytes, { stream: true });
-      if (expectedBytes != null && receivedBytes >= expectedBytes) {
-        text += decoder.decode();
-        cancel('response complete');
-        return text;
-      }
       const trimmedText = text.trim();
       if (trimmedText.startsWith('{') || trimmedText.startsWith('[')) {
         try {

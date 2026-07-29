@@ -2060,6 +2060,24 @@ test('provider HTTP retries share one total deadline instead of resetting it per
   assert.ok(Date.now() - startedAt < 450, 'the two attempts must not each receive the full deadline');
 });
 
+test('provider cancellation interrupts the retry backoff immediately', async () => {
+  const controller = new AbortController();
+  let attempts = 0;
+  const startedAt = Date.now();
+  const pending = fetchJson(async () => {
+    attempts += 1;
+    return new Response('{"error":"busy"}', { status: 503 });
+  }, 'https://example.invalid/balance', {}, 5_000, 3, controller.signal, 1_000);
+
+  while (attempts === 0) await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setTimeout(resolve, 20));
+  controller.abort(new Error('cancelled during retry'));
+
+  await assert.rejects(pending, /cancelled during retry/);
+  assert.equal(attempts, 1);
+  assert.ok(Date.now() - startedAt < 300, 'abort must not wait for the one-second retry delay');
+});
+
 test('provider queries enforce one global deadline even when a transport ignores abort', async () => {
   const engine = new ProviderQueryEngine({}, {}, {
     providerQueryTimeoutMs: 15,

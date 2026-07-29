@@ -49,6 +49,7 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 Source: "{#PackageRoot}\*"; Excludes: "runtime-bin\node.exe"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#PackageRoot}\runtime-bin\node.exe"; DestDir: "{app}\runtime-bin"
 Source: "{#PackageRoot}\scripts\stop-host.ps1"; Flags: dontcopy
+Source: "{#PackageRoot}\scripts\harden-acl.ps1"; Flags: dontcopy
 
 [InstallDelete]
 Type: files; Name: "{app}\scripts\migrate-default-profile.ps1"
@@ -86,15 +87,35 @@ begin
   ) and (ResultCode = 0);
 end;
 
+function HardenInstallAcl(const ScriptPath: String): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := Exec(
+    ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + ScriptPath +
+      '" -InstallRoot "' + ExpandConstant('{app}') + '"',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  ) and (ResultCode = 0);
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
   ExtractTemporaryFile('stop-host.ps1');
+  ExtractTemporaryFile('harden-acl.ps1');
   if not StopHost(
     ExpandConstant('{tmp}\stop-host.ps1'),
     CompareText(ExpandConstant('{param:nostopall|0}'), '1') <> 0
-  ) then
+  ) then begin
     Result := '无法停止旧版插件宿主，请关闭后重试。';
+    Exit;
+  end;
+  if not HardenInstallAcl(ExpandConstant('{tmp}\harden-acl.ps1')) then
+    Result := '无法收紧安装目录权限；为避免本机其他用户读取连接凭据，安装已中止。';
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

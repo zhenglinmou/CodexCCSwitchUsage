@@ -39,6 +39,22 @@ export function formatRequestTime(value) {
   return `${(milliseconds / 1_000).toFixed(1)}s`;
 }
 
+export function calculatePopoverPlacement(buttonRect, viewportHeight, desiredHeight, gap = 10, margin = 8) {
+  const height = Math.max(0, Number(viewportHeight) || 0);
+  const top = Math.max(0, Number(buttonRect?.top) || 0);
+  const bottom = Math.max(top, Number(buttonRect?.bottom) || top);
+  const availableAbove = Math.max(0, top - gap - margin);
+  const availableBelow = Math.max(0, height - bottom - gap - margin);
+  const boundedDesiredHeight = Math.max(1, Math.min(Number(desiredHeight) || 1, Math.max(0, height - margin * 2)));
+  const placement = availableAbove >= boundedDesiredHeight || availableAbove >= availableBelow ? 'above' : 'below';
+  return {
+    placement,
+    maxHeight: Math.floor(placement === 'above' ? availableAbove : availableBelow),
+    top: placement === 'below' ? Math.round(bottom + gap) : null,
+    bottom: placement === 'above' ? Math.round(height - top + gap) : null,
+  };
+}
+
 export function selectResponsiveUsageMode(measurements, previousMode = '', upgradeMargin = 12) {
   const modes = ['full', 'compact', 'no-extra', 'no-used', 'no-meter', 'no-dot', 'icon'];
   const selected = modes.find(mode => measurements?.[mode]?.fits) || 'icon';
@@ -232,9 +248,9 @@ export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = glob
 }
 
 export { PAGE_ACTION_SENTINEL };
-export const INJECTOR_VERSION = 82;
+export const INJECTOR_VERSION = 83;
 
-function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, formatRequestTime, selectResponsiveUsageMode, calculateResponsiveMeasurements, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, enqueuePageActionTitle, pageActionSentinel, version) {
+function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, formatRequestTime, calculatePopoverPlacement, selectResponsiveUsageMode, calculateResponsiveMeasurements, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, enqueuePageActionTitle, pageActionSentinel, version) {
   const VERSION = version;
   const GLOBAL = '__CODEX_CCSWITCH_USAGE__';
   const ROOT_ID = 'codex-ccswitch-usage-root';
@@ -504,22 +520,22 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       const shadow = host.attachShadow({ mode: 'open' });
       shadow.innerHTML = `<style>
         *{box-sizing:border-box}
-        .popover{position:fixed;z-index:2147483000;width:min(236px,calc(100vw - 16px));max-height:calc(100vh - 16px);padding:12px;border:1px solid var(--color-token-border,var(--color-token-button-border,rgba(127,127,127,.16)));border-radius:14px;background:var(--color-token-dropdown-background,rgb(38,38,38));box-shadow:0 12px 32px rgba(0,0,0,.32);color:var(--color-token-text-primary,currentColor);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:var(--text-sm,13px);font-weight:445;line-height:18px;letter-spacing:normal;display:flex;flex-direction:column;opacity:0;visibility:hidden;transform:translateY(4px);transition:opacity .12s ease,transform .12s ease,visibility .12s;pointer-events:none}
+        .popover{position:fixed;box-sizing:border-box;z-index:2147483000;width:min(236px,calc(100vw - 16px));max-height:calc(100vh - 16px);padding:12px;border:1px solid var(--color-token-border,var(--color-token-button-border,rgba(127,127,127,.16)));border-radius:14px;background:var(--color-token-dropdown-background,rgb(38,38,38));box-shadow:0 12px 32px rgba(0,0,0,.32);color:var(--color-token-text-primary,currentColor);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:var(--text-sm,13px);font-weight:445;line-height:18px;letter-spacing:normal;display:flex;flex-direction:column;overflow:hidden;opacity:0;visibility:hidden;transform:translateY(4px);transition:opacity .12s ease,transform .12s ease,visibility .12s;pointer-events:none}
         .popover.open{opacity:1;visibility:visible;transform:translateY(0);pointer-events:auto}
         .popover[data-mode="requests"]{width:min(420px,calc(100vw - 16px))}
-        .popover-head{display:flex;align-items:center;justify-content:space-between;color:var(--color-token-text-tertiary,currentColor);height:24px}
+        .popover-head{display:flex;flex:0 0 auto;align-items:center;justify-content:space-between;color:var(--color-token-text-tertiary,currentColor);height:24px}
         .popover-head-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:inherit}
         .popover-refresh{appearance:none;display:grid;place-items:center;width:28px;height:28px;margin:-2px -6px -2px 0;padding:0;border:0;border-radius:7px;background:transparent;color:var(--color-token-text-tertiary,currentColor);cursor:pointer}
         .popover-refresh:hover{background:var(--color-background-button-tertiary-hover,rgba(127,127,127,.12));color:var(--color-token-text-primary,currentColor)}
         .popover-refresh:focus-visible{outline:2px solid var(--color-token-text-primary,currentColor);outline-offset:1px}
         .popover-refresh svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
         .popover-refresh[data-loading="true"] svg{animation:popover-refresh-spin .9s linear infinite}
-        .popover-grid{display:grid;gap:6px;margin-top:8px}
+        .popover-grid{display:grid;flex:1 1 auto;min-height:0;gap:6px;margin-top:8px;overflow-y:auto;overscroll-behavior:contain}
         .popover[data-mode="requests"] .popover-grid{display:none}
         .popover-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;min-height:30px;padding:6px 9px;border-radius:8px;background:var(--color-background-button-tertiary,rgba(127,127,127,.04))}
         .popover-label{flex:0 0 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-token-text-tertiary,currentColor)}
         .popover-value{flex:1 1 auto;min-width:0;max-width:100%;overflow-wrap:anywhere;text-align:right;color:var(--color-token-text-primary,currentColor);font:inherit}
-        .request-list{display:none;min-height:0;margin-top:8px;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
+        .request-list{display:none;flex:1 1 auto;min-height:0;margin-top:8px;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}
         .popover[data-mode="requests"] .request-list{display:block}
         .request-item{padding:9px 4px;border-bottom:1px solid var(--color-token-border,rgba(127,127,127,.12))}
         .request-item:last-child{border-bottom:0}
@@ -532,7 +548,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
         .request-cost{margin-left:auto;color:var(--color-token-text-primary,currentColor);white-space:nowrap}
         .request-error{color:var(--color-text-warning,#ff9f43);white-space:nowrap}
         .request-empty{padding:22px 4px;text-align:center;color:var(--color-token-text-tertiary,currentColor)}
-        .hub-open{appearance:none;width:100%;height:34px;margin-top:9px;border:1px solid var(--color-token-border,rgba(127,127,127,.18));border-radius:9px;background:var(--color-background-button-tertiary,rgba(127,127,127,.06));color:var(--color-token-text-primary,currentColor);font:inherit;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px}
+        .hub-open{appearance:none;flex:0 0 auto;width:100%;height:34px;margin-top:9px;border:1px solid var(--color-token-border,rgba(127,127,127,.18));border-radius:9px;background:var(--color-background-button-tertiary,rgba(127,127,127,.06));color:var(--color-token-text-primary,currentColor);font:inherit;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px}
         .hub-open:hover{background:var(--color-background-button-tertiary-hover,rgba(127,127,127,.12))}
         .hub-open svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
         .hub-open span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -636,11 +652,23 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     const popover = state.popoverShadow.querySelector('.popover');
     if (!button || !popover) return;
     const buttonRect = button.getBoundingClientRect();
+    popover.style.maxHeight = `${Math.max(0, window.innerHeight - 16)}px`;
     const popoverRect = popover.getBoundingClientRect();
     const left = Math.max(8, Math.min(window.innerWidth - popoverRect.width - 8, buttonRect.left + buttonRect.width / 2 - popoverRect.width / 2));
     popover.style.left = `${Math.round(left)}px`;
-    popover.style.bottom = `${Math.round(window.innerHeight - buttonRect.top + 10)}px`;
-    popover.style.maxHeight = `${Math.max(160, Math.floor(buttonRect.top - 18))}px`;
+    const placement = calculatePopoverPlacement(
+      buttonRect,
+      window.innerHeight,
+      Math.max(popover.scrollHeight || 0, popoverRect.height || 0),
+    );
+    popover.style.maxHeight = `${placement.maxHeight}px`;
+    if (placement.placement === 'above') {
+      popover.style.removeProperty('top');
+      popover.style.bottom = `${placement.bottom}px`;
+    } else {
+      popover.style.removeProperty('bottom');
+      popover.style.top = `${placement.top}px`;
+    }
   }
 
   function hideUsageTooltip() {
@@ -738,21 +766,31 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     (target || state.popoverShadow.getElementById('popover'))?.focus?.({ preventScroll: true });
   }
 
-  function closePopover(returnFocus = false) {
+  function syncPopoverVisibility() {
+    const instances = [{ root: state.root }, ...state.mirrors];
+    for (const instance of instances) {
+      const ownsPopover = state.popoverAnchor?.root === instance.root;
+      updateElementAttribute(instance.root?.__codexUsageHubButton, 'aria-expanded', ownsPopover && state.popoverOpen && state.popoverMode === 'requests' ? 'true' : 'false');
+      updateElementAttribute(instance.root?.__codexUsageRefreshButton, 'aria-expanded', ownsPopover && state.popoverOpen && state.popoverMode === 'balance' ? 'true' : 'false');
+    }
+    const popover = state.popoverShadow?.querySelector('.popover');
+    popover?.classList.toggle('open', state.popoverOpen);
+    updateElementAttribute(popover, 'aria-hidden', state.popoverOpen ? 'false' : 'true');
+  }
+
+  function closePopover(returnFocus = false, renderNow = true) {
     const trigger = state.popoverTrigger;
     state.popoverOpen = false;
     state.popoverMode = '';
     state.popoverTrigger = null;
-    render();
+    if (renderNow) render();
+    else syncPopoverVisibility();
     if (returnFocus && trigger?.isConnected) trigger.focus?.({ preventScroll: true });
   }
 
   function openHub() {
     hideUsageTooltip();
-    state.popoverOpen = false;
-    state.popoverMode = '';
-    state.popoverTrigger = null;
-    state.popoverShadow?.querySelector('.popover')?.classList.remove('open');
+    closePopover(false);
     publishPageAction('open-hub');
   }
 
@@ -1288,9 +1326,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
         || (state.popoverMode === 'requests' && mode === 'icon')
       );
     if (popoverAnchorUnavailable) {
-      state.popoverOpen = false;
-      state.popoverMode = '';
-      state.popoverShadow?.querySelector('.popover')?.classList.remove('open');
+      closePopover(false, false);
     }
   }
 
@@ -1527,7 +1563,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
 }
 
 export function buildInjectorScript() {
-  return `(${installCodexUsageExtension.toString()})(${findUsageTooltipTarget.toString()},${isUsageTooltipBoundaryCrossing.toString()},${getUsageFreshness.toString()},${formatUsageAge.toString()},${formatRequestTime.toString()},${selectResponsiveUsageMode.toString()},${calculateResponsiveMeasurements.toString()},${stabilizeResponsiveUsageMode.toString()},${findMutationObserverTarget.toString()},${classifyComposerMutations.toString()},${createInjectorEventController.toString()},${updateElementAttribute.toString()},${isComposerFooterCandidate.toString()},${isNativeFlowCacheValid.toString()},${resolveNativeFlowPlacement.toString()},${enqueuePageActionTitle.toString()},${JSON.stringify(PAGE_ACTION_SENTINEL)},${INJECTOR_VERSION})`;
+  return `(${installCodexUsageExtension.toString()})(${findUsageTooltipTarget.toString()},${isUsageTooltipBoundaryCrossing.toString()},${getUsageFreshness.toString()},${formatUsageAge.toString()},${formatRequestTime.toString()},${calculatePopoverPlacement.toString()},${selectResponsiveUsageMode.toString()},${calculateResponsiveMeasurements.toString()},${stabilizeResponsiveUsageMode.toString()},${findMutationObserverTarget.toString()},${classifyComposerMutations.toString()},${createInjectorEventController.toString()},${updateElementAttribute.toString()},${isComposerFooterCandidate.toString()},${isNativeFlowCacheValid.toString()},${resolveNativeFlowPlacement.toString()},${enqueuePageActionTitle.toString()},${JSON.stringify(PAGE_ACTION_SENTINEL)},${INJECTOR_VERSION})`;
 }
 
 export const UPDATE_GLOBAL = '__CODEX_CCSWITCH_USAGE__';

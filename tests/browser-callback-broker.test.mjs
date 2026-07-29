@@ -8,6 +8,13 @@ import {
 } from '../browser-companion/protocol.js';
 
 const peer = values => ({ ...companionHandshake(), ...(values || {}) });
+const claim = (job, values = {}) => ({
+  clientId: 'edge-client-one',
+  browser: 'Edge',
+  instanceId: '',
+  claimToken: job.claimToken,
+  ...values,
+});
 
 test('browser callback broker delivers a query and resolves its callback', async () => {
   const broker = new BrowserCallbackBroker();
@@ -20,7 +27,7 @@ test('browser callback broker delivers a query and resolves its callback', async
   assert.equal(job.request.origin, 'https://anyrouter.top');
   assert.ok(Number.isFinite(Date.parse(job.expiresAt)), 'jobs expose the host callback deadline');
   assert.ok(Date.parse(job.expiresAt) > Date.parse(job.createdAt));
-  assert.equal(broker.complete(job.id, { ok: true, value: { status: 200, text: '{"success":true}' } }), true);
+  assert.equal(broker.complete(job.id, { ok: true, value: { status: 200, text: '{"success":true}' } }, claim(job)), true);
   assert.deepEqual(await resultPromise, { status: 200, text: '{"success":true}' });
   broker.close();
 });
@@ -184,7 +191,7 @@ test('a replacement service worker cancels the obsolete long poll before dispatc
   const resultPromise = broker.queryJson({ baseUrl: 'https://anyrouter.top', requestPath: '/api/user/self' });
   const job = await current;
   assert.equal(job.type, 'query-json');
-  broker.complete(job.id, { ok: true, value: { status: 200, text: '{}' } });
+  broker.complete(job.id, { ok: true, value: { status: 200, text: '{}' } }, claim(job, { instanceId: 'worker-two' }));
   assert.equal((await resultPromise).status, 200);
 });
 
@@ -210,11 +217,11 @@ test('a replacement service worker reclaims a job taken by the obsolete instance
   assert.equal(reclaimed.id, claimed.id, 'the original callback identity and deadline must be preserved');
   assert.equal(broker.getStatus().queuedJobs, 0);
   assert.equal(broker.getStatus().pendingJobs, 1);
-  broker.complete(reclaimed.id, { ok: true, value: { status: 200, text: '{"success":true}' } });
+  broker.complete(reclaimed.id, { ok: true, value: { status: 200, text: '{"success":true}' } }, claim(reclaimed, { instanceId: 'worker-two' }));
   assert.equal((await resultPromise).status, 200);
 });
 
-test('a late result from the obsolete worker removes its requeued job', async t => {
+test('a late result from the obsolete worker cannot complete its requeued job', async t => {
   const broker = new BrowserCallbackBroker();
   t.after(() => broker.close());
   broker.heartbeat(peer({
@@ -231,9 +238,13 @@ test('a late result from the obsolete worker removes its requeued job', async t 
     clientId: 'edge-client-one', browser: 'Edge', instanceId: 'worker-two',
   }));
   assert.equal(broker.getStatus().queuedJobs, 1);
-  assert.equal(broker.complete(claimed.id, { ok: true, value: { status: 200, text: '{}' } }), true);
-  assert.equal(broker.getStatus().queuedJobs, 0);
-  assert.equal(broker.getStatus().pendingJobs, 0);
+  assert.equal(broker.complete(claimed.id, { ok: true, value: { status: 200, text: '{}' } }, claim(claimed, { instanceId: 'worker-one' })), false);
+  assert.equal(broker.getStatus().queuedJobs, 1);
+  assert.equal(broker.getStatus().pendingJobs, 1);
+  const reclaimed = await broker.nextJob(peer({
+    clientId: 'edge-client-one', browser: 'Edge', instanceId: 'worker-two',
+  }), 1_000);
+  assert.equal(broker.complete(reclaimed.id, { ok: true, value: { status: 200, text: '{}' } }, claim(reclaimed, { instanceId: 'worker-two' })), true);
   assert.equal((await resultPromise).status, 200);
 });
 
@@ -255,7 +266,7 @@ test('an aborted browser long poll is removed without claiming a later job', asy
   const resultPromise = broker.queryJson({ baseUrl: 'https://anyrouter.top', requestPath: '/api/user/self' });
   const job = await current;
   assert.equal(job.type, 'query-json');
-  broker.complete(job.id, { ok: true, value: { status: 200, text: '{}' } });
+  broker.complete(job.id, { ok: true, value: { status: 200, text: '{}' } }, claim(job, { instanceId: 'worker-one' }));
   await resultPromise;
 });
 
@@ -276,7 +287,7 @@ test('a queued job falls back when its preferred companion does not claim it', a
 
   const job = await waiting;
   assert.equal(job.type, 'query-json');
-  broker.complete(job.id, { ok: true, value: { status: 200, text: '{"success":true}' } });
+  broker.complete(job.id, { ok: true, value: { status: 200, text: '{"success":true}' } }, claim(job, { clientId: 'chrome-client-two', browser: 'Chrome' }));
   assert.equal((await resultPromise).status, 200);
 });
 
@@ -300,7 +311,7 @@ test('targeted browser queries cannot be claimed by another connected browser', 
   const edgeJob = await broker.nextJob(peer({ clientId: 'edge-client-one', browser: 'Edge' }), 1_000);
   assert.equal(edgeJob.type, 'query-json');
   assert.equal(broker.getStatus().queuedJobs, 0);
-  broker.complete(edgeJob.id, { ok: true, value: { status: 200, text: '{"success":true}' } });
+  broker.complete(edgeJob.id, { ok: true, value: { status: 200, text: '{"success":true}' } }, claim(edgeJob));
   assert.equal((await resultPromise).status, 200);
 
   broker.close();
@@ -328,8 +339,62 @@ test('Edge and Chrome remain independent when copied extension storage reused th
 
   assert.equal(job.type, 'open-login');
   assert.equal(broker.getStatus().queuedJobs, 0, 'the Edge poll must not steal the Chrome login job');
-  broker.complete(job.id, { ok: true, value: { opened: true } });
+  broker.complete(job.id, { ok: true, value: { opened: true } }, claim(job, { clientId: 'shared-client-one', browser: 'Chrome' }));
   assert.deepEqual(await resultPromise, { opened: true });
   broker.close();
   assert.equal(await edgeWaiting, null);
+});
+
+test('broker prunes expired clients and bounds client and session state', () => {
+  let now = 1_000;
+  const broker = new BrowserCallbackBroker({
+    now: () => now,
+    connectionMaxAgeMs: 10_000,
+    maxClients: 3,
+    maxSessionsPerClient: 2,
+  });
+  try {
+    for (let index = 0; index < 3; index += 1) {
+      broker.heartbeat(peer({
+        clientId: `client-${String(index).padStart(8, '0')}`,
+        browser: 'Edge',
+        sessions: ['https://one.example', 'https://two.example', 'https://ignored.example'],
+      }));
+    }
+    assert.equal(broker.clients.size, 3);
+    assert.equal(broker.clients.values().next().value.sessions.size, 2);
+    assert.throws(() => broker.heartbeat(peer({
+      clientId: 'client-overflow', browser: 'Edge',
+    })), /数量已达到上限/);
+
+    const firstClientId = 'client-00000000';
+    assert.equal(broker.noteSession(firstClientId, 'https://three.example', 'Edge'), false);
+    now += 10_001;
+    broker.heartbeat(peer({ clientId: 'client-replacement', browser: 'Edge' }));
+    assert.equal(broker.clients.size, 1, 'expired clients must be removed from storage, not only hidden from status');
+  } finally {
+    broker.close();
+  }
+});
+
+test('only the exact browser worker that claimed a job can complete it', async t => {
+  const broker = new BrowserCallbackBroker();
+  t.after(() => broker.close());
+  broker.heartbeat(peer({ clientId: 'edge-client-one', browser: 'Edge', instanceId: 'worker-one' }));
+  broker.heartbeat(peer({ clientId: 'chrome-client-two', browser: 'Chrome', instanceId: 'worker-two' }));
+  const resultPromise = broker.queryJson({ baseUrl: 'https://anyrouter.top', requestPath: '/api/user/self' });
+  const job = await broker.nextJob(peer({
+    clientId: 'edge-client-one', browser: 'Edge', instanceId: 'worker-one',
+  }), 1_000);
+
+  assert.equal(broker.complete(job.id, { ok: true, value: { status: 200 } }, claim(job, {
+    clientId: 'chrome-client-two', browser: 'Chrome', instanceId: 'worker-two',
+  })), false);
+  assert.equal(broker.complete(job.id, { ok: true, value: { status: 200 } }, claim(job, {
+    instanceId: 'worker-one', claimToken: 'x'.repeat(32),
+  })), false);
+  assert.equal(broker.complete(job.id, { ok: true, value: { status: 200 } }, claim(job, {
+    instanceId: 'worker-one',
+  })), true);
+  assert.equal((await resultPromise).status, 200);
 });

@@ -42,12 +42,27 @@ function clientRef(key) {
   return crypto.createHash('sha256').update(key).digest('base64url').slice(0, 16);
 }
 
+function cleanClaimToken(value) {
+  const text = String(value || '').trim();
+  return /^[A-Za-z0-9_-]{32,128}$/.test(text) ? text : '';
+}
+
+function equalClaimToken(left, right) {
+  const first = Buffer.from(cleanClaimToken(left));
+  const second = Buffer.from(cleanClaimToken(right));
+  return first.length > 0 && first.length === second.length && crypto.timingSafeEqual(first, second);
+}
+
 export class BrowserCallbackBroker {
   constructor(options = {}) {
     this.now = options.now || Date.now;
     this.connectionMaxAgeMs = Math.max(10_000, Number(options.connectionMaxAgeMs) || 45_000);
     this.queryTimeoutMs = Math.max(10_000, Number(options.queryTimeoutMs) || BROWSER_CALLBACK_TIMEOUT_MS);
     this.preferredClientGraceMs = Math.max(1_000, Number(options.preferredClientGraceMs) || 5_000);
+    this.maxClients = Math.max(1, Math.min(128, Number(options.maxClients) || 32));
+    this.maxSessionsPerClient = Math.max(1, Math.min(256, Number(options.maxSessionsPerClient) || 64));
+    this.maxWaiters = Math.max(1, Math.min(256, Number(options.maxWaiters) || 64));
+    this.maxPendingJobs = Math.max(1, Math.min(512, Number(options.maxPendingJobs) || 128));
     this.clients = new Map();
     this.queue = [];
     this.waiters = [];
@@ -59,6 +74,7 @@ export class BrowserCallbackBroker {
   }
 
   heartbeat(payload = {}) {
+    this.#pruneClients();
     const clientId = cleanClientId(payload.clientId);
     if (!clientId) throw new Error('浏览器伴侣 clientId 无效');
     const browser = normalizeBrowser(payload.browser);
@@ -71,7 +87,11 @@ export class BrowserCallbackBroker {
       throw new Error(compatibility.message);
     }
     this.lastCompatibilityError = '';
-    const existing = this.clients.get(key) || { sessions: new Set() };
+    const existingClient = this.clients.get(key);
+    if (!existingClient && this.clients.size >= this.maxClients) {
+      throw new Error('浏览器伴侣连接数量已达到上限');
+    }
+    const existing = existingClient || { sessions: new Set() };
     const instanceId = cleanInstanceId(payload.instanceId) || existing.instanceId || '';
     if (instanceId && existing.instanceId !== instanceId) {
       this.generation += 1;
@@ -81,7 +101,7 @@ export class BrowserCallbackBroker {
       }
     }
     const sessions = Array.isArray(payload.sessions)
-      ? new Set(payload.sessions.map(normalizeOrigin).filter(Boolean))
+      ? new Set(payload.sessions.slice(0, this.maxSessionsPerClient).map(normalizeOrigin).filter(Boolean))
       : new Set(existing.sessions);
     this.clients.set(key, {
       key,
@@ -100,6 +120,7 @@ export class BrowserCallbackBroker {
   }
 
   noteSession(clientId, origin, browser = '') {
+    this.#pruneClients();
     const id = cleanClientId(clientId);
     const normalized = normalizeOrigin(origin);
     if (!id || !normalized) return false;
@@ -110,6 +131,7 @@ export class BrowserCallbackBroker {
     let accepted = false;
     for (const [key, client] of matches) {
       if (!client) continue;
+      if (!client.sessions.has(normalized) && client.sessions.size >= this.maxSessionsPerClient) continue;
       client.sessions.add(normalized);
       client.lastSeenAt = this.now();
       this.clients.set(key, client);
@@ -119,6 +141,7 @@ export class BrowserCallbackBroker {
   }
 
   getStatus() {
+    this.#pruneClients();
     const cutoff = this.now() - this.connectionMaxAgeMs;
     const active = [...this.clients.values()].filter(client => client.lastSeenAt >= cutoff);
     return {
@@ -146,6 +169,7 @@ export class BrowserCallbackBroker {
   }
 
   listQueryClients(origin = '') {
+    this.#pruneClients();
     const normalized = normalizeOrigin(origin);
     const cutoff = this.now() - this.connectionMaxAgeMs;
     return [...this.clients.values()]
@@ -160,6 +184,7 @@ export class BrowserCallbackBroker {
   }
 
   hasSession(origin) {
+    this.#pruneClients();
     const normalized = normalizeOrigin(origin);
     if (!normalized) return false;
     const cutoff = this.now() - this.connectionMaxAgeMs;
@@ -183,6 +208,7 @@ export class BrowserCallbackBroker {
       this.#schedulePreferenceRelease();
       return queued.publicJob;
     }
+    if (this.waiters.length >= this.maxWaiters) throw new Error('浏览器伴侣等待连接数量已达到上限');
     return new Promise(resolve => {
       const waiter = {
         clientKey: key,
@@ -230,10 +256,18 @@ export class BrowserCallbackBroker {
     return this.#enqueue('open-login', request, BROWSER_LOGIN_JOB_TIMEOUT_MS, { targetClientKey });
   }
 
-  complete(jobId, result) {
+  complete(jobId, result, claimant = {}) {
     const key = String(jobId || '');
     const pending = this.pending.get(key);
     if (!pending) return false;
+    const claimedClientKey = clientKey(cleanClientId(claimant.clientId), claimant.browser);
+    const claimedInstanceId = cleanInstanceId(claimant.instanceId);
+    if (
+      !pending.claimedClientKey
+      || claimedClientKey !== pending.claimedClientKey
+      || claimedInstanceId !== pending.claimedInstanceId
+      || !equalClaimToken(claimant.claimToken, pending.claimToken)
+    ) return false;
     this.pending.delete(key);
     this.queue = this.queue.filter(job => job.publicJob.id !== key);
     clearTimeout(pending.timer);
@@ -266,7 +300,9 @@ export class BrowserCallbackBroker {
 
   #enqueue(type, request, timeoutMs, options = {}) {
     if (this.closed) return Promise.reject(new Error('浏览器余额伴侣回调已关闭'));
+    this.#pruneClients();
     if (!this.isConnected()) return Promise.reject(new Error('现有浏览器余额伴侣未连接'));
+    if (this.pending.size >= this.maxPendingJobs) return Promise.reject(new Error('浏览器余额任务数量已达到上限'));
     const signal = options?.signal;
     if (signal?.aborted) return Promise.reject(signal.reason || new Error('浏览器余额回调已取消'));
     const origin = normalizeOrigin(request?.baseUrl || request?.loginUrl || request?.origin);
@@ -300,6 +336,7 @@ export class BrowserCallbackBroker {
         job: null,
         claimedClientKey: '',
         claimedInstanceId: '',
+        claimToken: '',
       };
       const abort = () => {
         if (this.pending.get(id) !== pending) return;
@@ -371,8 +408,11 @@ export class BrowserCallbackBroker {
     if (pending) {
       pending.claimedClientKey = key;
       pending.claimedInstanceId = this.clients.get(key)?.instanceId || '';
+      pending.claimToken = crypto.randomBytes(24).toString('base64url');
     }
-    return job;
+    return pending
+      ? { ...job, publicJob: { ...job.publicJob, claimToken: pending.claimToken } }
+      : job;
   }
 
   #requeueClaimedJobs(key, instanceId) {
@@ -384,6 +424,7 @@ export class BrowserCallbackBroker {
         || queuedIds.has(pending.job.publicJob.id)) continue;
       pending.claimedClientKey = '';
       pending.claimedInstanceId = '';
+      pending.claimToken = '';
       pending.job.preferredClientKey = pending.job.targetClientKey || key;
       pending.job.preferredUntil = this.now() + this.preferredClientGraceMs;
       this.queue.push(pending.job);
@@ -399,6 +440,21 @@ export class BrowserCallbackBroker {
       waiter.resolve(job.publicJob);
     }
     this.#schedulePreferenceRelease();
+  }
+
+  #pruneClients() {
+    if (this.closed || this.clients.size === 0) return 0;
+    const cutoff = this.now() - this.connectionMaxAgeMs;
+    let removed = 0;
+    for (const [key, client] of this.clients) {
+      if (client.lastSeenAt >= cutoff) continue;
+      this.#requeueClaimedJobs(key, client.instanceId || '');
+      this.#cancelWaiters(key);
+      this.clients.delete(key);
+      removed += 1;
+    }
+    if (removed > 0) this.#dispatch();
+    return removed;
   }
 
   #releaseExpiredPreferences() {

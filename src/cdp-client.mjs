@@ -1,9 +1,276 @@
+import crypto from 'node:crypto';
 import http from 'node:http';
+import net from 'node:net';
 
 export const CODEX_MAIN_DOCUMENT_URL = 'app://-/index.html';
 
 let cdpHttpAgent = null;
 let cdpHttpClientClosed = false;
+
+function transportEvent(type, data) {
+  if (type === 'message') return new MessageEvent(type, { data });
+  return new Event(type);
+}
+
+const WEBSOCKET_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+const MAX_WEBSOCKET_MESSAGE_BYTES = 16_000_000;
+
+function loopbackHostname(value) {
+  const hostname = String(value || '').replace(/^\[|\]$/g, '').toLowerCase();
+  if (hostname === 'localhost') return '127.0.0.1';
+  return ['127.0.0.1', '::1'].includes(hostname) ? hostname : '';
+}
+
+function maskedWebSocketFrame(opcode, value = Buffer.alloc(0)) {
+  const payload = Buffer.isBuffer(value) ? value : Buffer.from(value);
+  let lengthBytes = 0;
+  if (payload.length >= 126 && payload.length <= 65_535) lengthBytes = 2;
+  else if (payload.length > 65_535) lengthBytes = 8;
+  const header = Buffer.allocUnsafe(2 + lengthBytes + 4);
+  header[0] = 0x80 | (opcode & 0x0f);
+  if (lengthBytes === 0) header[1] = 0x80 | payload.length;
+  else if (lengthBytes === 2) {
+    header[1] = 0x80 | 126;
+    header.writeUInt16BE(payload.length, 2);
+  } else {
+    header[1] = 0x80 | 127;
+    header.writeBigUInt64BE(BigInt(payload.length), 2);
+  }
+  const maskOffset = 2 + lengthBytes;
+  const mask = crypto.randomBytes(4);
+  mask.copy(header, maskOffset);
+  const masked = Buffer.allocUnsafe(payload.length);
+  for (let index = 0; index < payload.length; index += 1) masked[index] = payload[index] ^ mask[index % 4];
+  return Buffer.concat([header, masked]);
+}
+
+class LoopbackWebSocketTransport extends EventTarget {
+  constructor(value) {
+    super();
+    const url = new URL(String(value || ''));
+    const hostname = loopbackHostname(url.hostname);
+    if (url.protocol !== 'ws:' || !hostname || url.username || url.password) {
+      throw new Error('Codex 调试 WebSocket 地址不在本机允许列表中');
+    }
+    const port = Number(url.port || 80);
+    if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('Codex 调试 WebSocket 端口无效');
+    this.closed = false;
+    this.opened = false;
+    this.socketClosed = false;
+    this.terminationPromise = null;
+    this.receiveBuffer = Buffer.alloc(0);
+    this.fragmentBuffers = [];
+    this.fragmentSize = 0;
+    this.fragmentOpcode = 0;
+    this.handshakeKey = crypto.randomBytes(16).toString('base64');
+    this.expectedAccept = crypto.createHash('sha1').update(this.handshakeKey + WEBSOCKET_GUID).digest('base64');
+    this.url = url;
+    this.socket = net.createConnection({ host: hostname, port });
+    this.socket.setNoDelay(true);
+    this.socket.once('connect', () => this.#writeHandshake());
+    this.socket.on('data', chunk => this.#handleData(chunk));
+    this.socket.once('error', () => this.#fail());
+    this.socket.once('close', () => {
+      this.socketClosed = true;
+      this.closed = true;
+      this.#dispatchClose();
+    });
+  }
+
+  waitForOpen(timeoutMs) {
+    return new Promise((resolve, reject) => {
+      let timer;
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.removeEventListener('open', opened);
+        this.removeEventListener('error', failed);
+        this.removeEventListener('close', closed);
+      };
+      const opened = () => { cleanup(); resolve(); };
+      const failed = () => { cleanup(); reject(new Error('无法连接 Codex 调试接口')); };
+      const closed = () => { cleanup(); reject(new Error('Codex 调试连接在握手期间关闭')); };
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error('连接 Codex 调试接口超时'));
+      }, timeoutMs);
+      this.addEventListener('open', opened, { once: true });
+      this.addEventListener('error', failed, { once: true });
+      this.addEventListener('close', closed, { once: true });
+    });
+  }
+
+  send(data) {
+    if (this.closed || !this.opened) throw new Error('Codex 调试连接不可用');
+    const payload = Buffer.from(String(data), 'utf8');
+    if (payload.length > MAX_WEBSOCKET_MESSAGE_BYTES) throw new Error('Codex 调试消息过大');
+    this.socket.write(maskedWebSocketFrame(0x1, payload));
+  }
+
+  close() {
+    void this.terminate();
+  }
+
+  async terminate() {
+    if (this.terminationPromise) return this.terminationPromise;
+    this.closed = true;
+    this.#dispatchClose();
+    this.terminationPromise = new Promise(resolve => {
+      if (this.socketClosed) {
+        resolve();
+        return;
+      }
+      this.socket.once('close', resolve);
+      this.socket.destroy();
+    });
+    await this.terminationPromise;
+  }
+
+  #writeHandshake() {
+    if (this.closed) return;
+    const requestTarget = `${this.url.pathname || '/'}${this.url.search}`;
+    this.socket.write([
+      `GET ${requestTarget} HTTP/1.1`,
+      `Host: ${this.url.host}`,
+      'Connection: Upgrade',
+      'Upgrade: websocket',
+      `Sec-WebSocket-Key: ${this.handshakeKey}`,
+      'Sec-WebSocket-Version: 13',
+      '',
+      '',
+    ].join('\r\n'));
+  }
+
+  #handleData(chunk) {
+    if (this.closed) return;
+    this.receiveBuffer = Buffer.concat([this.receiveBuffer, chunk]);
+    if (!this.opened) {
+      const boundary = this.receiveBuffer.indexOf('\r\n\r\n');
+      if (boundary < 0) {
+        if (this.receiveBuffer.length > 65_536) this.#fail();
+        return;
+      }
+      const header = this.receiveBuffer.subarray(0, boundary).toString('latin1');
+      this.receiveBuffer = this.receiveBuffer.subarray(boundary + 4);
+      const lines = header.split('\r\n');
+      const headers = new Map();
+      for (const line of lines.slice(1)) {
+        const separator = line.indexOf(':');
+        if (separator > 0) headers.set(line.slice(0, separator).trim().toLowerCase(), line.slice(separator + 1).trim());
+      }
+      if (
+        !/^HTTP\/1\.[01] 101\b/.test(lines[0] || '')
+        || String(headers.get('upgrade') || '').toLowerCase() !== 'websocket'
+        || !String(headers.get('connection') || '').toLowerCase().split(/\s*,\s*/).includes('upgrade')
+        || headers.get('sec-websocket-accept') !== this.expectedAccept
+      ) {
+        this.#fail();
+        return;
+      }
+      this.opened = true;
+      this.dispatchEvent(transportEvent('open'));
+    }
+    this.#readFrames();
+  }
+
+  #readFrames() {
+    while (!this.closed && this.receiveBuffer.length >= 2) {
+      const first = this.receiveBuffer[0];
+      const second = this.receiveBuffer[1];
+      const fin = Boolean(first & 0x80);
+      const opcode = first & 0x0f;
+      if (first & 0x70) {
+        this.#fail();
+        return;
+      }
+      const masked = Boolean(second & 0x80);
+      let length = second & 0x7f;
+      let offset = 2;
+      if (length === 126) {
+        if (this.receiveBuffer.length < 4) return;
+        length = this.receiveBuffer.readUInt16BE(2);
+        offset = 4;
+      } else if (length === 127) {
+        if (this.receiveBuffer.length < 10) return;
+        const largeLength = this.receiveBuffer.readBigUInt64BE(2);
+        if (largeLength > BigInt(MAX_WEBSOCKET_MESSAGE_BYTES)) {
+          this.#fail();
+          return;
+        }
+        length = Number(largeLength);
+        offset = 10;
+      }
+      if (length > MAX_WEBSOCKET_MESSAGE_BYTES || (!fin && opcode >= 0x8) || (opcode >= 0x8 && length > 125)) {
+        this.#fail();
+        return;
+      }
+      let mask = null;
+      if (masked) {
+        if (this.receiveBuffer.length < offset + 4) return;
+        mask = this.receiveBuffer.subarray(offset, offset + 4);
+        offset += 4;
+      }
+      if (this.receiveBuffer.length < offset + length) return;
+      let payload = Buffer.from(this.receiveBuffer.subarray(offset, offset + length));
+      this.receiveBuffer = this.receiveBuffer.subarray(offset + length);
+      if (mask) {
+        for (let index = 0; index < payload.length; index += 1) payload[index] ^= mask[index % 4];
+      }
+      if (opcode === 0x8) {
+        void this.terminate();
+        return;
+      }
+      if (opcode === 0x9) {
+        this.socket.write(maskedWebSocketFrame(0xA, payload));
+        continue;
+      }
+      if (opcode === 0xA) continue;
+      if (opcode === 0x1) {
+        if (this.fragmentOpcode) {
+          this.#fail();
+          return;
+        }
+        if (fin) {
+          this.dispatchEvent(transportEvent('message', payload.toString('utf8')));
+          continue;
+        }
+        this.fragmentOpcode = opcode;
+        this.fragmentBuffers = [payload];
+        this.fragmentSize = payload.length;
+        continue;
+      }
+      if (opcode === 0x0 && this.fragmentOpcode === 0x1) {
+        this.fragmentBuffers.push(payload);
+        this.fragmentSize += payload.length;
+        if (this.fragmentSize > MAX_WEBSOCKET_MESSAGE_BYTES) {
+          this.#fail();
+          return;
+        }
+        if (fin) {
+          const message = Buffer.concat(this.fragmentBuffers, this.fragmentSize).toString('utf8');
+          this.fragmentOpcode = 0;
+          this.fragmentBuffers = [];
+          this.fragmentSize = 0;
+          this.dispatchEvent(transportEvent('message', message));
+        }
+        continue;
+      }
+      this.#fail();
+      return;
+    }
+  }
+
+  #fail() {
+    if (this.closed) return;
+    this.dispatchEvent(transportEvent('error'));
+    void this.terminate();
+  }
+
+  #dispatchClose() {
+    if (this.closeDispatched) return;
+    this.closeDispatched = true;
+    this.dispatchEvent(transportEvent('close'));
+  }
+}
 
 function getCdpHttpAgent() {
   if (cdpHttpClientClosed) throw new Error('Codex 调试 HTTP 客户端已关闭');
@@ -39,33 +306,11 @@ export class CdpClient {
   }
 
   static async connect(url, timeoutMs = 3_000) {
-    const socket = new WebSocket(url);
+    const socket = new LoopbackWebSocketTransport(url);
     try {
-      await new Promise((resolve, reject) => {
-        let timer;
-        const cleanup = () => {
-          clearTimeout(timer);
-          socket.removeEventListener('open', handleOpen);
-          socket.removeEventListener('error', handleError);
-        };
-        const handleOpen = () => {
-          cleanup();
-          resolve();
-        };
-        const handleError = () => {
-          cleanup();
-          reject(new Error('无法连接 Codex 调试接口'));
-        };
-
-        timer = setTimeout(() => {
-          cleanup();
-          reject(new Error('连接 Codex 调试接口超时'));
-        }, timeoutMs);
-        socket.addEventListener('open', handleOpen);
-        socket.addEventListener('error', handleError);
-      });
+      await socket.waitForOpen(timeoutMs);
     } catch (error) {
-      try { socket.close(); } catch {}
+      await socket.terminate();
       throw error;
     }
     return new CdpClient(socket);

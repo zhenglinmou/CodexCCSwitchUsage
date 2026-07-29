@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { once } from 'node:events';
 import http from 'node:http';
+import net from 'node:net';
 import test from 'node:test';
 import { CdpClient, closeCdpHttpClient, listCdpTargets } from '../src/cdp-client.mjs';
 
@@ -22,6 +24,94 @@ test('CDP calls release pending state when WebSocket send fails synchronously', 
   } finally {
     client.close();
   }
+});
+
+test('CDP WebSocket transport refuses non-loopback targets', async () => {
+  await assert.rejects(CdpClient.connect('ws://example.com/devtools/page/test'), /本机允许列表/);
+});
+
+test('CDP uses a masked loopback WebSocket and parses its response', async t => {
+  const sockets = new Set();
+  const server = net.createServer(socket => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+    let buffer = Buffer.alloc(0);
+    let upgraded = false;
+    socket.on('data', chunk => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (!upgraded) {
+        const boundary = buffer.indexOf('\r\n\r\n');
+        if (boundary < 0) return;
+        const request = buffer.subarray(0, boundary).toString('latin1');
+        buffer = buffer.subarray(boundary + 4);
+        const key = /^Sec-WebSocket-Key:\s*(.+)$/im.exec(request)?.[1]?.trim();
+        const accept = crypto.createHash('sha1')
+          .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+          .digest('base64');
+        socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+        upgraded = true;
+      }
+      if (!upgraded || buffer.length < 6) return;
+      const length = buffer[1] & 0x7f;
+      assert.ok(length < 126, 'fixture request should use the short frame form');
+      assert.equal(Boolean(buffer[1] & 0x80), true, 'client frames must be masked');
+      if (buffer.length < 6 + length) return;
+      const mask = buffer.subarray(2, 6);
+      const payload = Buffer.from(buffer.subarray(6, 6 + length));
+      for (let index = 0; index < payload.length; index += 1) payload[index] ^= mask[index % 4];
+      buffer = buffer.subarray(6 + length);
+      const request = JSON.parse(payload.toString('utf8'));
+      const responsePayload = Buffer.from(JSON.stringify({ id: request.id, result: { answer: 2 } }));
+      socket.write(Buffer.concat([Buffer.from([0x81, responsePayload.length]), responsePayload]));
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    for (const socket of sockets) socket.destroy();
+    await new Promise(resolve => server.close(resolve));
+  });
+
+  const client = await CdpClient.connect(`ws://127.0.0.1:${server.address().port}/devtools/page/test`, 1_000);
+  try {
+    assert.deepEqual(await client.call('Runtime.evaluate', { expression: '1+1' }), { answer: 2 });
+  } finally {
+    client.close();
+  }
+});
+
+test('a timed-out CDP WebSocket handshake releases its TCP connection', async t => {
+  const sockets = new Set();
+  const server = net.createServer(socket => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+    socket.resume();
+    // Deliberately never answer the WebSocket upgrade request.
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(async () => {
+    for (const socket of sockets) socket.destroy();
+    await new Promise(resolve => server.close(resolve));
+  });
+
+  const connected = once(server, 'connection');
+  const port = server.address().port;
+  const pending = CdpClient.connect(`ws://127.0.0.1:${port}/devtools/page/stalled`, 200);
+  await connected;
+  await assert.rejects(pending, /超时/);
+
+  const deadline = Date.now() + 500;
+  while (sockets.size > 0 && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(sockets.size, 0, 'terminating the handshake transport must close the underlying TCP socket');
 });
 
 test('CDP target snapshots reuse one bounded HTTP connection and release it on close', async () => {

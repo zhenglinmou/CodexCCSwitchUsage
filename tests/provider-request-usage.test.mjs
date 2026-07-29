@@ -127,6 +127,7 @@ test('OpenAI Official reads per-request Token usage from account-scoped Codex se
   assert.equal(result.billing.available, false);
   assert.equal(result.billing.exact, false);
   assert.equal(result.billing.unit, 'subscription');
+  assert.equal(result.officialIndexComplete, true);
   assert.deepEqual(result.items.map(item => ({
     createdAt: item.createdAt,
     model: item.model,
@@ -157,6 +158,149 @@ test('OpenAI Official reads per-request Token usage from account-scoped Codex se
   assert.equal(mismatched.success, false);
   assert.equal(mismatched.errorType, 'account_scope');
   assert.match(mismatched.message, /当前 Codex 登录账号不匹配/);
+});
+
+test('OpenAI Official session index scans newest files first and stays bounded', async t => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-index-'));
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
+    tokens: { account_id: 'indexed-account' },
+  }), 'utf8');
+  const baseTime = Date.now() - 60_000;
+  for (let index = 0; index < 8; index += 1) {
+    const eventTime = baseTime - index * 60_000;
+    const filename = path.join(codexHome, 'sessions', `session-${index}.jsonl`);
+    writeJsonLines(filename, [
+      { timestamp: new Date(eventTime - 1_000).toISOString(), type: 'session_meta', payload: { id: `session-${index}`, model_provider: 'openai' } },
+      { timestamp: new Date(eventTime).toISOString(), type: 'turn_context', payload: { model: 'gpt-5.6-sol' } },
+      {
+        timestamp: new Date(eventTime).toISOString(), type: 'event_msg', payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: { total_tokens: index + 1 },
+            last_token_usage: { input_tokens: index + 1, output_tokens: 0, total_tokens: index + 1 },
+          },
+        },
+      },
+    ]);
+    fs.utimesSync(filename, new Date(eventTime + 1_000), new Date(eventTime + 1_000));
+  }
+  const indexPath = path.join(codexHome, 'runtime', 'codex-session-index.json');
+  const reader = new CodexSessionUsageReader({ codexHome, indexPath, maximumCachedFiles: 3 });
+  const provider = {
+    id: 'openai-indexed', name: 'OpenAI Official', websiteUrl: 'https://chatgpt.com/codex',
+    auth: { tokens: { account_id: 'indexed-account' } },
+  };
+
+  const result = await reader.query(provider, { limit: 1 });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].id.startsWith('session-0:'), true);
+  assert.equal(result.complete, false, 'older uncached files may be skipped once their mtime cannot enter the requested top-N');
+  assert.equal(result.officialSessionCount, 4, 'the cold query should stop after a bounded newest-file safety window');
+  assert.equal(reader.persistedIndex.size, 3);
+
+  const persisted = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+  assert.equal(persisted.files.length, 3);
+  assert.ok(persisted.files.every(record => record.entry.result.items.length <= 64));
+});
+
+test('OpenAI Official session index parses only appended JSONL records', async t => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-append-'));
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
+    tokens: { account_id: 'append-account' },
+  }), 'utf8');
+  const filename = path.join(codexHome, 'sessions', 'active.jsonl');
+  writeJsonLines(filename, [
+    { timestamp: '2026-07-29T01:00:00.000Z', type: 'session_meta', payload: { id: 'active-session', model_provider: 'openai' } },
+    { timestamp: '2026-07-29T01:00:01.000Z', type: 'turn_context', payload: { model: 'gpt-5.6-sol' } },
+    {
+      timestamp: '2026-07-29T01:00:02.000Z', type: 'event_msg', payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { total_tokens: 10 },
+          last_token_usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+        },
+      },
+    },
+  ]);
+  const reader = new CodexSessionUsageReader({
+    codexHome,
+    indexPath: path.join(codexHome, 'runtime', 'codex-session-index.json'),
+  });
+  const provider = {
+    id: 'openai-append', name: 'OpenAI Official', websiteUrl: 'https://chatgpt.com/codex',
+    auth: { tokens: { account_id: 'append-account' } },
+  };
+
+  const first = await reader.query(provider, { limit: 10 });
+  assert.equal(first.totalRecords, 1);
+  fs.appendFileSync(filename, `${JSON.stringify({
+    timestamp: '2026-07-29T01:00:03.000Z', type: 'event_msg', payload: {
+      type: 'token_count',
+      info: {
+        total_token_usage: { total_tokens: 30 },
+        last_token_usage: { input_tokens: 12, output_tokens: 8, total_tokens: 20 },
+      },
+    },
+  })}\n`, 'utf8');
+
+  const second = await reader.query(provider, { limit: 10 });
+  assert.equal(second.totalRecords, 2);
+  assert.deepEqual(second.items.map(item => item.totalTokens), [20, 10]);
+  assert.equal(second.items[0].model, 'gpt-5.6-sol', 'incremental parsing retains prior session state');
+});
+
+test('OpenAI Official session index rejects a rewritten append boundary', async t => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-rewrite-'));
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
+    tokens: { account_id: 'rewrite-account' },
+  }), 'utf8');
+  const filename = path.join(codexHome, 'sessions', 'active.jsonl');
+  writeJsonLines(filename, [
+    { timestamp: '2026-07-29T01:00:00.000Z', type: 'session_meta', payload: { id: 'old-session', model_provider: 'openai' } },
+    {
+      timestamp: '2026-07-29T01:00:01.000Z', type: 'event_msg', payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { total_tokens: 10 },
+          last_token_usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+        },
+      },
+    },
+  ]);
+  const originalSize = fs.statSync(filename).size;
+  const reader = new CodexSessionUsageReader({
+    codexHome,
+    indexPath: path.join(codexHome, 'runtime', 'codex-session-index.json'),
+  });
+  const provider = {
+    id: 'openai-rewrite', name: 'OpenAI Official', websiteUrl: 'https://chatgpt.com/codex',
+    auth: { tokens: { account_id: 'rewrite-account' } },
+  };
+  assert.equal((await reader.query(provider, { limit: 10 })).items[0].id.startsWith('old-session:'), true);
+
+  writeJsonLines(filename, [
+    { timestamp: '2026-07-29T02:00:00.000Z', type: 'session_meta', payload: { id: 'new-session', model_provider: 'openai' } },
+    { timestamp: '2026-07-29T02:00:01.000Z', type: 'turn_context', payload: { model: `gpt-5.6-sol-${'x'.repeat(originalSize)}` } },
+    {
+      timestamp: '2026-07-29T02:00:02.000Z', type: 'event_msg', payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { total_tokens: 99 },
+          last_token_usage: { input_tokens: 90, output_tokens: 9, total_tokens: 99 },
+        },
+      },
+    },
+  ]);
+  assert.ok(fs.statSync(filename).size > originalSize, 'the rewritten file must still look like a possible append by size');
+
+  const result = await reader.query(provider, { limit: 10 });
+  assert.equal(result.totalRecords, 1);
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].id.startsWith('new-session:'), true);
+  assert.equal(result.items[0].totalTokens, 99);
 });
 
 test('request-usage descriptions are domain-pinned and do not expose credentials', () => {
@@ -565,6 +709,112 @@ test('empty Token logs auto-detect safely correlated browser account logs on any
   assert.equal(browserCalls[0].request.headers.Authorization, undefined);
   assert.match(browserCalls[0].request.requestPath, /^\/api\/log\/self\/\?/);
   assert.match(browserCalls[0].request.requestPath, /page_size=100/);
+});
+
+test('account-log correlation accepts provider completion counts that exclude reasoning output', async () => {
+  const engine = new ProviderRequestUsageEngine({
+    fetchImpl: async url => new Response(JSON.stringify(String(url).endsWith('/api/status')
+      ? statusPayload()
+      : logPayload([])), { status: 200 }),
+    browserBroker: {
+      isConnected: () => true,
+      listQueryClients: () => [{ clientRef: 'edge-anyrouter', browser: 'Edge', hasSession: true }],
+      async queryJsonOnClient() {
+        return {
+          status: 200,
+          text: JSON.stringify(accountLogPayload([
+            {
+              id: 52, token_id: 7, token_name: 'current-key', created_at: 1_700_000_099, type: 2,
+              model_name: 'gpt-5.6-sol', quota: 90_000, prompt_tokens: 31_082, completion_tokens: 46,
+              other: JSON.stringify({ request_path: '/v1/responses', cache_tokens: 30_208 }),
+            },
+            {
+              id: 51, token_id: 7, token_name: 'current-key', created_at: 1_700_000_090, type: 2,
+              model_name: 'gpt-5.6-sol', quota: 80_000, prompt_tokens: 30_845, completion_tokens: 40,
+              other: JSON.stringify({ request_path: '/v1/responses', cache_tokens: 30_208 }),
+            },
+          ])),
+        };
+      },
+    },
+  });
+
+  const result = await engine.query({
+    id: 'anyrouter-reasoning',
+    name: 'AnyRouter',
+    apiBaseUrl: 'https://anyrouter.top/v1',
+    apiKey: 'anyrouter-private-key',
+  }, {
+    requestUsageTemplateId: 'new-api-token-log',
+    appType: 'codex',
+    getLocalRequestRows: () => [
+      {
+        createdAt: '2023-11-14T22:14:59.000Z', model: 'gpt-5.6-sol', requestModel: 'gpt-5.6-sol',
+        inputTokens: 31_082, outputTokens: 264, statusCode: 200,
+      },
+      {
+        createdAt: '2023-11-14T22:14:50.000Z', model: 'gpt-5.6-sol', requestModel: 'gpt-5.6-sol',
+        inputTokens: 30_845, outputTokens: 40, statusCode: 200,
+      },
+    ],
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.source, 'provider_account_log');
+  assert.equal(result.localCorrelationMatches, 2);
+  assert.deepEqual(result.items.map(item => item.id), ['52', '51']);
+});
+
+test('non-AnyRouter account-log correlation keeps exact completion token matching', async () => {
+  const engine = new ProviderRequestUsageEngine({
+    fetchImpl: async url => new Response(JSON.stringify(String(url).endsWith('/api/status')
+      ? statusPayload()
+      : logPayload([])), { status: 200 }),
+    browserBroker: {
+      isConnected: () => true,
+      listQueryClients: () => [{ clientRef: 'edge-relay', browser: 'Edge', hasSession: true }],
+      async queryJsonOnClient() {
+        return {
+          status: 200,
+          text: JSON.stringify(accountLogPayload([
+            {
+              id: 62, token_id: 9, token_name: 'relay-key', created_at: 1_700_000_099, type: 2,
+              model_name: 'gpt-5.6-sol', quota: 90_000, prompt_tokens: 31_082, completion_tokens: 46,
+              other: JSON.stringify({ request_path: '/v1/responses', cache_tokens: 30_208 }),
+            },
+            {
+              id: 61, token_id: 9, token_name: 'relay-key', created_at: 1_700_000_090, type: 2,
+              model_name: 'gpt-5.6-sol', quota: 80_000, prompt_tokens: 30_845, completion_tokens: 40,
+              other: JSON.stringify({ request_path: '/v1/responses', cache_tokens: 30_208 }),
+            },
+          ])),
+        };
+      },
+    },
+  });
+
+  const result = await engine.query({
+    id: 'ordinary-relay',
+    name: '普通 New API 中转',
+    apiBaseUrl: 'https://relay.example/v1',
+    apiKey: 'relay-private-key',
+  }, {
+    requestUsageTemplateId: 'new-api-token-log',
+    appType: 'codex',
+    getLocalRequestRows: () => [
+      {
+        createdAt: '2023-11-14T22:14:59.000Z', model: 'gpt-5.6-sol', requestModel: 'gpt-5.6-sol',
+        inputTokens: 31_082, outputTokens: 264, statusCode: 200,
+      },
+      {
+        createdAt: '2023-11-14T22:14:50.000Z', model: 'gpt-5.6-sol', requestModel: 'gpt-5.6-sol',
+        inputTokens: 30_845, outputTokens: 40, statusCode: 200,
+      },
+    ],
+  });
+
+  assert.equal(result.success, false);
+  assert.equal(result.errorType, 'account_scope');
 });
 
 test('Token-log WAF failures use the same safely correlated browser account-log fallback', async () => {

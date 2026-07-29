@@ -205,6 +205,55 @@ test('request usage prefers exact provider logs without reading CCSwitch fallbac
   assert.equal(localReads, 0);
 });
 
+test('AnyRouter domestic mirrors reuse the same-key canonical provider request logs', async () => {
+  const domestic = {
+    ...provider('domestic-logs', 'any的国内镜像'),
+    apiKey: 'same-anyrouter-key',
+    apiBaseUrl: 'https://a-ocnfniawgw.cn-shanghai.fcapp.run/v1',
+  };
+  const foreign = {
+    ...provider('foreign-logs', 'any的国外我自己的'),
+    apiKey: 'same-anyrouter-key',
+    apiBaseUrl: 'https://anyrouter.top/v1',
+  };
+  const localLookups = [];
+  let queriedProvider = null;
+  const service = new HubService({
+    getAll: () => [domestic, foreign],
+    getCredentialAppTypes: () => ['codex'],
+    getRecentRequests(providerId, limit) {
+      localLookups.push({ providerId, limit });
+      return providerId === foreign.id
+        ? [{ createdAt: '2026-07-28T16:33:07.000Z', model: 'gpt-5.6-sol', inputTokens: 30_845, outputTokens: 40, statusCode: 200 }]
+        : [];
+    },
+  }, { async query() { return {}; } }, {
+    requestUsageEngine: {
+      async query(item, options) {
+        queriedProvider = item;
+        const rows = options.getLocalRequestRows(10);
+        return {
+          success: true,
+          supported: true,
+          providerId: item.id,
+          providerName: item.name,
+          source: 'provider_account_log',
+          billing: { exact: true, unit: 'USD' },
+          items: rows,
+        };
+      },
+    },
+  });
+
+  const result = await service.queryRequestUsage(domestic.id, { limit: 10 });
+
+  assert.equal(queriedProvider.id, foreign.id);
+  assert.deepEqual(localLookups, [{ providerId: foreign.id, limit: 10 }]);
+  assert.equal(result.providerId, domestic.id);
+  assert.equal(result.providerName, domestic.name);
+  assert.equal(result.items.length, 1);
+});
+
 test('request usage falls back to marked CCSwitch estimates when provider logs are unavailable', async () => {
   const item = provider('packy', 'PackyCode');
   let localLookup;
@@ -1393,6 +1442,112 @@ test('Hub persists an AnyRouter browser binding without exposing its account fin
   assert.equal(persisted.providers.every(item => item.accountBinding.accountRef === 'A'.repeat(43)), true);
   const restored = new HubService(repository, { async query() { return {}; } }, { cachePath });
   assert.deepEqual(restored.getState().providers[0].accountBinding, { clientRef: 'edge-ref-one', browser: 'Edge' });
+});
+
+test('AnyRouter binding discards a browser result when provider configuration changes in flight', async () => {
+  const original = { ...provider('any-race', 'any的国外我自己的'), apiKey: 'old-key' };
+  let providers = [original];
+  let releaseBinding;
+  let markStarted;
+  let queryCalls = 0;
+  const started = new Promise(resolve => { markStarted = resolve; });
+  const gate = new Promise(resolve => { releaseBinding = resolve; });
+  const service = new HubService({ getAll: () => providers }, {
+    async bindBrowserAccount() {
+      markStarted();
+      await gate;
+      return {
+        binding: {
+          clientRef: 'edge-ref-one', browser: 'Edge', origin: 'https://anyrouter.top',
+          accountRef: 'R'.repeat(43), boundAt: '2026-07-29T00:00:00.000Z',
+        },
+      };
+    },
+    async query() { queryCalls += 1; return {}; },
+  });
+
+  const pending = service.bindAccount(original.id, { clientRef: 'edge-ref-one' });
+  await started;
+  providers = [{ ...original, apiKey: 'new-key' }];
+  releaseBinding();
+
+  await assert.rejects(pending, /绑定期间已变更/);
+  assert.equal(queryCalls, 0, 'the stale binding must never reach the replacement provider query');
+  assert.equal(service.getState().providers[0].accountBinding, null);
+});
+
+test('AnyRouter binding invalidates an older balance refresh and reruns with the new account', async () => {
+  const item = { ...provider('any-refresh-race', 'any的国外我自己的'), apiKey: 'race-key' };
+  let releaseFirst;
+  let markFirstStarted;
+  const firstStarted = new Promise(resolve => { markFirstStarted = resolve; });
+  const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+  const queryBindings = [];
+  const binding = {
+    clientRef: 'edge-ref-one', browser: 'Edge', origin: 'https://anyrouter.top',
+    accountRef: 'B'.repeat(43), boundAt: '2026-07-29T00:00:00.000Z',
+  };
+  const service = new HubService({ getAll: () => [item] }, {
+    async bindBrowserAccount() { return { binding }; },
+    async query(current, options) {
+      queryBindings.push(options.accountBinding || null);
+      if (queryBindings.length === 1) {
+        markFirstStarted();
+        await firstGate;
+      }
+      const bound = Boolean(options.accountBinding);
+      return {
+        source: 'browser_session',
+        usage: {
+          status: 'ok', providerId: current.id, providerName: current.name,
+          used: bound ? 20 : 90, remaining: bound ? 80 : 10, total: 100,
+          unit: 'USD', extra: '', updatedAt: '2026-07-29T00:00:00.000Z', refreshIntervalMinutes: 5,
+        },
+      };
+    },
+  });
+
+  const staleRefresh = service.refreshProvider(item.id);
+  await firstStarted;
+  const bindingRefresh = service.bindAccount(item.id, { clientRef: 'edge-ref-one' });
+  while (!service.getState().providers[0].accountBinding) {
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  releaseFirst();
+  await Promise.all([staleRefresh, bindingRefresh]);
+
+  assert.equal(queryBindings.length, 2);
+  assert.equal(queryBindings[0], null);
+  assert.deepEqual(queryBindings[1], binding);
+  const state = service.getState().providers[0];
+  assert.equal(state.usage.remaining, 80);
+  assert.deepEqual(state.accountBinding, { clientRef: 'edge-ref-one', browser: 'Edge' });
+});
+
+test('AnyRouter binding fails closed and rolls back when Hub cache persistence fails', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-binding-cache-failure-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const blocker = path.join(directory, 'not-a-directory');
+  fs.writeFileSync(blocker, 'blocked', 'utf8');
+  const item = { ...provider('any-cache-failure', 'any的国外我自己的'), apiKey: 'binding-key' };
+  let queryCalls = 0;
+  const service = new HubService({ getAll: () => [item] }, {
+    async bindBrowserAccount() {
+      return {
+        binding: {
+          clientRef: 'chrome-ref-one', browser: 'Chrome', origin: 'https://anyrouter.top',
+          accountRef: 'C'.repeat(43), boundAt: '2026-07-29T00:00:00.000Z',
+        },
+      };
+    },
+    async query() { queryCalls += 1; return {}; },
+  }, { cachePath: path.join(blocker, 'hub-cache.json') });
+
+  await assert.rejects(service.bindAccount(item.id, { clientRef: 'chrome-ref-one' }), /未能保存/);
+  const state = service.getState();
+  assert.equal(state.providers[0].accountBinding, null);
+  assert.ok(state.cacheError, 'the persistence failure must remain visible in Hub diagnostics');
+  assert.equal(queryCalls, 0);
 });
 
 test('Hub clears a bound AnyRouter balance when the browser account changes', async () => {

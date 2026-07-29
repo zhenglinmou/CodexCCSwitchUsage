@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
@@ -18,6 +19,8 @@ const ACCOUNT_LOG_TIME_TOLERANCE_SECONDS = 3;
 const OPENAI_CODEX_SESSION_TEMPLATE_ID = 'openai-codex-session';
 const OPENAI_CODEX_SESSION_SOURCE = 'openai_codex_session';
 const CODEX_SESSION_FILE_LIMIT = 5_000;
+const CODEX_SESSION_INDEX_MAX_BYTES = 8_000_000;
+const CODEX_SESSION_APPEND_BOUNDARY_BYTES = 4_096;
 
 const EXCLUDED_PROVIDER_KINDS = new Set(['cpa']);
 const NEW_API_LOG_ADAPTERS = Object.freeze([
@@ -304,7 +307,7 @@ function listCodexSessionFiles(root, output, maximum) {
     } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.jsonl')) {
       try {
         const stat = fs.statSync(filename);
-        output.push({ filename, size: stat.size, mtimeMs: stat.mtimeMs });
+        output.push({ filename, size: stat.size, mtimeMs: stat.mtimeMs, birthtimeMs: stat.birthtimeMs });
       } catch {}
     }
   }
@@ -356,8 +359,13 @@ export class CodexSessionUsageReader {
     const userProfile = String(process.env.USERPROFILE || '').trim();
     this.codexHome = String(options.codexHome || (userProfile ? path.join(userProfile, '.codex') : ''));
     this.maximumFiles = Math.max(1, Math.min(20_000, Number(options.maximumFiles) || CODEX_SESSION_FILE_LIMIT));
+    this.maximumCachedFiles = Math.max(1, Math.min(5_000, Number(options.maximumCachedFiles) || 512));
+    this.maximumItemsPerFile = Math.max(MAX_REQUEST_USAGE_LIMIT, Math.min(512, Number(options.maximumItemsPerFile) || 64));
+    this.indexPath = String(options.indexPath || '');
     this.fileCache = new Map();
     this.fileScans = new Map();
+    this.indexDirty = false;
+    this.persistedIndex = this.#readIndex();
   }
 
   async query(provider, options = {}) {
@@ -376,25 +384,51 @@ export class CodexSessionUsageReader {
     for (const filename of this.fileCache.keys()) {
       if (!activeFiles.has(filename)) this.fileCache.delete(filename);
     }
+    for (const filename of this.persistedIndex.keys()) {
+      if (!activeFiles.has(filename)) {
+        this.persistedIndex.delete(filename);
+        this.indexDirty = true;
+      }
+    }
     files.sort((left, right) => right.mtimeMs - left.mtimeMs || right.filename.localeCompare(left.filename));
 
+    const limit = normalizeRequestUsageLimit(options.limit);
     const items = [];
     let officialSessionCount = 0;
-    for (const file of files) {
+    let totalRecords = 0;
+    let complete = true;
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
       const result = await this.#scanFile(file);
       if (!result.official) continue;
       officialSessionCount += 1;
+      totalRecords += result.recordCount;
       items.push(...result.items);
+      const nextFile = files[index + 1];
+      if (!nextFile || index < 3 || items.length < limit) continue;
+      const nextSignature = `${nextFile.size}:${nextFile.mtimeMs}:${nextFile.birthtimeMs}`;
+      const nextCached = this.fileCache.get(nextFile.filename) || this.persistedIndex.get(nextFile.filename);
+      if (nextCached?.signature === nextSignature) continue;
+      const newest = items.slice().sort((left, right) => {
+        const timeDifference = Date.parse(right.createdAt) - Date.parse(left.createdAt);
+        return timeDifference || right.id.localeCompare(left.id);
+      });
+      const oldestNeededAt = Date.parse(newest[Math.min(limit, newest.length) - 1]?.createdAt || '');
+      if (Number.isFinite(oldestNeededAt) && nextFile.mtimeMs <= oldestNeededAt) {
+        complete = false;
+        break;
+      }
     }
     items.sort((left, right) => {
       const timeDifference = Date.parse(right.createdAt) - Date.parse(left.createdAt);
       return timeDifference || right.id.localeCompare(left.id);
     });
-    const limit = normalizeRequestUsageLimit(options.limit);
+    this.#writeIndex();
     return {
       items: items.slice(0, limit),
-      totalRecords: items.length,
+      totalRecords,
       officialSessionCount,
+      complete,
     };
   }
 
@@ -409,14 +443,35 @@ export class CodexSessionUsageReader {
   }
 
   #scanFile(file) {
-    const signature = `${file.size}:${file.mtimeMs}`;
-    const cached = this.fileCache.get(file.filename);
-    if (cached?.signature === signature) return Promise.resolve(cached.result);
+    const signature = `${file.size}:${file.mtimeMs}:${file.birthtimeMs}`;
+    const cached = this.fileCache.get(file.filename) || this.persistedIndex.get(file.filename);
+    if (cached?.signature === signature) {
+      this.#rememberFile(file.filename, cached);
+      return Promise.resolve(cached.result);
+    }
     const active = this.fileScans.get(file.filename);
     if (active?.signature === signature) return active.promise;
-    const promise = this.#scanFileUncached(file.filename)
-      .then(result => {
-        this.fileCache.set(file.filename, { signature, result });
+    const appendFrom = cached
+      && cached.size < file.size
+      && Number(cached.birthtimeMs) === Number(file.birthtimeMs)
+      && cached.state?.canAppend === true
+      && this.#appendBoundaryMatches(file.filename, cached)
+      ? cached
+      : null;
+    const promise = this.#scanFileUncached(file.filename, file.size, appendFrom)
+      .then(({ result, state }) => {
+        const entry = {
+          signature,
+          size: file.size,
+          mtimeMs: file.mtimeMs,
+          birthtimeMs: file.birthtimeMs,
+          result,
+          state,
+        };
+        this.#rememberFile(file.filename, entry);
+        this.persistedIndex.set(file.filename, entry);
+        this.#prunePersistedIndex();
+        this.indexDirty = true;
         return result;
       })
       .finally(() => {
@@ -426,15 +481,20 @@ export class CodexSessionUsageReader {
     return promise;
   }
 
-  async #scanFileUncached(filename) {
-    const input = fs.createReadStream(filename, { encoding: 'utf8' });
+  async #scanFileUncached(filename, targetSize, previous = null) {
+    const input = fs.createReadStream(filename, {
+      encoding: 'utf8',
+      ...(previous ? { start: previous.size } : {}),
+      ...(targetSize > 0 ? { end: targetSize - 1 } : {}),
+    });
     const lines = createInterface({ input, crlfDelay: Infinity });
-    let official = null;
-    let sessionId = path.basename(filename, path.extname(filename));
-    let model = '';
-    let previousCumulative = 0;
-    let segment = 0;
-    const items = [];
+    let official = previous ? previous.result.official : null;
+    let sessionId = previous?.state?.sessionId || path.basename(filename, path.extname(filename));
+    let model = previous?.state?.model || '';
+    let previousCumulative = Math.max(0, Number(previous?.state?.previousCumulative) || 0);
+    let segment = Math.max(0, Number(previous?.state?.segment) || 0);
+    let recordCount = Math.max(0, Number(previous?.result?.recordCount) || 0);
+    const items = Array.isArray(previous?.result?.items) ? previous.result.items.slice(0, this.maximumItemsPerFile) : [];
     try {
       for await (const line of lines) {
         if (official !== true && line.includes('"type":"session_meta"')) {
@@ -473,13 +533,143 @@ export class CodexSessionUsageReader {
         if (cumulativeTokens <= previousCumulative) continue;
         previousCumulative = cumulativeTokens;
         const item = codexSessionItem(sessionId, segment, cumulativeTokens, event, model);
-        if (item) items.push(item);
+        if (item) {
+          recordCount += 1;
+          items.push(item);
+          items.sort((left, right) => {
+            const timeDifference = Date.parse(right.createdAt) - Date.parse(left.createdAt);
+            return timeDifference || right.id.localeCompare(left.id);
+          });
+          if (items.length > this.maximumItemsPerFile) items.length = this.maximumItemsPerFile;
+        }
       }
     } finally {
       lines.close();
       input.destroy();
     }
-    return { official: official === true, items };
+    items.sort((left, right) => {
+      const timeDifference = Date.parse(right.createdAt) - Date.parse(left.createdAt);
+      return timeDifference || right.id.localeCompare(left.id);
+    });
+    return {
+      result: { official: official === true, items, recordCount },
+      state: {
+        sessionId,
+        model,
+        previousCumulative,
+        segment,
+        canAppend: targetSize === 0 || this.#fileEndsWithNewline(filename, targetSize),
+        appendBoundaryHash: this.#appendBoundaryHash(filename, targetSize),
+      },
+    };
+  }
+
+  #rememberFile(filename, entry) {
+    this.fileCache.delete(filename);
+    this.fileCache.set(filename, entry);
+    while (this.fileCache.size > this.maximumCachedFiles) {
+      this.fileCache.delete(this.fileCache.keys().next().value);
+    }
+  }
+
+  #prunePersistedIndex() {
+    while (this.persistedIndex.size > this.maximumCachedFiles) {
+      let oldestFilename = '';
+      let oldestMtime = Number.POSITIVE_INFINITY;
+      for (const [filename, entry] of this.persistedIndex) {
+        const mtime = Number(entry?.mtimeMs) || 0;
+        if (mtime < oldestMtime) {
+          oldestFilename = filename;
+          oldestMtime = mtime;
+        }
+      }
+      if (!oldestFilename) break;
+      this.persistedIndex.delete(oldestFilename);
+    }
+  }
+
+  #appendBoundaryMatches(filename, entry) {
+    const expected = String(entry?.state?.appendBoundaryHash || '');
+    return Boolean(expected && expected === this.#appendBoundaryHash(filename, entry.size));
+  }
+
+  #appendBoundaryHash(filename, sizeValue) {
+    const size = Math.max(0, Math.trunc(Number(sizeValue) || 0));
+    if (size === 0) return crypto.createHash('sha256').digest('base64url');
+    const length = Math.min(size, CODEX_SESSION_APPEND_BOUNDARY_BYTES);
+    let descriptor;
+    try {
+      descriptor = fs.openSync(filename, 'r');
+      const bytes = Buffer.allocUnsafe(length);
+      const read = fs.readSync(descriptor, bytes, 0, length, size - length);
+      if (read !== length) return '';
+      return crypto.createHash('sha256').update(bytes).digest('base64url');
+    } catch {
+      return '';
+    } finally {
+      if (descriptor != null) try { fs.closeSync(descriptor); } catch {}
+    }
+  }
+
+  #fileEndsWithNewline(filename, sizeValue) {
+    let descriptor;
+    try {
+      const size = Math.max(0, Math.trunc(Number(sizeValue) || 0));
+      if (size === 0) return true;
+      descriptor = fs.openSync(filename, 'r');
+      const byte = Buffer.allocUnsafe(1);
+      fs.readSync(descriptor, byte, 0, 1, size - 1);
+      return byte[0] === 10;
+    } catch {
+      return false;
+    } finally {
+      if (descriptor != null) try { fs.closeSync(descriptor); } catch {}
+    }
+  }
+
+  #readIndex() {
+    if (!this.indexPath) return new Map();
+    try {
+      if (fs.statSync(this.indexPath).size > CODEX_SESSION_INDEX_MAX_BYTES) return new Map();
+      const payload = JSON.parse(fs.readFileSync(this.indexPath, 'utf8'));
+      if (payload?.version !== 1 || !Array.isArray(payload.files)) return new Map();
+      return new Map(payload.files.slice(0, this.maximumCachedFiles).flatMap(record => {
+        const filename = String(record?.filename || '');
+        const entry = record?.entry;
+        if (!filename || !entry || typeof entry !== 'object' || !entry.result || !entry.state) return [];
+        const items = Array.isArray(entry.result.items)
+          ? entry.result.items.slice(0, this.maximumItemsPerFile)
+          : [];
+        return [[filename, { ...entry, result: { ...entry.result, items } }]];
+      }));
+    } catch {
+      return new Map();
+    }
+  }
+
+  #writeIndex() {
+    if (!this.indexPath || !this.indexDirty) return;
+    const temporary = `${this.indexPath}.tmp`;
+    try {
+      const candidates = [...this.persistedIndex.entries()]
+        .sort(([, left], [, right]) => Number(right.mtimeMs) - Number(left.mtimeMs))
+        .slice(0, this.maximumCachedFiles);
+      const files = [];
+      let serializedBytes = Buffer.byteLength('{"version":1,"files":[]}');
+      for (const [filename, entry] of candidates) {
+        const record = { filename, entry };
+        const recordBytes = Buffer.byteLength(JSON.stringify(record)) + (files.length ? 1 : 0);
+        if (serializedBytes + recordBytes > CODEX_SESSION_INDEX_MAX_BYTES) break;
+        files.push(record);
+        serializedBytes += recordBytes;
+      }
+      fs.mkdirSync(path.dirname(this.indexPath), { recursive: true });
+      fs.writeFileSync(temporary, JSON.stringify({ version: 1, files }), 'utf8');
+      fs.renameSync(temporary, this.indexPath);
+      this.indexDirty = false;
+    } catch {
+      try { fs.rmSync(temporary, { force: true }); } catch {}
+    }
   }
 }
 
@@ -629,7 +819,7 @@ function parseAccountLogRows(payload, providerName) {
   return data.items.filter(isProviderRequestLogRow);
 }
 
-function accountLogRowMatchesLocal(row, local) {
+function accountLogRowMatchesLocal(row, local, options = {}) {
   if (Number(row?.type) !== 2) return false;
   const remoteTimestamp = finiteNumber(row?.created_at);
   const localTimestamp = localRequestTimestamp(local);
@@ -640,11 +830,17 @@ function accountLogRowMatchesLocal(row, local) {
   ) return false;
   const remoteModel = cleanText(row?.model_name || row?.model, 160).toLocaleLowerCase('en-US');
   if (!remoteModel || !localRequestModels(local).has(remoteModel)) return false;
+  const remoteCompletionTokens = integerOrNull(row?.completion_tokens);
+  const localOutputTokens = integerOrNull(local?.outputTokens);
+  const completionMatches = remoteCompletionTokens === localOutputTokens
+    || (options.allowCompletionSubset === true
+      && remoteCompletionTokens != null && remoteCompletionTokens > 0
+      && localOutputTokens != null && localOutputTokens > remoteCompletionTokens);
   return integerOrNull(row?.prompt_tokens) === integerOrNull(local?.inputTokens)
-    && integerOrNull(row?.completion_tokens) === integerOrNull(local?.outputTokens);
+    && completionMatches;
 }
 
-function correlateAccountLogRows(accountRows, localRows, appType = '') {
+function correlateAccountLogRows(accountRows, localRows, appType = '', options = {}) {
   const normalizedAppType = String(appType || '').trim().toLowerCase();
   const remote = accountRows
     .map((row, index) => ({ row, index, identity: accountLogTokenIdentity(row) }))
@@ -660,7 +856,9 @@ function correlateAccountLogRows(accountRows, localRows, appType = '') {
   const usedRemote = new Set();
   const matches = [];
   for (const localItem of local) {
-    const candidates = remote.filter(item => !usedRemote.has(item.index) && accountLogRowMatchesLocal(item.row, localItem.row));
+    const candidates = remote.filter(item => (
+      !usedRemote.has(item.index) && accountLogRowMatchesLocal(item.row, localItem.row, options)
+    ));
     const identities = new Set(candidates.map(item => item.identity));
     if (identities.size !== 1) continue;
     const selected = candidates[0];
@@ -933,6 +1131,7 @@ export class ProviderRequestUsageEngine {
           requestCount: sessionResult.items.length,
           totalOfficialRecords: sessionResult.totalRecords,
           officialSessionCount: sessionResult.officialSessionCount,
+          officialIndexComplete: sessionResult.complete,
           schemaValidated: true,
           billing: {
             available: false,
@@ -1153,7 +1352,9 @@ export class ProviderRequestUsageEngine {
         if (raw?.identityMissing === true || Number(raw?.status) !== 200) continue;
         const payload = parseBrowserJson(raw?.text);
         const accountRows = parseAccountLogRows(payload, providerLabel(provider));
-        const correlation = correlateAccountLogRows(accountRows, correlatableLocalRows, base.appType);
+        const correlation = correlateAccountLogRows(accountRows, correlatableLocalRows, base.appType, {
+          allowCompletionSubset: config.adapterId === 'anyrouter',
+        });
         if (!correlation) continue;
         const items = parseProviderRequestLogs({ success: true, message: '', data: correlation.rows }, display, limit, {
           appType: base.appType,
