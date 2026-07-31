@@ -132,6 +132,17 @@ test('closing the browser callback broker clears connected clients from status',
   assert.deepEqual(status.clients, []);
 });
 
+test('connection checks and job admission do not materialize the public companion status', async () => {
+  const broker = new BrowserCallbackBroker();
+  broker.heartbeat(peer({ clientId: 'edge-client-one', browser: 'Edge', sessions: ['https://chatgpt.com'] }));
+  broker.getStatus = () => { throw new Error('public status should not be built'); };
+
+  assert.equal(broker.isConnected(), true);
+  const pending = broker.queryJson({ baseUrl: 'https://chatgpt.com', requestPath: '/backend-api/wham/usage' });
+  broker.close();
+  await assert.rejects(pending, /回调已关闭/);
+});
+
 test('an explicit companion heartbeat restores and replaces browser session origins', async () => {
   const broker = new BrowserCallbackBroker();
   broker.heartbeat(peer({

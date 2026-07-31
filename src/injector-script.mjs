@@ -248,7 +248,7 @@ export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = glob
 }
 
 export { PAGE_ACTION_SENTINEL };
-export const INJECTOR_VERSION = 83;
+export const INJECTOR_VERSION = 84;
 
 function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, formatRequestTime, calculatePopoverPlacement, selectResponsiveUsageMode, calculateResponsiveMeasurements, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, enqueuePageActionTitle, pageActionSentinel, version) {
   const VERSION = version;
@@ -961,10 +961,6 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     if (payload.status !== 'ok') {
       elements.push(dynamicElement('span', 'message', payload.message || (payload.status === 'unsupported' ? '未配置用量' : '读取中…')));
       return elements;
-    }
-    if (payload.extra) {
-      const parts = String(payload.extra).split(/[，,；;|]+/).map(part => part.trim()).filter(Boolean);
-      parts.forEach((part, index) => elements.push(dynamicElement('span', `metric extra ${index > 0 ? 'extra-secondary' : ''}`.trim(), part)));
     }
     const used = formatNumber(payload.used);
     const remaining = formatNumber(payload.remaining);

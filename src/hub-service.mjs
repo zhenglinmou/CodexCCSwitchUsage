@@ -443,7 +443,11 @@ export class HubService {
     this.cacheError = '';
     this.revision = 0;
     this.providerSnapshot = null;
+    this.providerSelectors = new Map();
     this.publicProvidersCache = null;
+    this.publicStateProvidersCache = null;
+    this.publicStateRevision = -1;
+    this.browserOriginsCache = null;
     this.lastFullRefreshAt = '';
     this.lastFullRefreshDurationMs = null;
     this.cachedItems = readCache(this.cachePath);
@@ -539,12 +543,29 @@ export class HubService {
     }
     this.cachedItems = {};
     this.providerSnapshot = providers;
+    const selectors = new Map();
+    for (const provider of providers) {
+      const id = String(provider.id || '').trim().toLowerCase();
+      if (id) selectors.set(id, provider);
+    }
+    for (const provider of providers) {
+      for (const alias of providerAliases(provider)) {
+        if (!selectors.has(alias)) selectors.set(alias, provider);
+      }
+    }
+    this.providerSelectors = selectors;
     this.publicProvidersCache = null;
+    this.browserOriginsCache = null;
     this.revision += 1;
     return { changed: true, providers };
   }
 
   getState() {
+    if (this.publicStateRevision !== this.revision) {
+      this.publicStateProvidersCache = [...this.items.values()]
+        .map(item => this.#publicItem(item, this.refreshes.has(item.id)));
+      this.publicStateRevision = this.revision;
+    }
     return {
       version: 2,
       revision: this.revision,
@@ -552,15 +573,21 @@ export class HubService {
       lastFullRefreshAt: this.lastFullRefreshAt,
       lastFullRefreshDurationMs: this.lastFullRefreshDurationMs,
       cacheError: this.cacheError,
-      providers: [...this.items.values()].map(item => this.#publicItem(item, this.refreshes.has(item.id))),
+      providers: this.publicStateProvidersCache,
+    };
+  }
+
+  getSummary() {
+    return {
+      providers: this.items.size,
+      refreshing: this.refreshes.size > 0,
     };
   }
 
   findProvider(selector) {
     const key = String(selector || '').trim().toLowerCase();
     if (!key) return null;
-    if (this.providers.has(key)) return this.providers.get(key);
-    return [...this.providers.values()].find(provider => providerAliases(provider).includes(key)) || null;
+    return this.providerSelectors.get(key) || null;
   }
 
   getProviderConfigurationFingerprint(providerOrSelector) {
@@ -703,6 +730,7 @@ export class HubService {
   }
 
   listBrowserOrigins() {
+    if (this.browserOriginsCache) return this.browserOriginsCache;
     const origins = new Set();
     for (const provider of this.providers.values()) {
       const selection = this.items.get(provider.id)?.templateSelection || templateSelectionFor(provider, this.templateStore);
@@ -723,7 +751,8 @@ export class HubService {
         if (origin) origins.add(origin);
       }
     }
-    return [...origins].sort();
+    this.browserOriginsCache = Object.freeze([...origins].sort());
+    return this.browserOriginsCache;
   }
 
   refreshProvider(providerSelector) {

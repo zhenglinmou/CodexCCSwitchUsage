@@ -41,8 +41,19 @@ function sourceSection(source, startMarker, endMarker) {
 
 test('injector script carries an exported version for hot replacement', () => {
   assert.equal(Number.isInteger(INJECTOR_VERSION), true);
-  assert.ok(INJECTOR_VERSION >= 83);
+  assert.ok(INJECTOR_VERSION >= 84);
   assert.match(buildInjectorScript(), new RegExp(`,${INJECTOR_VERSION}\\)$`));
+});
+
+test('footer hides provider details while tooltip and popover retain them', () => {
+  const script = buildInjectorScript();
+  const title = sourceSection(script, 'function usageTitle(payload) {', 'function popoverRows(payload) {');
+  const popover = sourceSection(script, 'function popoverRows(payload) {', 'function formatTokenCount(');
+  const footer = sourceSection(script, 'function buildUsageElements(payload, balanceLevel) {', 'function renderInstance(');
+
+  assert.doesNotMatch(footer, /payload\.extra|metric extra/);
+  assert.match(title, /if \(payload\.extra\) values\.push\(payload\.extra\)/);
+  assert.match(popover, /if \(payload\.extra\)/);
 });
 
 test('popover placement stays inside the viewport above or below a top-edge trigger', () => {

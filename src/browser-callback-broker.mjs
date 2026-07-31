@@ -165,7 +165,12 @@ export class BrowserCallbackBroker {
   }
 
   isConnected() {
-    return this.getStatus().connected;
+    this.#pruneClients();
+    const cutoff = this.now() - this.connectionMaxAgeMs;
+    for (const client of this.clients.values()) {
+      if (client.lastSeenAt >= cutoff) return true;
+    }
+    return false;
   }
 
   listQueryClients(origin = '') {
@@ -300,7 +305,6 @@ export class BrowserCallbackBroker {
 
   #enqueue(type, request, timeoutMs, options = {}) {
     if (this.closed) return Promise.reject(new Error('浏览器余额伴侣回调已关闭'));
-    this.#pruneClients();
     if (!this.isConnected()) return Promise.reject(new Error('现有浏览器余额伴侣未连接'));
     if (this.pending.size >= this.maxPendingJobs) return Promise.reject(new Error('浏览器余额任务数量已达到上限'));
     const signal = options?.signal;

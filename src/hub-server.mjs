@@ -218,12 +218,14 @@ export class HubServer {
       return;
     }
     if (request.method === 'GET' && ['/', '/health', '/v1/health'].includes(url.pathname)) {
-      const state = this.service.getState();
+      const state = typeof this.service.getSummary === 'function'
+        ? this.service.getSummary()
+        : this.service.getState();
       jsonResponse(response, 200, {
         success: true,
         service: 'codex-ccswitch-balance-hub',
         version: 2,
-        providers: state.providers.length,
+        providers: Array.isArray(state.providers) ? state.providers.length : Math.max(0, Number(state.providers) || 0),
         refreshing: state.refreshing,
       });
       return;

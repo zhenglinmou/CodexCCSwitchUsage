@@ -82,6 +82,30 @@ test('Hub state exposes safe provider fields and refreshes with bounded concurre
   assert.equal('apiKey' in state.providers[0], false);
 });
 
+test('Hub reuses derived public state and browser origins until its provider snapshot changes', () => {
+  let providers = [provider('one', 'AgentRouter', true)];
+  const service = new HubService({ getAll: () => providers }, { async query() { return {}; } });
+
+  const firstState = service.getState();
+  const secondState = service.getState();
+  const firstOrigins = service.listBrowserOrigins();
+  const secondOrigins = service.listBrowserOrigins();
+
+  assert.strictEqual(secondState.providers, firstState.providers);
+  assert.strictEqual(secondOrigins, firstOrigins);
+  assert.deepEqual(service.getSummary(), { providers: 1, refreshing: false });
+
+  providers = [...providers, provider('two', 'DeepSeek')];
+  service.syncProviders();
+
+  const changedState = service.getState();
+  const changedOrigins = service.listBrowserOrigins();
+  assert.notStrictEqual(changedState.providers, firstState.providers);
+  assert.notStrictEqual(changedOrigins, firstOrigins);
+  assert.equal(service.findProvider('TWO')?.id, 'two');
+  assert.deepEqual(service.getSummary(), { providers: 2, refreshing: false });
+});
+
 test('Hub full refresh can target only active workspace providers', async () => {
   const providers = [provider('one', 'DeepSeek', true), provider('two', 'PackyCode')];
   const queried = [];

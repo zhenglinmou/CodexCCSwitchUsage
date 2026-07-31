@@ -133,6 +133,21 @@ test('status reports mounted primary pages while event-driven CDP remains disabl
   assert.match(writeStatus, /connectionError:\s*lastConnectionError/);
 });
 
+test('status and usage-cache writes are coalesced and remain non-fatal after transient file errors', () => {
+  const source = hostSource();
+  const usageCache = source.slice(source.indexOf('function writeUsageCache('), source.indexOf('let cachedUsage ='));
+  const writeStatus = source.slice(source.indexOf('function writeStatus('), source.indexOf('function safeMessage('));
+
+  assert.match(usageCache, /try \{[\s\S]*fs\.writeFileSync[\s\S]*fs\.renameSync[\s\S]*return true/);
+  assert.match(usageCache, /catch \(error\) \{[\s\S]*lastUsageCacheError = safeMessage\(error\)[\s\S]*return false/);
+  assert.match(writeStatus, /hubService\.getSummary\(\)\.providers/);
+  assert.match(writeStatus, /browserBroker\.isConnected\(\)/);
+  assert.match(writeStatus, /const signature = JSON\.stringify\(\{ \.\.\.status, updatedAt: '' \}\)/);
+  assert.match(writeStatus, /signature === lastStatusSignature[\s\S]*STATUS_HEARTBEAT_MS/);
+  assert.match(writeStatus, /try \{[\s\S]*fs\.writeFileSync[\s\S]*fs\.renameSync[\s\S]*return true/);
+  assert.match(writeStatus, /catch \{[\s\S]*fs\.rmSync\(temporary, \{ force: true \}\)[\s\S]*return false/);
+});
+
 test('host watches explicit remount requests from the launcher', () => {
   const source = hostSource();
 

@@ -150,7 +150,8 @@ Expected fields include:
   "targetInstallFailures": 0,
   "targetInstallRetryMs": 0,
   "connectedPages": 1,
-  "connectionError": null
+  "connectionError": null,
+  "usageCacheError": null
 }
 ```
 
@@ -163,6 +164,10 @@ The recent-request popover reads the CCSwitch `latency_ms` and `first_token_ms` 
 The CCSwitch database uses `fs.watch` for immediate changes. While the watcher is healthy, the three SQLite files are audited only every 60,000 ms; the 1,000 ms retry is used only when a watcher is unavailable. SQLite/WAL activity that leaves the cached provider snapshot unchanged does not rebuild Hub state, increment its revision, or request a current-provider refresh. The Hub page loads full provider state once and polls it only while a user-started refresh operation is in progress. While visible, it polls only the lightweight companion-status route every 5,000 ms so browser connect/disconnect changes do not leave the cards stale. Only the current CCSwitch provider owns a fixed 300,000 ms balance timer.
 
 The sanitized `/v1/providers` catalog caches provider aliases, login metadata, and query descriptions for the lifetime of one repository snapshot. A changed repository snapshot invalidates that derived catalog immediately; repeated read-only requests do not redo hostname routing and metadata construction.
+
+The Hub also caches its public provider array, selector map, and browser-permission Origin list for the lifetime of the corresponding provider revision or repository snapshot. Operation polling reuses the public array until a real Hub revision occurs, companion heartbeats reuse the Origin list until provider/template configuration changes, and `/v1/health` reads only provider count plus refresh activity instead of materializing the complete provider state. Host status uses the same lightweight summary and a direct companion-connected check.
+
+Runtime status and current-provider usage cache files use same-directory atomic replacement. Repeated identical status writes are coalesced until the five-minute heartbeat, avoiding disk churn during a persistent identical error. A transient status or usage-cache file lock is treated as a diagnostics/cache failure: it is retried later and must not turn an otherwise successful live balance query into a provider error or terminate the host. `usageCacheError` reports the latest current-provider cache persistence failure when the status file remains writable.
 
 CDP target isolation is fail-closed per target. The host connects only to a `page` target whose snapshot URL is exactly the canonical Codex main document, `app://-/index.html`, with no query or fragment. Immediately after each short-lived connection, the operation revalidates that the live renderer is still the top-level canonical document before reading or changing its title, injector, or payload; a target that navigated after the HTTP snapshot is rejected and closed. Every eligible target WebSocket exists only for that acknowledgement, inspection, injection, or update call and is closed in `finally`; a socket whose handshake times out or fails is closed before ownership can transfer to a client. Deferred audits remain pending but never accelerate the maintenance loop beyond the 1,000 ms page-action cadence. A persistent one-shot installation failure uses a target-keyed `1,000 / 2,000 / 5,000 / 10,000 / 30,000 ms` retry sequence; a replacement target or new page action bypasses the old target's delay. The host never calls browser-wide `Target.setDiscoverTargets`, never keeps a target session, and never calls `Runtime.enable` or `Runtime.addBinding`. Empty URLs, `about:blank`, external pages, Browser Use WebViews, MCP App guests, auxiliary `initialRoute` windows, and every `webview` or `iframe` target are excluded from the operation list. Their presence does not delay Hub actions, refreshes, payload updates, or main-page injector maintenance because no operation ever connects to them.
 
@@ -188,7 +193,7 @@ Do not reintroduce a fixed root `max-width` or an icon-mode `flex: 0 0 28px` roo
 
 ### Codex App interaction layout performance baseline
 
-The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current injector version is `83`; the exhaustive interaction baseline below was established with injector `69` on Codex Desktop `26.715.2305.0`. Update that baseline only after completing the corresponding full live regression.
+The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current injector version is `84`; the exhaustive interaction baseline below was established with injector `69` on Codex Desktop `26.715.2305.0`. Update that baseline only after completing the corresponding full live regression.
 
 | Codex interaction | Expected injector geometry work |
 |---|---|

@@ -20,6 +20,29 @@ test('Hub path token persists across host restarts without becoming guessable', 
   assert.match(first, /^[A-Za-z0-9_-]{32}$/);
 });
 
+test('Hub health uses the lightweight service summary instead of building full provider state', async t => {
+  let summaryCalls = 0;
+  const server = new HubServer({
+    getSummary() {
+      summaryCalls += 1;
+      return { providers: 20, refreshing: true };
+    },
+    getState() {
+      throw new Error('full state should not be built for health');
+    },
+  }, { port: 0, token: 'test-token', openUrl() {} });
+  await server.start();
+  t.after(() => server.close());
+
+  const response = await fetch(`http://127.0.0.1:${server.boundPort}/v1/health`);
+  const payload = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(payload.providers, 20);
+  assert.equal(payload.refreshing, true);
+  assert.equal(summaryCalls, 1);
+});
+
 test('Hub server protects its local page and API with an unguessable path token', async t => {
   const refreshAllCalls = [];
   const refreshProviderCalls = [];

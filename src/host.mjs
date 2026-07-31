@@ -111,8 +111,16 @@ function writeUsageCache(payload, providerSignature = '') {
   delete cachePayload.recentRequestsPreciseCost;
   delete cachePayload.recentRequestsFetchedAt;
   delete cachePayload.recentRequestsMessage;
-  fs.writeFileSync(temporary, JSON.stringify({ ...cachePayload, providerSignature }), 'utf8');
-  fs.renameSync(temporary, cachePath);
+  try {
+    fs.writeFileSync(temporary, JSON.stringify({ ...cachePayload, providerSignature }), 'utf8');
+    fs.renameSync(temporary, cachePath);
+    lastUsageCacheError = '';
+    return true;
+  } catch (error) {
+    lastUsageCacheError = safeMessage(error);
+    try { fs.rmSync(temporary, { force: true }); } catch {}
+    return false;
+  }
 }
 
 let cachedUsage = readUsageCache();
@@ -178,12 +186,14 @@ let recentRequestsMessage = '';
 let recentRequestsRefreshPromise = null;
 let recentRequestsRefreshPending = false;
 let codexProcessMonitor = null;
+let lastUsageCacheError = '';
+let lastStatusSignature = '';
 
 fs.writeFileSync(pidPath, String(process.pid), 'utf8');
 
 function writeStatus(extra = {}) {
-  const temporary = `${statusPath}.tmp`;
   const stopping = stopped || extra.running === false;
+  const now = Date.now();
   const status = {
     running: !stopping,
     pid: stopping ? null : process.pid,
@@ -205,10 +215,11 @@ function writeStatus(extra = {}) {
     connectionError: lastConnectionError,
     hubRunning: stopping ? false : Boolean(hubServer.boundPort),
     hubPort: stopping ? null : (hubServer.boundPort || null),
-    hubProviders: hubService.getState().providers.length,
-    browserCompanion: stopping ? false : browserBroker.getStatus().connected,
+    hubProviders: hubService.getSummary().providers,
+    browserCompanion: stopping ? false : browserBroker.isConnected(),
     hubError: lastHubError,
-    updatedAt: new Date().toISOString(),
+    usageCacheError: lastUsageCacheError || null,
+    updatedAt: new Date(now).toISOString(),
     stopReason,
     ...extra,
     ...(stopping ? {
@@ -222,9 +233,19 @@ function writeStatus(extra = {}) {
       browserCompanion: false,
     } : {}),
   };
-  fs.writeFileSync(temporary, JSON.stringify(status, null, 2), 'utf8');
-  fs.renameSync(temporary, statusPath);
-  lastStatusWriteAt = Date.now();
+  const signature = JSON.stringify({ ...status, updatedAt: '' });
+  if (!stopping && signature === lastStatusSignature && now - lastStatusWriteAt < STATUS_HEARTBEAT_MS) return true;
+  const temporary = `${statusPath}.tmp`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(status, null, 2), 'utf8');
+    fs.renameSync(temporary, statusPath);
+    lastStatusSignature = signature;
+    lastStatusWriteAt = now;
+    return true;
+  } catch {
+    try { fs.rmSync(temporary, { force: true }); } catch {}
+    return false;
+  }
 }
 
 function safeMessage(error) {
