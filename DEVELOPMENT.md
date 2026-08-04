@@ -193,7 +193,7 @@ Do not reintroduce a fixed root `max-width` or an icon-mode `flex: 0 0 28px` roo
 
 ### Codex App interaction layout performance baseline
 
-The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current injector version is `84`; the exhaustive interaction baseline below was established with injector `69` on Codex Desktop `26.715.2305.0`. Update that baseline only after completing the corresponding full live regression.
+The injector layout policy was verified against the live Codex App through CDP function coverage, using controls inside the mounted primary composer footer rather than similarly named controls from transient side-task surfaces. The current injector version is `91`; the exhaustive interaction baseline below was established with injector `69` on Codex Desktop `26.715.2305.0`. Update that baseline only after completing the corresponding full live regression.
 
 | Codex interaction | Expected injector geometry work |
 |---|---|
@@ -202,7 +202,7 @@ The injector layout policy was verified against the live Codex App through CDP f
 | Expand/collapse command results, scroll messages, jump to a message | No layout |
 | Toggle the left sidebar, pinned summary, or bottom panel while the composer footer remains mounted | No layout; native flow moves the balance with the composer |
 | Change the access label between Full Access and Agent Approval | No layout while the free-lane width and responsive mode remain unchanged |
-| Open or close the animated model/reasoning menu | No layout when the current responsive mode still fits; native flex absorbs the width animation |
+| Open or close the animated model/reasoning menu | No layout when the current responsive mode and native trigger both fit; squeezed transient widths use an immediate layout plus one bounded 180 ms settle check to constrain or release the native trigger |
 | Animate a side panel that changes the free-lane width | Layout only when the predicted responsive mode crosses a threshold, plus the existing 180 ms direction-settle layout |
 | Click refresh outside icon mode | Render the loading attribute without scheduling layout |
 | Click refresh in icon mode | Layout is allowed because the balance popover is toggled and must be positioned |

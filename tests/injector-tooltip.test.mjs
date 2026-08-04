@@ -4,6 +4,7 @@ import fs from 'node:fs';
 
 import {
   buildInjectorScript,
+  calculateExpandedNativeTriggerMaxWidth,
   calculatePopoverPlacement,
   calculateResponsiveMeasurements,
   classifyComposerMutations,
@@ -41,7 +42,7 @@ function sourceSection(source, startMarker, endMarker) {
 
 test('injector script carries an exported version for hot replacement', () => {
   assert.equal(Number.isInteger(INJECTOR_VERSION), true);
-  assert.ok(INJECTOR_VERSION >= 84);
+  assert.ok(INJECTOR_VERSION >= 91);
   assert.match(buildInjectorScript(), new RegExp(`,${INJECTOR_VERSION}\\)$`));
 });
 
@@ -58,19 +59,33 @@ test('footer hides provider details while tooltip and popover retain them', () =
 
 test('popover placement stays inside the viewport above or below a top-edge trigger', () => {
   const below = calculatePopoverPlacement({ top: 4, bottom: 28 }, 600, 240);
-  assert.deepEqual(below, { placement: 'below', maxHeight: 554, top: 38, bottom: null });
+  assert.deepEqual(below, { placement: 'below', maxHeight: 560, top: 32, bottom: null });
   assert.ok(below.top + below.maxHeight <= 592);
 
   const above = calculatePopoverPlacement({ top: 560, bottom: 584 }, 600, 240);
-  assert.deepEqual(above, { placement: 'above', maxHeight: 542, top: null, bottom: 50 });
+  assert.deepEqual(above, { placement: 'above', maxHeight: 548, top: null, bottom: 44 });
   assert.ok(600 - above.bottom - Math.min(240, above.maxHeight) >= 8);
 
   const constrained = calculatePopoverPlacement({ top: 90, bottom: 114 }, 180, 240);
-  assert.equal(constrained.maxHeight, 72);
+  assert.equal(constrained.maxHeight, 78);
   assert.equal(constrained.placement, 'above');
   const script = buildInjectorScript();
   assert.match(script, /flex-direction:column;overflow:hidden/);
   assert.match(script, /\.popover-grid\{display:grid;flex:1 1 auto;min-height:0;[\s\S]*overflow-y:auto/);
+});
+
+test('custom popovers reuse the native menu surface and action-row styling', () => {
+  const script = buildInjectorScript();
+  const popoverStyles = sourceSection(script, '.popover{', '.tooltip{');
+
+  assert.match(popoverStyles, /padding:4px;border:0;border-radius:15px/);
+  assert.match(popoverStyles, /background:color-mix\(in srgb,var\(--color-token-dropdown-background,rgb\(38,38,38\)\) 90%,transparent\)/);
+  assert.match(popoverStyles, /box-shadow:0 0 0 \.5px [^;]+,0 8px 16px -4px rgba\(0,0,0,\.12\)/);
+  assert.match(popoverStyles, /backdrop-filter:blur\(8px\)/);
+  assert.doesNotMatch(popoverStyles, /transform:translateY|transition:/);
+  assert.match(popoverStyles, /\.popover-head\{[^}]*margin:4px 8px 0/);
+  assert.match(popoverStyles, /\.hub-open\{[^}]*height:28px;[^}]*padding:4px 8px;border:0;border-radius:\.75rem;background:transparent/);
+  assert.match(popoverStyles, /\.hub-open:hover,\.hub-open:focus-visible\{background:var\(--color-token-list-hover-background/);
 });
 
 test('every programmatic popover close synchronizes trigger and dialog ARIA state', () => {
@@ -240,10 +255,23 @@ test('Hub control shares refresh styling and stays inside the responsive content
   const source = fs.readFileSync(new URL('../src/injector-script.mjs', import.meta.url), 'utf8');
 
   assert.match(source, /\.toolbar-action\{[^}]*width:28px[^}]*height:28px/);
+  assert.match(source, /\.toolbar-action:hover\{background:var\(--color-token-list-hover-background/);
   assert.match(source, /refreshButton\.className = 'toolbar-action refresh'/);
   assert.match(source, /usage\.append\(dot, hubButton, refreshButton\)/);
   assert.match(source, /usage\.insertBefore\(element, hubButton\)/);
   assert.match(source, /:host\(\[data-mode="icon"\]\)[^{]*\.hub-trigger\{display:none\}/);
+});
+
+test('usage tooltips match the native Codex tooltip surface and spacing', () => {
+  const script = buildInjectorScript();
+  const portalSource = sourceSection(script, 'function ensurePopoverPortal() {', 'function usageTitle(');
+  const tooltipSource = sourceSection(script, 'function showUsageTooltip(instance, text, anchorElement = null) {', 'function syncMirrors(');
+
+  assert.match(portalSource, /\.tooltip\{[^}]*width:fit-content[^}]*max-width:min\(20rem,calc\(100vw - 16px\)\)/);
+  assert.match(portalSource, /\.tooltip\{[^}]*padding:4px 8px[^}]*border:1px solid var\(--color-token-border,rgba\(127,127,127,\.08\)\)[^}]*border-radius:\.75rem/);
+  assert.match(portalSource, /\.tooltip\{[^}]*box-shadow:none[^}]*font-size:var\(--text-sm,13px\)[^}]*font-weight:445/);
+  assert.doesNotMatch(portalSource, /\.tooltip\{[^}]*translateY|\.tooltip\{[^}]*box-shadow:0/);
+  assert.match(tooltipSource, /innerHeight - anchorRect\.top \+ 4/);
 });
 
 test('refresh loading animation follows the counter-clockwise arrow direction', () => {
@@ -605,6 +633,15 @@ test('cached mode metrics become live responsive measurements with one geometry 
   assert.deepEqual(measurements.icon, { fits: true, spare: 72 });
 });
 
+test('expanded native model triggers yield to the squeezed toolbar without shrinking the balance lane below its icon', () => {
+  assert.equal(calculateExpandedNativeTriggerMaxWidth({ laneWidth: 301, naturalWidth: 224, reservedWidth: 20 }), null);
+  assert.equal(calculateExpandedNativeTriggerMaxWidth({ laneWidth: 261, naturalWidth: 224, reservedWidth: 20 }), 213);
+  assert.equal(calculateExpandedNativeTriggerMaxWidth({ laneWidth: 221, naturalWidth: 224, reservedWidth: 20 }), 173);
+  assert.equal(calculateExpandedNativeTriggerMaxWidth({ laneWidth: 181, naturalWidth: 224, reservedWidth: 20 }), 133);
+  assert.equal(calculateExpandedNativeTriggerMaxWidth({ laneWidth: 141, naturalWidth: 224, reservedWidth: 20 }), 93);
+  assert.equal(calculateExpandedNativeTriggerMaxWidth({ laneWidth: 101, naturalWidth: 33, reservedWidth: 20 }), null);
+});
+
 test('injector caches responsive mode measurements and invalidates them for font changes', () => {
   const script = buildInjectorScript();
   assert.match(script, /__codexUsageMeasurements/);
@@ -777,6 +814,30 @@ test('usage root spans the entire free toolbar lane in every responsive mode', (
   assert.match(placementSource, /setStyleIfChanged\(root\.style, 'maxWidth', 'none'\)/);
   assert.doesNotMatch(placementSource, /'399px'/);
   assert.doesNotMatch(layoutSource, /mode === 'icon'[\s\S]*root\.style\.(?:flex|width|maxWidth)/);
+});
+
+test('squeezed model menus constrain only the native transient trigger and restore it on close', () => {
+  const script = buildInjectorScript();
+  const layoutSource = sourceSection(script, 'function layoutRoot(footer, root) {', 'function layout() {');
+  const constraintSource = sourceSection(script, 'function expandedNativeTrigger(native) {', 'function responsiveMeasurementSignature(');
+  const teardown = sourceSection(script, 'if (existing) {', 'const state = {');
+
+  assert.match(script, /data-inline-collapse-transient-width/);
+  assert.match(layoutSource, /syncNativeTriggerConstraint\(root, native\)/);
+  assert.match(constraintSource, /originalMaxWidth/);
+  assert.match(constraintSource, /removeProperty\('max-width'\)/);
+  assert.match(constraintSource, /calculateExpandedNativeTriggerMaxWidth/);
+  assert.match(teardown, /existing\.releaseNativeTriggerConstraints\?\.\(\)/);
+  assert.match(teardown, /if \(existing\.nativeTriggerSettleTimer\) clearTimeout\(existing\.nativeTriggerSettleTimer\)/);
+  assert.match(script, /function scheduleNativeTriggerSettle\(\) \{[\s\S]*scheduleLayout\(\);[\s\S]*\}, 180\);/);
+});
+
+test('responsive mode transitions never translate the centered balance content', () => {
+  const script = buildInjectorScript();
+  const layoutSource = sourceSection(script, 'function layoutRoot(footer, root) {', 'function layout() {');
+
+  assert.match(layoutSource, /usage\.animate\(\s*\[\{ opacity: 0\.58 \}, \{ opacity: 1 \}\]/);
+  assert.doesNotMatch(layoutSource, /usage\.animate\([\s\S]*translateX/);
 });
 
 test('closed popover does not eagerly create its portal during render', () => {
