@@ -88,6 +88,18 @@ test('custom popovers reuse the native menu surface and action-row styling', () 
   assert.match(popoverStyles, /\.hub-open:hover,\.hub-open:focus-visible\{background:var\(--color-token-list-hover-background/);
 });
 
+test('viewport changes keep an open popover aligned during native toolbar transitions', () => {
+  const script = buildInjectorScript();
+  const positioning = sourceSection(script, 'function cancelPopoverPositionBurst() {', 'function hideUsageTooltip()');
+
+  assert.match(positioning, /POPOVER_POSITION_BURST_FRAMES/);
+  assert.match(positioning, /requestAnimationFrame/);
+  assert.match(script, /function handleViewportChange\(\) \{/);
+  assert.match(script, /window\.addEventListener\('resize', handleViewportChange/);
+  assert.match(script, /document\.addEventListener\('fullscreenchange', handleViewportChange/);
+  assert.match(script, /window\.visualViewport\?\.addEventListener\?\.\('resize', handleViewportChange/);
+});
+
 test('every programmatic popover close synchronizes trigger and dialog ARIA state', () => {
   const script = buildInjectorScript();
   const visibility = sourceSection(script, 'function syncPopoverVisibility() {', 'function closePopover(');
@@ -157,6 +169,19 @@ test('composer discovery supports the Codex 26.730 responsive layout attributes'
   assert.match(discovery, /\[data-composer-surface-variant\]/);
   assert.match(discovery, /\[data-composer-footer-responsive\]/);
   assert.match(discovery, /hasAttribute\('data-composer-footer-responsive'\)/);
+});
+
+test('composer discovery avoids scanning every div when a footer selector already matches', () => {
+  const script = buildInjectorScript();
+  const discovery = sourceSection(
+    script,
+    'function findComposerFooter(surface, editor) {',
+    'const usageStyles = `',
+  );
+
+  assert.match(discovery, /const explicitCandidates =/);
+  assert.match(discovery, /if \(explicitCandidates\.length\)/);
+  assert.match(discovery, /querySelectorAll\('div'\)/);
 });
 
 test('injector caches hot-path usage and toolbar DOM references on each root', () => {

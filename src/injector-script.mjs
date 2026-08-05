@@ -264,13 +264,14 @@ export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = glob
 }
 
 export { PAGE_ACTION_SENTINEL };
-export const INJECTOR_VERSION = 92;
+export const INJECTOR_VERSION = 94;
 
 function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, formatRequestTime, calculatePopoverPlacement, selectResponsiveUsageMode, calculateResponsiveMeasurements, calculateExpandedNativeTriggerMaxWidth, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, enqueuePageActionTitle, pageActionSentinel, version) {
   const VERSION = version;
   const GLOBAL = '__CODEX_CCSWITCH_USAGE__';
   const ROOT_ID = 'codex-ccswitch-usage-root';
   const POPOVER_ID = 'codex-ccswitch-usage-popover';
+  const POPOVER_POSITION_BURST_FRAMES = 30;
   const NATIVE_MODEL_TRIGGER_SELECTOR = '[data-codex-intelligence-trigger="true"], [data-composer-navigation-target="reasoning"]';
   const NATIVE_MODEL_TRANSIENT_ATTRIBUTE = 'data-inline-collapse-transient-width';
   const REFRESH_LOADING_TIMEOUT_MS = 95_000;
@@ -280,6 +281,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
   }
   const eventController = createInjectorEventController(existing);
   if (existing) {
+    existing.popoverOpen = false;
     existing.releaseNativeTriggerConstraints?.();
     existing.observer?.disconnect();
     existing.themeObserver?.disconnect();
@@ -296,6 +298,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     if (existing.nativeTriggerSettleTimer) clearTimeout(existing.nativeTriggerSettleTimer);
     if (existing.rootResizeSettleTimer) clearTimeout(existing.rootResizeSettleTimer);
     if (existing.layoutFrame) cancelAnimationFrame(existing.layoutFrame);
+    if (existing.popoverPositionFrame) cancelAnimationFrame(existing.popoverPositionFrame);
     if (existing.composerSyncFrame) cancelAnimationFrame(existing.composerSyncFrame);
     existing.root?.remove();
     existing.popoverRoot?.remove();
@@ -344,6 +347,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     __codexUsageView: null,
     resizeSettleTimer: 0,
     nativeTriggerSettleTimer: 0,
+    popoverPositionFrame: 0,
     rootResizeSizes: new WeakMap(),
   };
 
@@ -389,30 +393,36 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
   function findComposerFooter(surface, editor) {
     const editorRect = editor.getBoundingClientRect();
     const surfaceRect = surface.getBoundingClientRect();
-    const candidates = [...new Set([
+    const explicitCandidates = [...new Set([
       ...surface.querySelectorAll('[data-composer-footer], [data-composer-footer-responsive], [class*="_footer_"], [class*="grid-cols-"]'),
-      ...surface.querySelectorAll('div'),
     ])];
     let best = null;
     let bestScore = -Infinity;
-    for (const element of candidates) {
-      const parts = footerParts(element);
-      if (!parts) continue;
-      const rect = element.getBoundingClientRect();
-      if (!isComposerFooterCandidate(element, editor, rect, editorRect)) continue;
-      const className = String(element.className || '');
-      let score = 0;
-      if (element.hasAttribute('data-composer-footer')) score += 8;
-      if (element.hasAttribute('data-composer-footer-responsive')) score += 8;
-      if (className.includes('_footer_')) score += 6;
-      if (className.includes('grid-cols-')) score += 4;
-      if (element.children.length === 3) score += 2;
-      if (rect.bottom >= surfaceRect.bottom - 48) score += 2;
-      if (element.querySelector('button,[role="button"],[aria-label]')) score += 2;
-      if (score > bestScore) {
-        best = element;
-        bestScore = score;
+    const evaluate = candidates => {
+      for (const element of candidates) {
+        const parts = footerParts(element);
+        if (!parts) continue;
+        const rect = element.getBoundingClientRect();
+        if (!isComposerFooterCandidate(element, editor, rect, editorRect)) continue;
+        const className = String(element.className || '');
+        let score = 0;
+        if (element.hasAttribute('data-composer-footer')) score += 8;
+        if (element.hasAttribute('data-composer-footer-responsive')) score += 8;
+        if (className.includes('_footer_')) score += 6;
+        if (className.includes('grid-cols-')) score += 4;
+        if (element.children.length === 3) score += 2;
+        if (rect.bottom >= surfaceRect.bottom - 48) score += 2;
+        if (element.querySelector('button,[role="button"],[aria-label]')) score += 2;
+        if (score > bestScore) {
+          best = element;
+          bestScore = score;
+        }
       }
+    };
+    if (explicitCandidates.length) evaluate(explicitCandidates);
+    else evaluate([...surface.querySelectorAll('div')]);
+    if (bestScore < 2 && explicitCandidates.length) {
+      evaluate([...surface.querySelectorAll('div')].filter(element => !explicitCandidates.includes(element)));
     }
     return bestScore >= 2 ? best : null;
   }
@@ -697,6 +707,34 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     }
   }
 
+  function cancelPopoverPositionBurst() {
+    if (!state.popoverPositionFrame) return;
+    cancelAnimationFrame(state.popoverPositionFrame);
+    state.popoverPositionFrame = 0;
+  }
+
+  function schedulePopoverPositionBurst() {
+    if (!state.popoverOpen || state.popoverPositionFrame) return;
+    let framesRemaining = POPOVER_POSITION_BURST_FRAMES;
+    const run = () => {
+      state.popoverPositionFrame = requestAnimationFrame(() => {
+        state.popoverPositionFrame = 0;
+        if (!state.popoverOpen) return;
+        positionPopover();
+        framesRemaining -= 1;
+        if (framesRemaining > 0) run();
+      });
+    };
+    run();
+  }
+
+  function handleViewportChange() {
+    scheduleLayout();
+    if (!state.popoverOpen) return;
+    positionPopover();
+    schedulePopoverPositionBurst();
+  }
+
   function hideUsageTooltip() {
     if (state.tooltipTimer) clearTimeout(state.tooltipTimer);
     state.tooltipTimer = 0;
@@ -806,6 +844,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
 
   function closePopover(returnFocus = false, renderNow = true) {
     const trigger = state.popoverTrigger;
+    cancelPopoverPositionBurst();
     state.popoverOpen = false;
     state.popoverMode = '';
     state.popoverTrigger = null;
@@ -1552,6 +1591,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
 
   function resetTransientUiForMissingComposer() {
     hideUsageTooltip();
+    cancelPopoverPositionBurst();
     state.popoverOpen = false;
     state.popoverMode = '';
     state.popoverTrigger = null;
@@ -1635,7 +1675,10 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
   state.setPopoverOpen = open => {
     state.popoverOpen = Boolean(open);
     state.popoverMode = state.popoverOpen ? (state.popoverMode || 'balance') : '';
-    if (!state.popoverOpen) state.popoverTrigger = null;
+    if (!state.popoverOpen) {
+      state.popoverTrigger = null;
+      cancelPopoverPositionBurst();
+    }
     if (!state.popoverAnchor) state.popoverAnchor = { root: state.root, shadow: state.shadow };
     render();
     return state.popoverOpen;
@@ -1689,7 +1732,9 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
   document.fonts?.ready?.then(() => {
     if (!state.eventController.signal.aborted) invalidateResponsiveMeasurements();
   });
-  window.addEventListener('resize', scheduleLayout, { passive: true, signal: state.eventController.signal });
+  window.addEventListener('resize', handleViewportChange, { passive: true, signal: state.eventController.signal });
+  document.addEventListener('fullscreenchange', handleViewportChange, { signal: state.eventController.signal });
+  window.visualViewport?.addEventListener?.('resize', handleViewportChange, { passive: true, signal: state.eventController.signal });
   window.addEventListener('pageshow', recoverOnActivation, { signal: state.eventController.signal });
   window.addEventListener('focus', recoverOnActivation, { signal: state.eventController.signal });
   window.addEventListener('popstate', scheduleComposerSync, { signal: state.eventController.signal });

@@ -44,6 +44,34 @@ test('provider fingerprints include built-in balance and request template select
   );
 });
 
+test('provider fingerprints ignore the legacy usage script payload in v2', () => {
+  const base = provider('legacy', '未识别中转');
+  const first = providerConfigurationFingerprint({
+    ...base,
+    usage: { enabled: true, script: 'old script', noisy: 'a'.repeat(20_000) },
+  });
+  const second = providerConfigurationFingerprint({
+    ...base,
+    usage: { enabled: false, script: 'new script', noisy: 'b'.repeat(20_000) },
+  });
+
+  assert.equal(first, second);
+});
+
+test('Hub provider snapshot changes clear obsolete request status origins', () => {
+  let providers = [provider('one', 'DeepSeek', true)];
+  let clearCalls = 0;
+  const service = new HubService({ getAll: () => providers }, { async query() { return {}; } }, {
+    requestUsageEngine: { clearStatusCache() { clearCalls += 1; } },
+  });
+  const initialClearCalls = clearCalls;
+
+  providers = [...providers, provider('two', 'PackyCode')];
+  service.syncProviders();
+
+  assert.equal(clearCalls, initialClearCalls + 1);
+});
+
 test('Hub state exposes safe provider fields and refreshes with bounded concurrency', async () => {
   const providers = [provider('one', 'DeepSeek', true), provider('two', 'PackyCode'), provider('three', '付费站')];
   let running = 0;

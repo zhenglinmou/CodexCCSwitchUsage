@@ -204,6 +204,143 @@ test('OpenAI Official session index scans newest files first and stays bounded',
   assert.ok(persisted.files.every(record => record.entry.result.items.length <= 64));
 });
 
+test('OpenAI Official session query selects newest files before applying the file limit', async t => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-file-limit-'));
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
+    tokens: { account_id: 'file-limit-account' },
+  }), 'utf8');
+
+  const sessions = [
+    ['00-old', '2026-08-01T00:00:00.000Z'],
+    ['01-old', '2026-08-02T00:00:00.000Z'],
+    ['02-old', '2026-08-03T00:00:00.000Z'],
+    ['98-new', '2026-08-04T00:00:00.000Z'],
+    ['99-new', '2026-08-05T00:00:00.000Z'],
+  ];
+  for (const [id, timestamp] of sessions) {
+    const filename = path.join(codexHome, 'sessions', `${id}.jsonl`);
+    writeJsonLines(filename, [
+      { timestamp, type: 'session_meta', payload: { id, model_provider: 'openai' } },
+      { timestamp, type: 'turn_context', payload: { model: 'gpt-5.6-sol' } },
+      {
+        timestamp, type: 'event_msg', payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: { total_tokens: 1 },
+            last_token_usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 },
+          },
+        },
+      },
+    ]);
+    const mtime = new Date(timestamp);
+    fs.utimesSync(filename, mtime, mtime);
+  }
+
+  const reader = new CodexSessionUsageReader({ codexHome, maximumFiles: 3 });
+  const result = await reader.query({
+    id: 'openai-file-limit',
+    name: 'OpenAI Official',
+    websiteUrl: 'https://chatgpt.com/codex',
+    auth: { tokens: { account_id: 'file-limit-account' } },
+  }, { limit: 3 });
+
+  assert.deepEqual(result.items.map(item => item.id.split(':', 1)[0]), ['99-new', '98-new', '02-old']);
+  assert.equal(result.officialSessionCount, 3);
+  assert.equal(result.complete, false, 'the bounded file list must report that older sessions were omitted');
+});
+
+test('request usage status cache evicts old provider origins at its configured bound', async () => {
+  const engine = new ProviderRequestUsageEngine({
+    statusCacheMaximumEntries: 2,
+    fetchImpl: async url => {
+      const payload = String(url).endsWith('/api/status') ? statusPayload() : logPayload([]);
+      return new Response(JSON.stringify(payload), { status: 200 });
+    },
+  });
+
+  for (let index = 0; index < 3; index += 1) {
+    await engine.query({
+      id: `cache-provider-${index}`,
+      name: `缓存供应商 ${index}`,
+      apiBaseUrl: `https://cache-${index}.example/v1`,
+      apiKey: `cache-key-${index}`,
+    }, { requestUsageTemplateId: 'new-api-token-log' });
+  }
+
+  assert.equal(engine.statusCache.size, 2);
+  assert.equal(engine.statusCache.has('https://cache-0.example'), false);
+  assert.equal(engine.statusCache.has('https://cache-1.example'), true);
+  assert.equal(engine.statusCache.has('https://cache-2.example'), true);
+});
+
+test('request usage engine creates the official session reader lazily', () => {
+  const engine = new ProviderRequestUsageEngine({
+    codexSessionUsageOptions: { indexPath: path.join(os.tmpdir(), 'unused-codex-index.json') },
+  });
+
+  assert.equal(engine.codexSessionUsageReader, null);
+});
+
+test('Codex session reader defers index loading until its first query', async t => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-lazy-index-'));
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
+    tokens: { account_id: 'lazy-index-account' },
+  }), 'utf8');
+  const filename = path.join(codexHome, 'sessions', 'active.jsonl');
+  writeJsonLines(filename, [
+    { timestamp: '2026-08-05T00:00:00.000Z', type: 'session_meta', payload: { id: 'active-session', model_provider: 'openai' } },
+  ]);
+  const stat = fs.statSync(filename);
+  const indexPath = path.join(codexHome, 'runtime', 'codex-session-index.json');
+  fs.mkdirSync(path.dirname(indexPath), { recursive: true });
+  fs.writeFileSync(indexPath, JSON.stringify({
+    version: 1,
+    files: [{
+      filename,
+      entry: {
+        signature: `${stat.size}:${stat.mtimeMs}:${stat.birthtimeMs}`,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        birthtimeMs: stat.birthtimeMs,
+        result: {
+          official: true,
+          recordCount: 1,
+          items: [{
+            id: 'active-session:0:1',
+            createdAt: '2026-08-05T00:00:00.000Z',
+            model: 'gpt-5.6-sol',
+            totalTokens: 1,
+          }],
+        },
+        state: { sessionId: 'active-session', model: 'gpt-5.6-sol', previousCumulative: 1, segment: 0 },
+      },
+    }],
+  }), 'utf8');
+
+  const reader = new CodexSessionUsageReader({ codexHome, indexPath });
+  assert.equal(reader.persistedIndex.size, 0);
+
+  const result = await reader.query({
+    id: 'openai-lazy-index',
+    name: 'OpenAI Official',
+    websiteUrl: 'https://chatgpt.com/codex',
+    auth: { tokens: { account_id: 'lazy-index-account' } },
+  }, { limit: 1 });
+
+  assert.equal(reader.persistedIndex.size, 1);
+  assert.equal(result.items[0].id, 'active-session:0:1');
+});
+
+test('Codex session index persistence uses an awaited asynchronous file write', () => {
+  const source = fs.readFileSync(new URL('../src/provider-request-usage.mjs', import.meta.url), 'utf8');
+
+  assert.match(source, /await this\.\#writeIndex\(\);/);
+  assert.match(source, /fs\.promises\.writeFile/);
+  assert.match(source, /fs\.promises\.rename/);
+});
+
 test('OpenAI Official session index parses only appended JSONL records', async t => {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-append-'));
   t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));

@@ -18,12 +18,15 @@ const DATABASE_WATCH_DEBOUNCE_MS = 100;
 const CURRENT_PROVIDER_REFRESH_MS = 300_000;
 const WATCHER_RETRY_MS = 1_000;
 const PAGE_ACTION_POLL_MS = 1_000;
+const PAGE_ACTION_IDLE_POLL_MS = 2_500;
 const DATABASE_AUDIT_MS = 60_000;
 const INJECTOR_AUDIT_MS = 300_000;
 const STATUS_HEARTBEAT_MS = 300_000;
 const HUB_RETRY_MS = 5_000;
 const RECENT_REQUEST_LIMIT = 10;
 const CODEX_PROCESS_POLL_MS = 1_000;
+const REMOTE_RECENT_REQUEST_SOURCES = new Set(['provider_log', 'provider_account_log', 'openai_codex_session']);
+const REMOTE_RECENT_REQUEST_REFRESH_DEBOUNCE_MS = 750;
 
 function readLocalVersion(relativePath) {
   try {
@@ -185,6 +188,7 @@ let recentRequestsFetchedAt = '';
 let recentRequestsMessage = '';
 let recentRequestsRefreshPromise = null;
 let recentRequestsRefreshPending = false;
+let remoteRecentRequestsRefreshTimer = null;
 let codexProcessMonitor = null;
 let lastUsageCacheError = '';
 let lastStatusSignature = '';
@@ -284,7 +288,8 @@ function normalizedRecentRequest(item, defaults = {}) {
   const rawTotalCost = item?.totalCost ?? item?.totalCostUsd;
   const totalCost = rawTotalCost == null || rawTotalCost === '' ? null : number(rawTotalCost, null);
   const costUnit = text(item?.costUnit || defaults.costUnit || 'USD', 24) || 'USD';
-  const statusCode = optionalInteger(item?.statusCode);
+  const parsedStatusCode = optionalInteger(item?.statusCode);
+  const statusCode = parsedStatusCode > 0 ? parsedStatusCode : null;
   const success = typeof item?.success === 'boolean'
     ? item.success
     : statusCode == null || (statusCode >= 200 && statusCode < 400);
@@ -357,7 +362,7 @@ function syncRecentRequests(providerOverride = undefined, options = {}) {
       options.force !== true
       && providerId
       && providerId === recentRequestProviderId
-      && ['provider_log', 'provider_account_log', 'openai_codex_session'].includes(recentRequestsSource)
+      && REMOTE_RECENT_REQUEST_SOURCES.has(recentRequestsSource)
     ) return false;
     const nextRequests = providerId ? repository.getRecentRequests(providerId, RECENT_REQUEST_LIMIT) : [];
     return updateRecentRequestsState(provider, nextRequests, {
@@ -373,6 +378,19 @@ function syncRecentRequests(providerOverride = undefined, options = {}) {
   } catch {
     return false;
   }
+}
+
+function shouldRefreshRemoteRecentRequests() {
+  return Boolean(recentRequestProviderId && REMOTE_RECENT_REQUEST_SOURCES.has(recentRequestsSource));
+}
+
+function scheduleRemoteRecentRequestsRefresh() {
+  if (!shouldRefreshRemoteRecentRequests() || stopped) return;
+  if (remoteRecentRequestsRefreshTimer) clearTimeout(remoteRecentRequestsRefreshTimer);
+  remoteRecentRequestsRefreshTimer = setTimeout(() => {
+    remoteRecentRequestsRefreshTimer = null;
+    requestRecentRequestsRefresh();
+  }, REMOTE_RECENT_REQUEST_REFRESH_DEBOUNCE_MS);
 }
 
 async function refreshRecentRequests() {
@@ -462,6 +480,10 @@ async function refreshRecentRequests() {
 }
 
 function requestRecentRequestsRefresh() {
+  if (remoteRecentRequestsRefreshTimer) {
+    clearTimeout(remoteRecentRequestsRefreshTimer);
+    remoteRecentRequestsRefreshTimer = null;
+  }
   recentRequestsRefreshPending = true;
   if (recentRequestsRefreshPromise) return recentRequestsRefreshPromise;
   recentRequestsRefreshPromise = (async () => {
@@ -794,6 +816,7 @@ function startDatabaseWatcher() {
         databaseChangeToken = nextDatabaseChangeToken;
         lastDatabaseAuditAt = Date.now();
         const recentRequestsChanged = syncRecentRequests();
+        if (shouldRefreshRemoteRecentRequests()) scheduleRemoteRecentRequestsRefresh();
         if (syncResult.changed) requestCurrentProviderRefresh(false, true);
         else if (recentRequestsChanged) requestTargetSync({ audit: true });
       }, DATABASE_WATCH_DEBOUNCE_MS);
@@ -837,10 +860,13 @@ function nextMaintenanceDelay() {
   const injectorAuditDelay = targetAuditPending
     ? PAGE_ACTION_POLL_MS
     : until(lastInjectorAuditAt, INJECTOR_AUDIT_MS);
+  const pageActionPollDelay = targetAuditPending || currentProviderQueryActive || mountedPages === 0
+    ? PAGE_ACTION_POLL_MS
+    : PAGE_ACTION_IDLE_POLL_MS;
   return Math.min(
     databaseWatcher ? until(lastDatabaseAuditAt, DATABASE_AUDIT_MS) : WATCHER_RETRY_MS,
     controlWatcher ? injectorAuditDelay : WATCHER_RETRY_MS,
-    PAGE_ACTION_POLL_MS,
+    pageActionPollDelay,
     injectorAuditDelay,
     until(lastStatusWriteAt, STATUS_HEARTBEAT_MS),
   );
@@ -870,6 +896,7 @@ async function loop() {
           lastDatabaseAuditAt = now;
           providersChanged = syncResult.changed;
           recentRequestsChanged = syncRecentRequests();
+          if (shouldRefreshRemoteRecentRequests()) scheduleRemoteRecentRequestsRefresh();
         } else {
           lastDatabaseAuditAt = now - DATABASE_AUDIT_MS + WATCHER_RETRY_MS;
           writeStatus({ error: safeMessage(syncResult.error) });
@@ -910,6 +937,7 @@ function shutdown(reason = null) {
   const auxiliaryShutdown = Promise.allSettled([hubServer.close()]);
   browserBroker.close();
   if (databaseWatchTimer) clearTimeout(databaseWatchTimer);
+  if (remoteRecentRequestsRefreshTimer) clearTimeout(remoteRecentRequestsRefreshTimer);
   if (currentProviderRefreshTimer) clearTimeout(currentProviderRefreshTimer);
   repository.close();
   try { fs.rmSync(pidPath, { force: true }); } catch {}

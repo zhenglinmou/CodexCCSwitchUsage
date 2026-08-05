@@ -291,26 +291,32 @@ function accountScopeError(message) {
   return error;
 }
 
-function listCodexSessionFiles(root, output, maximum) {
-  if (!root || output.length >= maximum) return;
+async function listCodexSessionFiles(root, output, maximum) {
+  if (!root) return false;
   let entries;
   try {
-    entries = fs.readdirSync(root, { withFileTypes: true });
+    entries = await fs.promises.readdir(root, { withFileTypes: true });
   } catch {
-    return;
+    return false;
   }
+  let truncated = false;
   for (const entry of entries) {
-    if (output.length >= maximum) break;
     const filename = path.join(root, entry.name);
     if (entry.isDirectory()) {
-      listCodexSessionFiles(filename, output, maximum);
+      truncated = (await listCodexSessionFiles(filename, output, maximum)) || truncated;
     } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.jsonl')) {
       try {
-        const stat = fs.statSync(filename);
+        const stat = await fs.promises.stat(filename);
         output.push({ filename, size: stat.size, mtimeMs: stat.mtimeMs, birthtimeMs: stat.birthtimeMs });
       } catch {}
     }
   }
+  output.sort((left, right) => right.mtimeMs - left.mtimeMs || right.birthtimeMs - left.birthtimeMs || right.filename.localeCompare(left.filename));
+  if (output.length > maximum) {
+    output.length = maximum;
+    truncated = true;
+  }
+  return truncated;
 }
 
 function codexSessionItem(sessionId, segment, cumulativeTokens, event, model) {
@@ -365,7 +371,10 @@ export class CodexSessionUsageReader {
     this.fileCache = new Map();
     this.fileScans = new Map();
     this.indexDirty = false;
-    this.persistedIndex = this.#readIndex();
+    this.persistedIndex = new Map();
+    this.indexLoadPromise = null;
+    this.indexWritePromise = Promise.resolve();
+    this.indexRevision = 0;
   }
 
   async query(provider, options = {}) {
@@ -377,9 +386,10 @@ export class CodexSessionUsageReader {
       throw accountScopeError('当前 Codex 登录账号不匹配这个 OpenAI Official 配置，已拒绝混用官方会话记录');
     }
 
+    await this.#ensureIndexLoaded();
     const files = [];
-    listCodexSessionFiles(path.join(this.codexHome, 'sessions'), files, this.maximumFiles);
-    listCodexSessionFiles(path.join(this.codexHome, 'archived_sessions'), files, this.maximumFiles);
+    const sessionsTruncated = await listCodexSessionFiles(path.join(this.codexHome, 'sessions'), files, this.maximumFiles);
+    const archivedSessionsTruncated = await listCodexSessionFiles(path.join(this.codexHome, 'archived_sessions'), files, this.maximumFiles);
     const activeFiles = new Set(files.map(file => file.filename));
     for (const filename of this.fileCache.keys()) {
       if (!activeFiles.has(filename)) this.fileCache.delete(filename);
@@ -388,15 +398,16 @@ export class CodexSessionUsageReader {
       if (!activeFiles.has(filename)) {
         this.persistedIndex.delete(filename);
         this.indexDirty = true;
+        this.indexRevision += 1;
       }
     }
-    files.sort((left, right) => right.mtimeMs - left.mtimeMs || right.filename.localeCompare(left.filename));
+    files.sort((left, right) => right.mtimeMs - left.mtimeMs || right.birthtimeMs - left.birthtimeMs || right.filename.localeCompare(left.filename));
 
     const limit = normalizeRequestUsageLimit(options.limit);
     const items = [];
     let officialSessionCount = 0;
     let totalRecords = 0;
-    let complete = true;
+    let complete = !sessionsTruncated && !archivedSessionsTruncated;
     for (let index = 0; index < files.length; index += 1) {
       const file = files[index];
       const result = await this.#scanFile(file);
@@ -423,7 +434,7 @@ export class CodexSessionUsageReader {
       const timeDifference = Date.parse(right.createdAt) - Date.parse(left.createdAt);
       return timeDifference || right.id.localeCompare(left.id);
     });
-    this.#writeIndex();
+    await this.#writeIndex();
     return {
       items: items.slice(0, limit),
       totalRecords,
@@ -472,6 +483,7 @@ export class CodexSessionUsageReader {
         this.persistedIndex.set(file.filename, entry);
         this.#prunePersistedIndex();
         this.indexDirty = true;
+        this.indexRevision += 1;
         return result;
       })
       .finally(() => {
@@ -627,11 +639,20 @@ export class CodexSessionUsageReader {
     }
   }
 
-  #readIndex() {
+  async #ensureIndexLoaded() {
+    if (!this.indexLoadPromise) {
+      this.indexLoadPromise = this.#readIndex().then(index => {
+        this.persistedIndex = index;
+      });
+    }
+    await this.indexLoadPromise;
+  }
+
+  async #readIndex() {
     if (!this.indexPath) return new Map();
     try {
-      if (fs.statSync(this.indexPath).size > CODEX_SESSION_INDEX_MAX_BYTES) return new Map();
-      const payload = JSON.parse(fs.readFileSync(this.indexPath, 'utf8'));
+      if ((await fs.promises.stat(this.indexPath)).size > CODEX_SESSION_INDEX_MAX_BYTES) return new Map();
+      const payload = JSON.parse(await fs.promises.readFile(this.indexPath, 'utf8'));
       if (payload?.version !== 1 || !Array.isArray(payload.files)) return new Map();
       return new Map(payload.files.slice(0, this.maximumCachedFiles).flatMap(record => {
         const filename = String(record?.filename || '');
@@ -647,28 +668,39 @@ export class CodexSessionUsageReader {
     }
   }
 
-  #writeIndex() {
-    if (!this.indexPath || !this.indexDirty) return;
-    const temporary = `${this.indexPath}.tmp`;
-    try {
-      const candidates = [...this.persistedIndex.entries()]
-        .sort(([, left], [, right]) => Number(right.mtimeMs) - Number(left.mtimeMs))
-        .slice(0, this.maximumCachedFiles);
-      const files = [];
-      let serializedBytes = Buffer.byteLength('{"version":1,"files":[]}');
-      for (const [filename, entry] of candidates) {
-        const record = { filename, entry };
-        const recordBytes = Buffer.byteLength(JSON.stringify(record)) + (files.length ? 1 : 0);
-        if (serializedBytes + recordBytes > CODEX_SESSION_INDEX_MAX_BYTES) break;
-        files.push(record);
-        serializedBytes += recordBytes;
+  async #writeIndex() {
+    if (!this.indexPath) return;
+    const previous = this.indexWritePromise;
+    const operation = previous.catch(() => {}).then(async () => {
+      if (!this.indexDirty) return;
+      const revision = this.indexRevision;
+      const temporary = `${this.indexPath}.tmp`;
+      try {
+        const candidates = [...this.persistedIndex.entries()]
+          .sort(([, left], [, right]) => Number(right.mtimeMs) - Number(left.mtimeMs))
+          .slice(0, this.maximumCachedFiles);
+        const files = [];
+        let serializedBytes = Buffer.byteLength('{"version":1,"files":[]}');
+        for (const [filename, entry] of candidates) {
+          const record = { filename, entry };
+          const recordBytes = Buffer.byteLength(JSON.stringify(record)) + (files.length ? 1 : 0);
+          if (serializedBytes + recordBytes > CODEX_SESSION_INDEX_MAX_BYTES) break;
+          files.push(record);
+          serializedBytes += recordBytes;
+        }
+        await fs.promises.mkdir(path.dirname(this.indexPath), { recursive: true });
+        await fs.promises.writeFile(temporary, JSON.stringify({ version: 1, files }), 'utf8');
+        await fs.promises.rename(temporary, this.indexPath);
+        if (this.indexRevision === revision) this.indexDirty = false;
+      } catch {
+        try { await fs.promises.rm(temporary, { force: true }); } catch {}
       }
-      fs.mkdirSync(path.dirname(this.indexPath), { recursive: true });
-      fs.writeFileSync(temporary, JSON.stringify({ version: 1, files }), 'utf8');
-      fs.renameSync(temporary, this.indexPath);
-      this.indexDirty = false;
-    } catch {
-      try { fs.rmSync(temporary, { force: true }); } catch {}
+    });
+    this.indexWritePromise = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.indexWritePromise === operation) this.indexWritePromise = Promise.resolve();
     }
   }
 }
@@ -1089,8 +1121,10 @@ export class ProviderRequestUsageEngine {
     this.timeoutMs = Math.max(1_000, Number(options.timeoutMs) || REQUEST_USAGE_TIMEOUT_MS);
     this.attempts = Math.max(1, Math.min(2, Math.trunc(Number(options.attempts) || REQUEST_USAGE_ATTEMPTS)));
     this.statusCacheTtlMs = Math.max(0, Number(options.statusCacheTtlMs) || 300_000);
+    this.statusCacheMaximumEntries = Math.max(1, Math.min(512, Math.trunc(Number(options.statusCacheMaximumEntries) || 64)));
     this.statusCache = new Map();
-    this.codexSessionUsageReader = options.codexSessionUsageReader || new CodexSessionUsageReader(options.codexSessionUsageOptions);
+    this.codexSessionUsageReader = options.codexSessionUsageReader || null;
+    this.codexSessionUsageOptions = options.codexSessionUsageOptions || {};
   }
 
   clearStatusCache() {
@@ -1121,7 +1155,9 @@ export class ProviderRequestUsageEngine {
     }
     if (config.adapter === OPENAI_CODEX_SESSION_TEMPLATE_ID) {
       try {
-        const sessionResult = await this.codexSessionUsageReader.query(provider, { limit });
+        const sessionReader = this.codexSessionUsageReader
+          || (this.codexSessionUsageReader = new CodexSessionUsageReader(this.codexSessionUsageOptions));
+        const sessionResult = await sessionReader.query(provider, { limit });
         const warning = 'Token 来自 Codex 官方会话；ChatGPT 套餐不提供逐请求货币金额';
         return {
           ...base,
@@ -1433,11 +1469,21 @@ export class ProviderRequestUsageEngine {
   }
 
   async #getStatus(config, signal, bypassCache = false, requestCache = null) {
+    const now = this.now();
     const cached = this.statusCache.get(config.origin);
-    if (!bypassCache && cached && cached.expiresAt > this.now()) return { status: 200, payload: cached.payload, cached: true };
+    if (!bypassCache && cached && cached.expiresAt > now) {
+      this.statusCache.delete(config.origin);
+      this.statusCache.set(config.origin, cached);
+      return { status: 200, payload: cached.payload, cached: true };
+    }
+    if (cached) this.statusCache.delete(config.origin);
     const result = await this.#fetchProviderJson(config, config.statusPath, { Accept: 'application/json' }, signal, requestCache);
     if (result.status === 200 && result.payload?.success === true) {
+      this.statusCache.delete(config.origin);
       this.statusCache.set(config.origin, { payload: result.payload, expiresAt: this.now() + this.statusCacheTtlMs });
+      while (this.statusCache.size > this.statusCacheMaximumEntries) {
+        this.statusCache.delete(this.statusCache.keys().next().value);
+      }
     }
     return result;
   }

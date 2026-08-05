@@ -106,7 +106,7 @@ test('a failed injector audit never accelerates maintenance beyond the one-secon
 
   assert.match(delay, /const injectorAuditDelay = targetAuditPending\s*\? PAGE_ACTION_POLL_MS\s*: until\(lastInjectorAuditAt, INJECTOR_AUDIT_MS\)/);
   assert.match(delay, /controlWatcher \? injectorAuditDelay : WATCHER_RETRY_MS/);
-  assert.match(delay, /PAGE_ACTION_POLL_MS,\s*injectorAuditDelay,/);
+  assert.match(delay, /pageActionPollDelay,\s*injectorAuditDelay,/);
 });
 
 test('failed one-shot installs use keyed bounded backoff without delaying page-action snapshots', () => {
@@ -122,6 +122,33 @@ test('failed one-shot installs use keyed bounded backoff without delaying page-a
   assert.match(sync, /if \(actionAccepted\) targetInstallBackoff\.reset\(\)/);
   assert.match(request, /if \(outcome\?\.deferred\) targetAuditPending = true/);
   assert.match(source, /targetInstallRetryMs: targetInstallBackoff\.remainingMs\(\)/);
+});
+
+test('database changes refresh a remote recent-request snapshot instead of leaving it stale', () => {
+  const source = hostSource();
+  const watcher = source.slice(source.indexOf('function startDatabaseWatcher()'), source.indexOf('function startControlWatcher()'));
+
+  assert.match(source, /function shouldRefreshRemoteRecentRequests\(\)/);
+  assert.match(source, /requestRecentRequestsRefresh\(\)/);
+  assert.match(watcher, /syncRecentRequests\(\);[\s\S]*shouldRefreshRemoteRecentRequests\(\)[\s\S]*scheduleRemoteRecentRequestsRefresh\(\)/);
+});
+
+test('database-triggered remote recent-request refreshes are debounced', () => {
+  const source = hostSource();
+  const watcher = source.slice(source.indexOf('function startDatabaseWatcher()'), source.indexOf('function startControlWatcher()'));
+
+  assert.match(source, /const REMOTE_RECENT_REQUEST_REFRESH_DEBOUNCE_MS = 750;/);
+  assert.match(source, /function scheduleRemoteRecentRequestsRefresh\(\)/);
+  assert.match(source, /setTimeout\(\(\) => \{[\s\S]*requestRecentRequestsRefresh\(\)/);
+  assert.match(watcher, /scheduleRemoteRecentRequestsRefresh\(\)/);
+});
+
+test('recent request status code zero is normalized as unknown rather than failure', () => {
+  const source = hostSource();
+  const recent = source.slice(source.indexOf('function normalizedRecentRequest('), source.indexOf('function updateRecentRequestsState('));
+
+  assert.match(recent, /const parsedStatusCode = optionalInteger\(item\?\.statusCode\);/);
+  assert.match(recent, /const statusCode = parsedStatusCode > 0 \? parsedStatusCode : null;/);
 });
 
 test('status reports mounted primary pages while event-driven CDP remains disabled', () => {
@@ -163,6 +190,7 @@ test('host schedules only the current CCSwitch provider and leaves Hub providers
   assert.match(source, /const CURRENT_PROVIDER_REFRESH_MS = 300_000;/);
   assert.match(source, /const WATCHER_RETRY_MS = 1_000;/);
   assert.match(source, /const PAGE_ACTION_POLL_MS = 1_000;/);
+  assert.match(source, /const PAGE_ACTION_IDLE_POLL_MS = 2_500;/);
   assert.match(source, /const DATABASE_AUDIT_MS = 60_000;/);
   assert.match(source, /const STATUS_HEARTBEAT_MS = 300_000;/);
   assert.match(loop, /repository\.getChangeToken\(\)/);
@@ -179,8 +207,18 @@ test('host keeps only the bounded page-title action poll for responsive composer
   const source = hostSource();
 
   assert.match(source, /const PAGE_ACTION_POLL_MS = 1_000/);
+  assert.match(source, /const PAGE_ACTION_IDLE_POLL_MS = 2_500/);
   assert.match(source, /decodePageActionQueue|recentActionSignatures/);
   assert.doesNotMatch(source, /actionEndpoint|onAction:\s*handlePageAction/);
+});
+
+test('host backs off page-action polling while a mounted page is idle', () => {
+  const source = hostSource();
+  const delay = source.slice(source.indexOf('function nextMaintenanceDelay('), source.indexOf('async function loop('));
+
+  assert.match(delay, /const pageActionPollDelay =/);
+  assert.match(delay, /PAGE_ACTION_IDLE_POLL_MS/);
+  assert.match(delay, /pageActionPollDelay/);
 });
 
 test('current-provider scheduling resumes from the cached query timestamp after a host reload', () => {

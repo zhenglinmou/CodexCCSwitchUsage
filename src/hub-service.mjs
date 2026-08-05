@@ -222,7 +222,6 @@ export function providerConfigurationFingerprint(provider, templateSelection = n
     provider.apiBaseUrl,
     provider.baseUrl,
     provider.auth,
-    provider.usage,
   ];
   if (templateSelection) {
     fields.push(
@@ -457,6 +456,7 @@ export class HubService {
   syncProviders() {
     const providers = this.repository.getAll();
     if (providers === this.providerSnapshot) return { changed: false, providers };
+    this.requestUsageEngine?.clearStatusCache?.();
     const activeIds = new Set();
     for (const provider of providers) {
       activeIds.add(provider.id);
