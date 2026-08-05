@@ -145,6 +145,20 @@ test('composer footer detection accepts the embedded-editor grid and rejects its
   );
 });
 
+test('composer discovery supports the Codex 26.730 responsive layout attributes', () => {
+  const script = buildInjectorScript();
+  const discovery = sourceSection(
+    script,
+    'function findComposerFooter(surface, editor) {',
+    'const usageStyles = `',
+  );
+
+  assert.match(discovery, /\[contenteditable="true"\]\[data-codex-composer="true"\]/);
+  assert.match(discovery, /\[data-composer-surface-variant\]/);
+  assert.match(discovery, /\[data-composer-footer-responsive\]/);
+  assert.match(discovery, /hasAttribute\('data-composer-footer-responsive'\)/);
+});
+
 test('injector caches hot-path usage and toolbar DOM references on each root', () => {
   const source = fs.readFileSync(new URL('../src/injector-script.mjs', import.meta.url), 'utf8');
 

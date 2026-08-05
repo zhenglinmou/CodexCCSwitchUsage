@@ -130,7 +130,7 @@ export function stabilizeResponsiveUsageMode(
 
 export function findMutationObserverTarget(footer, documentNode = globalThis.document) {
   const mainSelector = 'main,[role="main"],[data-codex-main]';
-  const composerSelector = '.composer-surface-chrome,[data-composer-surface],[class*="composer"]';
+  const composerSelector = '.composer-surface-chrome,[data-composer-surface],[data-composer-surface-variant],[class*="composer"]';
   const appRoot = footer?.closest?.('#root');
   if (appRoot) return appRoot;
   const main = footer?.closest?.(mainSelector);
@@ -143,7 +143,7 @@ export function findMutationObserverTarget(footer, documentNode = globalThis.doc
 }
 
 export function classifyComposerMutations(records, footer, root) {
-  const selector = '.ProseMirror[contenteditable="true"],[contenteditable="true"].ProseMirror,[contenteditable="true"][role="textbox"],[contenteditable="true"][data-lexical-editor="true"],.composer-surface-chrome,[data-composer-surface],[data-composer-footer],[class*="_footer_"]';
+  const selector = '.ProseMirror[contenteditable="true"],[contenteditable="true"].ProseMirror,[contenteditable="true"][role="textbox"],[contenteditable="true"][data-lexical-editor="true"],[contenteditable="true"][data-codex-composer="true"],.composer-surface-chrome,[data-composer-surface],[data-composer-surface-variant],[data-composer-footer],[data-composer-footer-responsive],[class*="_footer_"]';
   const stableMount = Boolean(footer?.isConnected && root?.isConnected);
   for (let recordIndex = 0; recordIndex < records.length; recordIndex += 1) {
     const record = records[recordIndex];
@@ -264,7 +264,7 @@ export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = glob
 }
 
 export { PAGE_ACTION_SENTINEL };
-export const INJECTOR_VERSION = 91;
+export const INJECTOR_VERSION = 92;
 
 function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, formatRequestTime, calculatePopoverPlacement, selectResponsiveUsageMode, calculateResponsiveMeasurements, calculateExpandedNativeTriggerMaxWidth, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, enqueuePageActionTitle, pageActionSentinel, version) {
   const VERSION = version;
@@ -390,7 +390,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     const editorRect = editor.getBoundingClientRect();
     const surfaceRect = surface.getBoundingClientRect();
     const candidates = [...new Set([
-      ...surface.querySelectorAll('[data-composer-footer], [class*="_footer_"], [class*="grid-cols-"]'),
+      ...surface.querySelectorAll('[data-composer-footer], [data-composer-footer-responsive], [class*="_footer_"], [class*="grid-cols-"]'),
       ...surface.querySelectorAll('div'),
     ])];
     let best = null;
@@ -403,6 +403,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       const className = String(element.className || '');
       let score = 0;
       if (element.hasAttribute('data-composer-footer')) score += 8;
+      if (element.hasAttribute('data-composer-footer-responsive')) score += 8;
       if (className.includes('_footer_')) score += 6;
       if (className.includes('grid-cols-')) score += 4;
       if (element.children.length === 3) score += 2;
@@ -422,12 +423,13 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       '[contenteditable="true"].ProseMirror',
       '[contenteditable="true"][role="textbox"]',
       '[contenteditable="true"][data-lexical-editor="true"]',
+      '[contenteditable="true"][data-codex-composer="true"]',
     ].join(','))];
     const footers = [];
     for (const editor of editors) {
       const editorRect = editor.getBoundingClientRect();
       if (!editor.isConnected || editorRect.width <= 0 || editorRect.height <= 0) continue;
-      const surface = editor.closest('.composer-surface-chrome, [data-composer-surface], [class*="composer"]');
+      const surface = editor.closest('.composer-surface-chrome, [data-composer-surface], [data-composer-surface-variant], [class*="composer"]');
       if (!surface) continue;
       const footer = findComposerFooter(surface, editor);
       if (footer && !footers.includes(footer)) footers.push(footer);
