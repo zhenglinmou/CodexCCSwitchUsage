@@ -363,6 +363,26 @@ dist\CodexCCSwitchUsage-Setup-<version>.exe
 
 `scripts\build-exe.ps1` prints the final size and SHA-256 hash.
 
+### GitHub Release assets are mandatory
+
+Every v2 GitHub Release must publish all three artifacts from the same versioned tag:
+
+1. `CodexCCSwitchUsage-Setup-<version>.exe`;
+2. `CCSwitch-Browser-Companion-<companion-version>.zip`;
+3. `CCSwitch-Browser-Companion-<companion-version>.crx`, signed with the persistent browser-companion private key.
+
+The release body must explain that the companion is required only when All API Hub needs an existing browser login, Cookie, or WAF query. It must also give the ZIP loading steps and state that a signed, non-store CRX can still be blocked by Chrome or Edge. Never upload the private `.pem` key.
+
+After the installer is built, the source commit and its matching tag are pushed, create a release-notes file from [docs/RELEASE_NOTES_TEMPLATE.md](./docs/RELEASE_NOTES_TEMPLATE.md), then run:
+
+```powershell
+npm run release:github -- `
+  -Tag v<version> `
+  -NotesFile .\release-notes.md
+```
+
+`scripts\publish-release.ps1` refuses to publish when the remote tag, installer, release notes, ZIP contents, signed CRX3 package, or private signing key are missing. It appends the browser-companion installation instructions and all three SHA-256 values to the release body, then creates or updates the GitHub Release. Use `-DryRun` to build and validate the three assets without changing GitHub. The signing key defaults to `%LOCALAPPDATA%\CodexCCSwitchUsage\signing\ccswitch-browser-companion.pem`; it is outside the repository and must be backed up securely. `-CreateSigningKey` is only for intentionally establishing a new extension identity.
+
 ## 7. Install or upgrade the stable EXE
 
 Run the newly generated Setup EXE. Do not uninstall the previous version first. The fixed Inno Setup `AppId` makes it an in-place upgrade.

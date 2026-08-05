@@ -120,6 +120,33 @@ test('every transitive browser companion module is included in each packaging ma
   }
 });
 
+test('GitHub releases always package and explain the browser companion', () => {
+  const packageJson = JSON.parse(read('package.json'));
+  const publish = read('scripts/publish-release.ps1');
+  const template = read('docs/RELEASE_NOTES_TEMPLATE.md');
+  const companionSection = read('docs/RELEASE_BROWSER_COMPANION_SECTION.md');
+  const development = read('DEVELOPMENT.md');
+  const userGuide = read('docs/V2.md');
+
+  assert.equal(packageJson.scripts['release:github'].includes('scripts/publish-release.ps1'), true);
+  assert.match(publish, /Compress-Archive/);
+  assert.match(publish, /--pack-extension-key=/);
+  assert.match(publish, /CreateSigningKey/);
+  assert.match(publish, /CRX3/);
+  assert.match(publish, /Security\.Cryptography\.SHA256/);
+  assert.doesNotMatch(publish, /Get-FileHash/);
+  assert.match(publish, /GitHub Release is missing required assets/);
+  assert.match(publish, /GitHub Release asset digest does not match local file/);
+  assert.match(publish, /required browser companion instructions/);
+  assert.doesNotMatch(publish, /[^\x00-\x7F]/);
+  assert.match(publish, /RELEASE_BROWSER_COMPANION_SECTION/);
+  assert.match(companionSection, /浏览器伴侣/);
+  assert.match(companionSection, /browser-companion-required:start/);
+  assert.match(template, /scripts\/publish-release\.ps1/);
+  assert.match(development, /release:github/);
+  assert.match(userGuide, /CCSwitch-Browser-Companion/);
+});
+
 test('one-time profile migration is not shipped', () => {
   const build = read('scripts/build-exe.ps1');
   const install = read('scripts/install.ps1');
