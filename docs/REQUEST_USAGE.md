@@ -17,6 +17,8 @@ Content-Type: application/json
 
 `limit` 默认 10，允许范围为 1–50。接口只在本机 Hub token 路径下提供，不接受跨站 `/v1` 请求。
 
+该接口是显式的逐请求读取操作，不属于 `/v1/balance/*`、`/v1/balances` 或 `/usage/*` 的缓存读取接口；它不会刷新余额，也不会修改 CCSwitch 数据库。返回结果的 `source` 可能是 `openai_codex_session`、`provider_log`、`provider_account_log` 或 `ccswitch_local`，调用方应根据 `fallback`、`degraded` 和 `preciseCostAvailable` 判断数据是否为真实供应商记录。
+
 CCSwitch 本地回退固定查询 `app_type = 'codex'`。如果同一个 API Key 同时配置给 Codex 与 Claude/Claude Desktop，第三方记录会先按请求路径分类（`/v1/responses` / OpenAI 兼容路径属于 Codex，`/v1/messages` / Anthropic 路径属于 Claude），路径缺失时再使用模型族判断，然后才截取最新 10 条。共享 Key 中无法判定归属的远端记录不会混入 Codex 列表。
 
 同一个 AnyRouter API Key 的主站配置与 API-only 镜像属于同一账户数据源。逐请求查询以配置到 `anyrouter.top` 的主站供应商为准，复用其模板、浏览器账号绑定和 CCSwitch 本地关联记录；镜像仍保留自己的 provider id、名称和模型 API Base URL。
