@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { getDefaultDatabasePath } from './platform.mjs';
 
 function parseJson(text, fallback) {
   try {
@@ -122,7 +123,7 @@ export function parseRequestLogRow(row) {
 }
 
 export class ProviderRepository {
-  constructor(databasePath = path.join(process.env.USERPROFILE, '.cc-switch', 'cc-switch.db'), options = {}) {
+  constructor(databasePath = getDefaultDatabasePath(), options = {}) {
     this.databasePath = databasePath;
     this.databaseFactory = options.databaseFactory || (filename => new DatabaseSync(filename, { readOnly: true }));
     this.statSync = options.statSync || fs.statSync;

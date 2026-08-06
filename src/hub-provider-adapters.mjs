@@ -5,6 +5,7 @@ import { PROVIDER_QUERY_TIMEOUT_MS } from '../browser-companion/protocol.js';
 import { normalizeUsage, readResponseTextLimited } from './usage-client.mjs';
 import { getBalanceTemplate, normalizeProviderTemplateOrigin } from './provider-templates.mjs';
 import { isTrustedHttpUrl } from './http-allowlist.mjs';
+import { getHomeDir } from './platform.mjs';
 
 const WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage';
 const QUOTA_PER_USD = 500_000;
@@ -943,7 +944,7 @@ export class ProviderQueryEngine {
     this.repository = repository;
     this.browserBroker = browserBroker;
     this.fetchImpl = options.fetchImpl || fetch;
-    this.homeDir = options.homeDir || process.env.USERPROFILE || process.env.HOME || '';
+    this.homeDir = options.homeDir || getHomeDir();
     this.now = options.now || Date.now;
     this.whamBrowserProbeTimeoutMs = Math.max(1, Number(options.whamBrowserProbeTimeoutMs) || WHAM_BROWSER_PROBE_TIMEOUT_MS);
     this.whamBrowserRaceDelayMs = Math.max(1, Number(options.whamBrowserRaceDelayMs) || WHAM_BROWSER_RACE_DELAY_MS);

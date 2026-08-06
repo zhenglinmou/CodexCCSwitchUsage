@@ -12,6 +12,7 @@ import { buildInjectorScript, INJECTOR_VERSION, UPDATE_GLOBAL } from './injector
 import { KeyedBackoff } from './keyed-backoff.mjs';
 import { decodePageActionQueue } from './page-action-channel.mjs';
 import { isProcessAlive, ProcessExitMonitor } from './process-lifecycle.mjs';
+import { getDefaultDatabasePath } from './platform.mjs';
 import { acknowledgePageAction, installTargetOnce, settleTargetOperations } from './target-session.mjs';
 
 const DATABASE_WATCH_DEBOUNCE_MS = 100;
@@ -42,7 +43,7 @@ const EXPECTED_COMPANION_VERSION = readLocalVersion('../browser-companion/manife
 const HOST_STARTED_AT = new Date().toISOString();
 
 function parseArgs(argv) {
-  const result = { port: 9334, database: path.join(process.env.USERPROFILE, '.cc-switch', 'cc-switch.db'), runtimeDir: path.join(process.cwd(), 'runtime'), codexPid: 0 };
+  const result = { port: 9334, database: getDefaultDatabasePath(), runtimeDir: path.join(process.cwd(), 'runtime'), codexPid: 0 };
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index + 1];
     if (argv[index] === '--port') result.port = Number(value);

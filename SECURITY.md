@@ -1,6 +1,6 @@
 # 隐私与安全政策
 
-Codex CCSwitch Usage 是一个仅在本机运行的 Windows 扩展。它读取 CCSwitch 的 Codex 供应商配置，在本机查询余额，并通过 Chrome DevTools Protocol 将结果显示在 Codex 中。项目不修改 Codex 或 CCSwitch 的安装文件和配置。
+Codex CCSwitch Usage 是一个仅在本机运行的 Windows/macOS 扩展。它读取 CCSwitch 的 Codex 供应商配置，在本机查询余额，并通过 Chrome DevTools Protocol 将结果显示在 Codex 中。项目不修改 Codex 或 CCSwitch 的安装文件和配置。
 
 ## 数据处理边界
 

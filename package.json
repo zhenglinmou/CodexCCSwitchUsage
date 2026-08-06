@@ -6,6 +6,8 @@
   "description": "Show the active CCSwitch quota in Codex and manage all Codex providers through a local Balance Hub.",
   "scripts": {
     "test": "node --no-warnings --experimental-sqlite --test tests/*.test.mjs",
+    "launch:mac": "node scripts/launch.mjs",
+    "stop-host:mac": "node scripts/stop-host.mjs",
     "build:exe": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-exe.ps1",
     "release:github": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-release.ps1"
   }

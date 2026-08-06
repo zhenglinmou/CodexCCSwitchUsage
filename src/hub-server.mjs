@@ -2,9 +2,9 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { buildHubPage } from './hub-page.mjs';
 import { HubPreferences } from './hub-preferences.mjs';
+import { openExternalUrl } from './platform.mjs';
 
 function isLoopbackRequest(request) {
   const value = request?.socket?.remoteAddress || '';
@@ -83,10 +83,7 @@ export class HubServer {
     this.diagnostics = typeof options.diagnostics === 'function' ? options.diagnostics : () => ({});
     this.port = Number.isFinite(Number(options.port)) ? Number(options.port) : 17891;
     this.token = options.token || getOrCreateHubToken(options.tokenPath);
-    this.openUrl = options.openUrl || (url => {
-      const child = spawn('explorer.exe', [url], { detached: true, stdio: 'ignore', windowsHide: true });
-      child.unref();
-    });
+    this.openUrl = options.openUrl || (url => openExternalUrl(url));
     this.server = null;
     this.boundPort = 0;
     this.startPromise = null;

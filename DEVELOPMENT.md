@@ -42,6 +42,7 @@ The installer preserves the stable `runtime` directory during an upgrade. A real
 
 | File | Responsibility |
 |---|---|
+| `src\platform.mjs` | Cross-platform home paths and native external URL opening |
 | `src\host.mjs` | Long-running host, quota refresh scheduling, database watcher, and HTTP-only target audits |
 | `src\injector-script.mjs` | Composer footer DOM, styles, responsive layout, tooltips, refresh UI |
 | `src\provider-repository.mjs` | Read-only CCSwitch SQLite access |
@@ -63,6 +64,8 @@ The installer preserves the stable `runtime` directory during an upgrade. A real
 | `src\process-lifecycle.mjs` | Exact Codex root-process liveness monitor; no CDP session ownership |
 | `scripts\launch.ps1` | Finds/starts Codex with CDP, starts the host, activates the window |
 | `scripts\stop-host.ps1` | Stops plugin hosts without stopping Codex |
+| `scripts\launch.mjs` | macOS/Linux source-mode CDP check, root-process discovery, and detached host start |
+| `scripts\stop-host.mjs` | macOS/Linux source-mode plugin-host stop without stopping Codex |
 | `scripts\stop.ps1` | Stops plugin hosts and the Codex process tree; not for normal development reloads |
 | `packaging\launcher\Program.cs` | Hidden Windows EXE wrapper that launches the existing PowerShell flow |
 | `packaging\setup.iss` | Inno Setup installer definition |
@@ -75,6 +78,8 @@ The v2 host is the only balance-query center. The Codex footer, Hub page, and lo
 The stable gateway listens on `127.0.0.1:17891` and exposes cache-only `/v1/balance/{provider}`, `/v1/balances`, and legacy-compatible `/usage/{provider}` reads, plus `/v1/providers` and `/v1/health`. Explicit external refreshes use the token-protected Hub POST route. CCSwitch remains read-only and its existing scripts are not rewritten during v2 development.
 
 The installer and source installer protect the complete target tree with a non-inherited Windows DACL owned by the current user and grant access only to that user, SYSTEM, and Administrators. Development launches reapply the same policy to `runtime` before the host reads or writes `hub-token`. ACL hardening rejects reparse-point roots and fails closed; it never continues startup or installation with a broadly readable token or modifiable installed source tree.
+
+源码宿主本身支持 Windows 和 macOS。Windows 的发布版仍由 PowerShell、隐藏 EXE 启动器和 Inno Setup 负责；macOS 不使用这些 Windows 组件，而是通过 `scripts/launch.mjs` 和 `scripts/stop-host.mjs` 运行源码。macOS 入口要求 Codex 已带 `9334` CDP 启动，不会自动关闭或重启 Codex；宿主只监控传入的 Codex 根 PID。Windows 上的 ACL 加固和 EXE 打包约束不适用于 macOS。
 
 The token-protected `/api/<hub-token>/request-usage` route is the per-request usage source for the current-provider recent-request popover. Opening or refreshing that popover requests the latest 10 Codex records. It prefers a supported third party's real token/quota charge records and falls back to clearly marked CCSwitch `proxy_request_logs` estimates when the remote interface is unavailable. OpenAI Official is a local exception: it reads Codex `token_count` events from `~/.codex/sessions` and `~/.codex/archived_sessions`, returns the official input/output/cache/reasoning Token counts, and leaves per-request cost unavailable because a ChatGPT subscription does not expose a per-call charge. The reader parses only `session_meta`, `turn_context`, and `token_count`, ignores conversation content, rejects non-OpenAI sessions, and activates only when the provider account id matches the current `~/.codex/auth.json` account. It scans newest files first, persists a bounded derived index under `runtime`, incrementally parses only verified append-only tails, and caps both retained files and per-file rows; the index contains no conversation text or credentials. Local fallback SQL is fixed to `app_type = 'codex'`. When one API Key is reused by Codex and Claude/Claude Desktop, remote rows are classified before applying the 10-row limit: `/v1/responses` and OpenAI-compatible paths are Codex, `/v1/messages` and Anthropic paths are Claude, and model families are used only when the path is absent. Ambiguous rows from a cross-app shared Key are excluded rather than mixed into the Codex list.
 

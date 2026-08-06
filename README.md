@@ -1,6 +1,6 @@
 # Codex CCSwitch Usage
 
-一个 Windows 本地扩展：读取 CCSwitch 的 Codex 供应商信息，并把用量嵌入 Codex 输入栏。当前以 v2 Balance Hub 为主。
+一个 Windows/macOS 本地扩展：读取 CCSwitch 的 Codex 供应商信息，并把用量嵌入 Codex 输入栏。当前以 v2 Balance Hub 为主。
 
 ## 先看效果
 
@@ -36,4 +36,24 @@
 - `v2`：当前 Balance Hub 版本的维护分支。
 - `main`：仓库默认分支，当前已快进到 v2 内容。
 
-项目只支持 Windows，保持 CCSwitch 数据库只读，不修改 Codex 的 `app.asar`、MSIX 文件或 Codex 配置。
+源码模式支持 Windows 和 macOS；Windows 另提供 EXE 安装包，macOS 使用 Node.js 启动入口。项目保持 CCSwitch 数据库只读，不修改 Codex 的 `app.asar`、MSIX 文件或 Codex 配置。
+
+## macOS 源码运行
+
+macOS 目前支持源码模式，不提供 Windows EXE。要求 Node.js 22 或更高版本、已安装 CCSwitch，并让 Codex 以本地 CDP 端口 `9334` 启动。若应用名为 `Codex`，可以使用：
+
+```bash
+open -a "Codex" --args \
+  --remote-debugging-port=9334 \
+  --remote-allow-origins=http://127.0.0.1:9334 \
+  --no-first-run
+```
+
+在项目根目录执行：
+
+```bash
+npm run stop-host:mac -- --install-root "$PWD" --all-instances
+npm run launch:mac -- --install-root "$PWD"
+```
+
+启动入口不会关闭或重启 Codex；如果 macOS 上的进程名不是 `Codex` 或无法自动识别根进程，可先确认 CDP 已就绪，再追加 `--codex-pid <PID>`。CCSwitch 数据库默认读取 `~/.cc-switch/cc-switch.db`，官方会话默认读取 `~/.codex`。

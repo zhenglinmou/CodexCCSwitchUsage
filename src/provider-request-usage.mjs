@@ -5,6 +5,7 @@ import { createInterface } from 'node:readline';
 import { fetchJson, parseBrowserJson, providerKind } from './hub-provider-adapters.mjs';
 import { getRequestUsageTemplate } from './provider-templates.mjs';
 import { isTrustedHttpUrl } from './http-allowlist.mjs';
+import { getCodexHomeDir } from './platform.mjs';
 
 export const DEFAULT_REQUEST_USAGE_LIMIT = 10;
 export const MAX_REQUEST_USAGE_LIMIT = 50;
@@ -224,7 +225,9 @@ export function describeProviderRequestUsage(provider, templateId = '') {
       templateId: backend.templateId || '',
       providerAdapter: 'codex-session-token-count',
       method: backend.supported ? 'LOCAL' : '',
-      requestUrl: backend.supported ? '%USERPROFILE%\\.codex\\sessions\\**\\*.jsonl' : '',
+      requestUrl: backend.supported
+        ? (process.platform === 'win32' ? '%USERPROFILE%\\.codex\\sessions\\**\\*.jsonl' : '~/.codex/sessions/**/*.jsonl')
+        : '',
       configurationUrl: '',
       authentication: backend.supported ? '当前 Codex 官方账号 ID 匹配' : '',
       requiresBrowser: false,
@@ -362,8 +365,7 @@ function codexSessionItem(sessionId, segment, cumulativeTokens, event, model) {
 
 export class CodexSessionUsageReader {
   constructor(options = {}) {
-    const userProfile = String(process.env.USERPROFILE || '').trim();
-    this.codexHome = String(options.codexHome || (userProfile ? path.join(userProfile, '.codex') : ''));
+    this.codexHome = String(options.codexHome || getCodexHomeDir());
     this.maximumFiles = Math.max(1, Math.min(20_000, Number(options.maximumFiles) || CODEX_SESSION_FILE_LIMIT));
     this.maximumCachedFiles = Math.max(1, Math.min(5_000, Number(options.maximumCachedFiles) || 512));
     this.maximumItemsPerFile = Math.max(MAX_REQUEST_USAGE_LIMIT, Math.min(512, Number(options.maximumItemsPerFile) || 64));

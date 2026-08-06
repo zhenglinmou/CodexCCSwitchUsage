@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { getHomeDir } from './platform.mjs';
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
 const CACHE_TTL_MS = 5_000;
@@ -13,7 +14,7 @@ let cachedAt = 0;
 function allowlistFilePath() {
   const override = String(process.env.CCSWITCH_HTTP_ALLOWLIST_FILE || '').trim();
   if (override) return path.resolve(override);
-  const home = process.env.USERPROFILE || process.env.HOME || '';
+  const home = getHomeDir();
   if (!home) return '';
   return path.join(home, '.cc-switch', 'allow-http-origins.json');
 }
