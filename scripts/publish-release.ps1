@@ -167,7 +167,8 @@ if ($Tag -ne "v$version") {
 }
 
 $notesPath = Resolve-ExistingFile -Path $NotesFile -Label 'Release notes file'
-$notes = (Get-Content -LiteralPath $notesPath -Raw).Trim()
+$utf8 = [Text.UTF8Encoding]::new($false, $true)
+$notes = ([IO.File]::ReadAllText($notesPath, $utf8)).Trim()
 if (-not $notes) { throw 'Release notes file cannot be empty.' }
 
 $installer = Assert-WorkspaceChild (Join-Path $dist "CodexCCSwitchUsage-Setup-$version.exe")
@@ -233,7 +234,7 @@ try {
     $zipHash = Get-FileSha256 -Path $zipPath
     $crxHash = Get-FileSha256 -Path $crxPath
     $companionSectionPath = Join-Path $root 'docs\RELEASE_BROWSER_COMPANION_SECTION.md'
-    $companionSection = Get-Content -LiteralPath $companionSectionPath -Raw -Encoding UTF8
+    $companionSection = [IO.File]::ReadAllText($companionSectionPath, $utf8)
     $replacements = @{
         '{{COMPANION_VERSION}}' = $companionVersion
         '{{APP_VERSION}}' = $version
@@ -250,8 +251,11 @@ try {
         throw 'Browser companion release template is missing its required markers.'
     }
     $renderedNotes = Join-Path $tempRoot 'release-notes.md'
-    $utf8 = [Text.UTF8Encoding]::new($false)
-    [IO.File]::WriteAllText($renderedNotes, ($notes + "`r`n`r`n" + $companionSection.Trim() + "`r`n"), $utf8)
+    $renderedNotesContent = $notes + "`r`n`r`n" + $companionSection.Trim() + "`r`n"
+    [IO.File]::WriteAllText($renderedNotes, $renderedNotesContent, $utf8)
+    if ([IO.File]::ReadAllText($renderedNotes, $utf8) -cne $renderedNotesContent) {
+        throw 'Release notes UTF-8 round-trip validation failed.'
+    }
 
     $assets = @($installer, $macArm64Package, $macX64Package, $zipPath, $crxPath)
     if ($DryRun) {

@@ -135,6 +135,9 @@ test('GitHub releases always package and explain the browser companion', () => {
   assert.match(publish, /CRX3/);
   assert.match(publish, /Security\.Cryptography\.SHA256/);
   assert.doesNotMatch(publish, /Get-FileHash/);
+  assert.match(publish, /ReadAllText\(\$notesPath, \$utf8\)/);
+  assert.match(publish, /UTF-8 round-trip validation failed/);
+  assert.match(publish, /WriteAllText\(\$renderedNotes/);
   assert.match(publish, /GitHub Release is missing required assets/);
   assert.match(publish, /GitHub Release asset digest does not match local file/);
   assert.match(publish, /required browser companion instructions/);
