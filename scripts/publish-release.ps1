@@ -273,8 +273,22 @@ try {
     $ghCommand = Get-Command gh.exe -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $ghCommand) { $ghCommand = Get-Command gh -ErrorAction Stop | Select-Object -First 1 }
     $gh = $ghCommand.Source
-    & $gh release view $Tag --repo $repositoryName *> $null
-    $releaseExists = $LASTEXITCODE -eq 0
+    $releaseProbeOutput = Join-Path $tempRoot 'release-view.out'
+    $releaseProbeError = Join-Path $tempRoot 'release-view.err'
+    $releaseProbe = Start-Process -FilePath $gh `
+        -ArgumentList @('release', 'view', $Tag, '--repo', $repositoryName) `
+        -RedirectStandardOutput $releaseProbeOutput `
+        -RedirectStandardError $releaseProbeError `
+        -Wait -PassThru -WindowStyle Hidden
+    if ($releaseProbe.ExitCode -eq 0) {
+        $releaseExists = $true
+    } else {
+        $probeError = if (Test-Path -LiteralPath $releaseProbeError -PathType Leaf) { Get-Content -LiteralPath $releaseProbeError -Raw } else { '' }
+        if ($probeError -notmatch '(?i)release not found') {
+            throw "Cannot inspect GitHub Release $Tag (gh exit code $($releaseProbe.ExitCode)): $probeError"
+        }
+        $releaseExists = $false
+    }
     if ($releaseExists) {
         Invoke-CheckedNative -FilePath $gh -Arguments (@('release', 'upload', $Tag) + $assets + @('--repo', $repositoryName, '--clobber')) -Description 'GitHub Release asset upload'
         Invoke-CheckedNative -FilePath $gh -Arguments @('release', 'edit', $Tag, '--repo', $repositoryName, '--notes-file', $renderedNotes) -Description 'GitHub Release notes update'
