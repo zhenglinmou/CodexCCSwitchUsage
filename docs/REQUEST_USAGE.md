@@ -116,18 +116,13 @@ All API Hub 自动识别逐请求模板时固定使用 `limit = 10`，只验证�
 
 - AnyRouter（直连遇到 WAF 时通过已连接的浏览器伴侣请求同一个 API Key 接口）
 - AgentRouter
-- CHY 公益站
-- freely
-- 简直了
-- 魔方公益站
-- 君的公益（直连遇到 WAF 时通过已连接的浏览器伴侣请求同一个 API Key 接口；首次被 Cloudflare 拦截时需在官方页面完成一次验证）
+- 第三方公益站（有限 API Key 直连；WAF 时由已连接的浏览器伴侣回退）
 - PackyCode
-- 无名公益站
 
 其他 CCSwitch 中转站可在 All API Hub 的“模板”弹窗中测试并选择 `New API 逐请求日志`。手动模板始终请求该供应商自己配置的安全 Origin，不会因显示名称把 API Key 转发到上述固定站点；远程 HTTP 只有在本机允许列表按供应商 ID 和精确 Origin 单独放行时才可直连，测试成功后仍需显式保存。
 
-当前实测中，PackyCode 远端接口返回 `record not found`，会自动回退 CCSwitch 并明确标记为非精确；CHY 受地区限制或返回 403 时同样回退。君的公益直连受 WAF 或网站权限限制时可尝试浏览器伴侣，仍不可用才回退 CCSwitch。
+当前实测中，PackyCode 远端接口返回 `record not found`，会自动回退 CCSwitch 并明确标记为非精确；第三方公益站受地区限制、WAF 或网站权限限制时同样回退，并明确标记为非精确。
 
 `rawchat.cn` / `sharedchat.top` 的精确消费记录位于官网登录会话接口 `/frontend-api/vibe-code/records`，API Key 不能直接调用。当前遵循“不读取网页登录态”的约束，因此这两项直接走 CCSwitch 回退。
 
-DeepSeek 官方当前没有按 API Key 查询历史逐请求日志的接口。CPA 调用统一接口时仍会返回 CCSwitch 本地记录，并标记为非精确。OpenAI Official 使用上文所述的 Codex 官方本机会话 Token。君的公益在浏览器伴侣不可用或远端接口失败时也会自动回退 CCSwitch。
+DeepSeek 官方当前没有按 API Key 查询历史逐请求日志的接口。CPA 调用统一接口时仍会返回 CCSwitch 本地记录，并标记为非精确。OpenAI Official 使用上文所述的 Codex 官方本机会话 Token。第三方公益站在浏览器伴侣不可用或远端接口失败时也会自动回退 CCSwitch。
