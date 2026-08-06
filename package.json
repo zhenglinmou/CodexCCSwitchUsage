@@ -1,6 +1,6 @@
 {
   "name": "codex-ccswitch-usage",
-  "version": "2.0.19",
+  "version": "2.0.20",
   "private": true,
   "type": "module",
   "description": "Show the active CCSwitch quota in Codex and manage all Codex providers through a local Balance Hub.",
@@ -8,6 +8,7 @@
     "test": "node --no-warnings --experimental-sqlite --test tests/*.test.mjs",
     "launch:mac": "node scripts/launch.mjs",
     "stop-host:mac": "node scripts/stop-host.mjs",
+    "build:macos": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-macos-package.ps1",
     "build:exe": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-exe.ps1",
     "release:github": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/publish-release.ps1"
   }

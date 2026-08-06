@@ -66,6 +66,32 @@ export function buildHostArguments({ root, port, codexPid, runtimeDir, databaseP
   ];
 }
 
+export function parseLauncherArgs(argv) {
+  const result = {
+    installRoot: process.cwd(),
+    port: DEFAULT_PORT,
+    codexPid: 0,
+    runtimeDir: '',
+    databasePath: '',
+  };
+  for (let index = 0; index < argv.length; index += 1) {
+    const option = argv[index];
+    const value = argv[index + 1];
+    if (option === '--install-root') { result.installRoot = value; index += 1; }
+    else if (option === '--port') { result.port = Number(value); index += 1; }
+    else if (option === '--codex-pid') { result.codexPid = Number(value); index += 1; }
+    else if (option === '--runtime-dir') { result.runtimeDir = value; index += 1; }
+    else if (option === '--database') { result.databasePath = value; index += 1; }
+    else if (option === '--help' || option === '-h') result.help = true;
+    else throw new Error(`未知参数: ${option}`);
+  }
+  if (!Number.isInteger(result.port) || result.port < 1 || result.port > 65_535) throw new Error('CDP 端口无效');
+  if (result.codexPid && (!Number.isInteger(result.codexPid) || result.codexPid <= 0)) throw new Error('Codex PID 无效');
+  if (result.runtimeDir === '' && argv.includes('--runtime-dir')) throw new Error('runtime 目录不能为空');
+  if (result.databasePath === '' && argv.includes('--database')) throw new Error('数据库路径不能为空');
+  return result;
+}
+
 function normalizeProxyUrl(value, defaultScheme = 'http') {
   const candidate = String(value || '').trim();
   if (!candidate) return '';
@@ -120,26 +146,6 @@ export function buildProxyEnvironment({
   const noProxy = new Set(String(result.NO_PROXY || result.no_proxy || '').split(',').map(value => value.trim()).filter(Boolean));
   for (const localAddress of ['127.0.0.1', 'localhost', '::1']) noProxy.add(localAddress);
   result.NO_PROXY = [...noProxy].join(',');
-  return result;
-}
-
-function parseLauncherArgs(argv) {
-  const result = {
-    installRoot: process.cwd(),
-    port: DEFAULT_PORT,
-    codexPid: 0,
-  };
-  for (let index = 0; index < argv.length; index += 1) {
-    const option = argv[index];
-    const value = argv[index + 1];
-    if (option === '--install-root') { result.installRoot = value; index += 1; }
-    else if (option === '--port') { result.port = Number(value); index += 1; }
-    else if (option === '--codex-pid') { result.codexPid = Number(value); index += 1; }
-    else if (option === '--help' || option === '-h') result.help = true;
-    else throw new Error(`未知参数: ${option}`);
-  }
-  if (!Number.isInteger(result.port) || result.port < 1 || result.port > 65_535) throw new Error('CDP 端口无效');
-  if (result.codexPid && (!Number.isInteger(result.codexPid) || result.codexPid <= 0)) throw new Error('Codex PID 无效');
   return result;
 }
 
@@ -237,12 +243,12 @@ export async function launch({
   if (platform === 'win32') throw new Error('Windows 请使用 scripts\\launch.ps1；此入口用于 macOS/Linux 源码运行');
   const parsed = parseLauncherArgs(argv);
   if (parsed.help) {
-    return { help: true, usage: 'node scripts/launch.mjs [--install-root PATH] [--port 9334] [--codex-pid PID]' };
+    return { help: true, usage: 'node scripts/launch.mjs [--install-root PATH] [--port 9334] [--codex-pid PID] [--runtime-dir PATH] [--database PATH]' };
   }
   const root = path.resolve(parsed.installRoot);
   assertInstallRoot(root);
-  const runtimeDir = path.join(root, DEFAULT_RUNTIME_DIR_NAME);
-  const databasePath = getDefaultDatabasePath(process.env, process.cwd(), platform);
+  const runtimeDir = parsed.runtimeDir ? path.resolve(parsed.runtimeDir) : path.join(root, DEFAULT_RUNTIME_DIR_NAME);
+  const databasePath = parsed.databasePath || getDefaultDatabasePath(process.env, process.cwd(), platform);
   const hostPath = path.join(root, 'src', 'host.mjs');
 
   await waitForCodexPage(parsed.port, { listTargets });

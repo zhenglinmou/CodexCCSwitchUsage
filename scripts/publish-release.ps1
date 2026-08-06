@@ -174,6 +174,13 @@ $installer = Assert-WorkspaceChild (Join-Path $dist "CodexCCSwitchUsage-Setup-$v
 if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
     throw "Build the versioned installer before publishing: $installer"
 }
+$macArm64Package = Assert-WorkspaceChild (Join-Path $dist "CodexCCSwitchUsage-macos-arm64-$version.tar.gz")
+$macX64Package = Assert-WorkspaceChild (Join-Path $dist "CodexCCSwitchUsage-macos-x64-$version.tar.gz")
+foreach ($macPackage in @($macArm64Package, $macX64Package)) {
+    if (-not (Test-Path -LiteralPath $macPackage -PathType Leaf)) {
+        throw "Build the macOS package before publishing: $macPackage"
+    }
+}
 if (-not (Test-Path -LiteralPath $companionRoot -PathType Container)) {
     throw "Browser companion source is missing: $companionRoot"
 }
@@ -221,13 +228,18 @@ try {
     Copy-Item -LiteralPath $packedCrx -Destination $crxPath -Force
 
     $installerHash = Get-FileSha256 -Path $installer
+    $macArm64Hash = Get-FileSha256 -Path $macArm64Package
+    $macX64Hash = Get-FileSha256 -Path $macX64Package
     $zipHash = Get-FileSha256 -Path $zipPath
     $crxHash = Get-FileSha256 -Path $crxPath
     $companionSectionPath = Join-Path $root 'docs\RELEASE_BROWSER_COMPANION_SECTION.md'
     $companionSection = Get-Content -LiteralPath $companionSectionPath -Raw -Encoding UTF8
     $replacements = @{
         '{{COMPANION_VERSION}}' = $companionVersion
+        '{{APP_VERSION}}' = $version
         '{{INSTALLER_SHA256}}' = $installerHash
+        '{{MACOS_ARM64_SHA256}}' = $macArm64Hash
+        '{{MACOS_X64_SHA256}}' = $macX64Hash
         '{{COMPANION_ZIP_SHA256}}' = $zipHash
         '{{COMPANION_CRX_SHA256}}' = $crxHash
     }
@@ -241,16 +253,18 @@ try {
     $utf8 = [Text.UTF8Encoding]::new($false)
     [IO.File]::WriteAllText($renderedNotes, ($notes + "`r`n`r`n" + $companionSection.Trim() + "`r`n"), $utf8)
 
-    $assets = @($installer, $zipPath, $crxPath)
+    $assets = @($installer, $macArm64Package, $macX64Package, $zipPath, $crxPath)
     if ($DryRun) {
         [pscustomobject]@{
             dryRun = $true
             tag = $Tag
             repository = $repositoryName
             installer = $installer
+            macosArm64 = $macArm64Package
+            macosX64 = $macX64Package
             companionZip = $zipPath
             companionCrx = $crxPath
-            hashes = @{ installer = $installerHash; zip = $zipHash; crx = $crxHash }
+            hashes = @{ installer = $installerHash; macosArm64 = $macArm64Hash; macosX64 = $macX64Hash; zip = $zipHash; crx = $crxHash }
             signingKey = $signingKeyPath
         } | ConvertTo-Json -Depth 4 -Compress
         return
@@ -275,6 +289,8 @@ try {
     if ($missingAssets.Count) { throw ('GitHub Release is missing required assets: ' + ($missingAssets -join ', ')) }
     $expectedDigests = @{
         ([IO.Path]::GetFileName($installer)) = "sha256:$installerHash"
+        ([IO.Path]::GetFileName($macArm64Package)) = "sha256:$macArm64Hash"
+        ([IO.Path]::GetFileName($macX64Package)) = "sha256:$macX64Hash"
         ([IO.Path]::GetFileName($zipPath)) = "sha256:$zipHash"
         ([IO.Path]::GetFileName($crxPath)) = "sha256:$crxHash"
     }
@@ -294,9 +310,11 @@ try {
         repository = $repositoryName
         release = $release.url
         installer = $installer
+        macosArm64 = $macArm64Package
+        macosX64 = $macX64Package
         companionZip = $zipPath
         companionCrx = $crxPath
-        hashes = @{ installer = $installerHash; zip = $zipHash; crx = $crxHash }
+        hashes = @{ installer = $installerHash; macosArm64 = $macArm64Hash; macosX64 = $macX64Hash; zip = $zipHash; crx = $crxHash }
     } | ConvertTo-Json -Depth 4 -Compress
 } finally {
     if ($tempRoot -and (Test-Path -LiteralPath $tempRoot)) {

@@ -6,11 +6,12 @@ import { isProcessAlive } from '../src/process-lifecycle.mjs';
 import { listLocalProcesses } from './launch.mjs';
 
 function parseArgs(argv) {
-  const result = { installRoot: process.cwd(), timeoutMs: 5_000, port: 9334, allInstances: false };
+  const result = { installRoot: process.cwd(), runtimeDir: '', timeoutMs: 5_000, port: 9334, allInstances: false };
   for (let index = 0; index < argv.length; index += 1) {
     const option = argv[index];
     const value = argv[index + 1];
     if (option === '--install-root') { result.installRoot = value; index += 1; }
+    else if (option === '--runtime-dir') { result.runtimeDir = value; index += 1; }
     else if (option === '--timeout-ms') { result.timeoutMs = Number(value); index += 1; }
     else if (option === '--port') { result.port = Number(value); index += 1; }
     else if (option === '--all-instances') result.allInstances = true;
@@ -19,6 +20,7 @@ function parseArgs(argv) {
   }
   if (!Number.isInteger(result.port) || result.port < 1 || result.port > 65_535) throw new Error('CDP 端口无效');
   if (!Number.isFinite(result.timeoutMs) || result.timeoutMs < 250) throw new Error('停止超时无效');
+  if (result.runtimeDir === '' && argv.includes('--runtime-dir')) throw new Error('runtime 目录不能为空');
   return result;
 }
 
@@ -84,6 +86,7 @@ export async function stopHost({
   timeoutMs = 5_000,
   port = 9334,
   allInstances = false,
+  runtimeDir = '',
   platform = process.platform,
   execFileSyncFn = execFileSync,
 } = {}) {
@@ -91,10 +94,10 @@ export async function stopHost({
   const root = path.resolve(installRoot);
   const marker = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   if (marker?.name !== 'codex-ccswitch-usage') throw new Error(`扩展目录不匹配: ${root}`);
-  const runtimeDir = path.join(root, 'runtime');
+  const resolvedRuntimeDir = runtimeDir ? path.resolve(runtimeDir) : path.join(root, 'runtime');
   const hostPath = path.join(root, 'src', 'host.mjs');
   const processes = listLocalProcesses({ platform, execFileSyncFn });
-  const recordedPid = readPid(path.join(runtimeDir, 'host.pid'));
+  const recordedPid = readPid(path.join(resolvedRuntimeDir, 'host.pid'));
   const candidates = new Set();
   const recorded = processes.find(processInfo => processInfo.pid === recordedPid);
   if (hostMatches(recorded, hostPath, port, false)) candidates.add(recordedPid);
@@ -105,7 +108,7 @@ export async function stopHost({
   for (const pid of candidates) {
     if (await terminate(pid, timeoutMs)) stopped += 1;
   }
-  if (candidates.size === 0 || [...candidates].every(pid => !isProcessAlive(pid))) markStopped(runtimeDir);
+  if (candidates.size === 0 || [...candidates].every(pid => !isProcessAlive(pid))) markStopped(resolvedRuntimeDir);
   return { stopped: true, hostCount: stopped, installRoot: root, allInstances: Boolean(allInstances) };
 }
 
@@ -115,7 +118,7 @@ function isMainModule() {
 
 if (isMainModule()) {
   const args = parseArgs(process.argv.slice(2));
-  if (args.help) console.log('node scripts/stop-host.mjs [--install-root PATH] [--all-instances] [--timeout-ms 5000]');
+  if (args.help) console.log('node scripts/stop-host.mjs [--install-root PATH] [--runtime-dir PATH] [--all-instances] [--timeout-ms 5000]');
   else stopHost(args).then(result => console.log(JSON.stringify(result))).catch(error => {
     console.error(error?.message || error);
     process.exitCode = 1;

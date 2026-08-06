@@ -4,6 +4,7 @@ import {
   buildHostArguments,
   buildProxyEnvironment,
   findCodexRootProcess,
+  parseLauncherArgs,
   parseProcessTable,
 } from '../scripts/launch.mjs';
 
@@ -49,6 +50,20 @@ test('portable launcher passes explicit paths and root PID to the host', () => {
     '--runtime-dir', '/workspace/runtime',
     '--database', '/Users/demo/.cc-switch/cc-switch.db',
   ]);
+});
+
+test('portable launcher accepts a writable runtime directory outside the app bundle', () => {
+  assert.deepEqual(parseLauncherArgs([
+    '--install-root', '/Applications/CodexCCSwitchUsage.app/Contents/Resources/app',
+    '--runtime-dir', '/Users/demo/Library/Application Support/CodexCCSwitchUsage/runtime',
+    '--database', '/Users/demo/.cc-switch/cc-switch.db',
+  ]), {
+    installRoot: '/Applications/CodexCCSwitchUsage.app/Contents/Resources/app',
+    port: 9334,
+    codexPid: 0,
+    runtimeDir: '/Users/demo/Library/Application Support/CodexCCSwitchUsage/runtime',
+    databasePath: '/Users/demo/.cc-switch/cc-switch.db',
+  });
 });
 
 test('macOS proxy discovery keeps loopback traffic outside the proxy', () => {

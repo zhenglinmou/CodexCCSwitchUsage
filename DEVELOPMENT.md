@@ -4,7 +4,7 @@
 
 This document is the operational guide for developing, testing, running, packaging, upgrading, and rolling back CodexCCSwitchUsage on this computer.
 
-The current v2 source metadata is application version `2.0.19`, injector version `94`, and browser-companion version `0.1.25`. Read `package.json` and `browser-companion\manifest.json` when starting a later release; the values below describe the current checkout and are not a substitute for those files.
+The current v2 source metadata is application version `2.0.20`, injector version `94`, and browser-companion version `0.1.25`. Read `package.json` and `browser-companion\manifest.json` when starting a later release; the values below describe the current checkout and are not a substitute for those files.
 
 ## 1. Source of truth and generated copies
 
@@ -372,11 +372,13 @@ dist\CodexCCSwitchUsage-Setup-<version>.exe
 
 ### GitHub Release assets are mandatory
 
-Every v2 GitHub Release must publish all three artifacts from the same versioned tag:
+Every v2 GitHub Release must publish five artifacts from the same versioned tag:
 
 1. `CodexCCSwitchUsage-Setup-<version>.exe`;
-2. `CCSwitch-Browser-Companion-<companion-version>.zip`;
-3. `CCSwitch-Browser-Companion-<companion-version>.crx`, signed with the persistent browser-companion private key.
+2. `CodexCCSwitchUsage-macos-arm64-<version>.tar.gz`;
+3. `CodexCCSwitchUsage-macos-x64-<version>.tar.gz`;
+4. `CCSwitch-Browser-Companion-<companion-version>.zip`;
+5. `CCSwitch-Browser-Companion-<companion-version>.crx`, signed with the persistent browser-companion private key.
 
 The release body must explain that the companion is required only when All API Hub needs an existing browser login, Cookie, or WAF query. It must also give the ZIP loading steps and state that a signed, non-store CRX can still be blocked by Chrome or Edge. Never upload the private `.pem` key.
 
@@ -388,7 +390,7 @@ npm run release:github -- `
   -NotesFile .\release-notes.md
 ```
 
-`scripts\publish-release.ps1` refuses to publish when the remote tag, installer, release notes, ZIP contents, signed CRX3 package, or private signing key are missing. It appends the browser-companion installation instructions and all three SHA-256 values to the release body, then creates or updates the GitHub Release. Use `-DryRun` to build and validate the three assets without changing GitHub. The signing key defaults to `%LOCALAPPDATA%\CodexCCSwitchUsage\signing\ccswitch-browser-companion.pem`; it is outside the repository and must be backed up securely. `-CreateSigningKey` is only for intentionally establishing a new extension identity.
+`scripts\publish-release.ps1` refuses to publish when the remote tag, Windows installer, macOS packages, release notes, ZIP contents, signed CRX3 package, or private signing key are missing. It appends the macOS installation instructions, browser-companion instructions, and all five SHA-256 values to the release body, then creates or updates the GitHub Release. Use `-DryRun` to build and validate the five assets without changing GitHub. The signing key defaults to `%LOCALAPPDATA%\CodexCCSwitchUsage\signing\ccswitch-browser-companion.pem`; it is outside the repository and must be backed up securely. `-CreateSigningKey` is only for intentionally establishing a new extension identity.
 
 ## 7. Install or upgrade the stable EXE
 

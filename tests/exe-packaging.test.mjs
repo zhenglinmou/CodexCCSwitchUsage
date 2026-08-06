@@ -147,6 +147,33 @@ test('GitHub releases always package and explain the browser companion', () => {
   assert.match(userGuide, /CCSwitch-Browser-Companion/);
 });
 
+test('macOS release packages include both native architectures and writable app-bundle paths', () => {
+  const packageJson = JSON.parse(read('package.json'));
+  const build = read('scripts/build-macos-package.ps1');
+  const archive = read('scripts/create-macos-archive.mjs');
+  const launcher = read('packaging/macos/CodexCCSwitchUsage');
+  const stopHost = read('packaging/macos/stop-host.command');
+  const plist = read('packaging/macos/Info.plist');
+  const publish = read('scripts/publish-release.ps1');
+
+  assert.equal(packageJson.scripts['build:macos'].includes('scripts/build-macos-package.ps1'), true);
+  assert.match(build, /darwin-arm64/);
+  assert.match(build, /darwin-x64/);
+  assert.match(build, /runtime-bin/);
+  assert.match(build, /create-macos-archive\.mjs/);
+  assert.match(archive, /prefix = path\.basename/);
+  assert.match(archive, /0o755/);
+  assert.match(launcher, /--runtime-dir/);
+  assert.match(launcher, /Library\/Application Support\/CodexCCSwitchUsage/);
+  assert.match(stopHost, /--all-instances/);
+  assert.match(plist, /@VERSION@/);
+  assert.match(plist, /@ARCH@/);
+  assert.match(publish, /CodexCCSwitchUsage-macos-arm64-\$version\.tar\.gz/);
+  assert.match(publish, /CodexCCSwitchUsage-macos-x64-\$version\.tar\.gz/);
+  assert.match(publish, /MACOS_ARM64_SHA256/);
+  assert.match(publish, /MACOS_X64_SHA256/);
+});
+
 test('one-time profile migration is not shipped', () => {
   const build = read('scripts/build-exe.ps1');
   const install = read('scripts/install.ps1');
