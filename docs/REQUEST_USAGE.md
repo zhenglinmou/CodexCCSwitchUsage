@@ -21,7 +21,7 @@ Content-Type: application/json
 
 CCSwitch 本地回退固定查询 `app_type = 'codex'`。如果同一个 API Key 同时配置给 Codex 与 Claude/Claude Desktop，第三方记录会先按请求路径分类（`/v1/responses` / OpenAI 兼容路径属于 Codex，`/v1/messages` / Anthropic 路径属于 Claude），路径缺失时再使用模型族判断，然后才截取最新 10 条。共享 Key 中无法判定归属的远端记录不会混入 Codex 列表。
 
-同一个 AnyRouter API Key 的主站配置与 API-only 镜像属于同一账户数据源。逐请求查询以配置到 `anyrouter.top` 的主站供应商为准，复用其模板、浏览器账号绑定和 CCSwitch 本地关联记录；镜像仍保留自己的 provider id、名称和模型 API Base URL。
+同一个 浏览器型供应商 API Key 的主站配置与 API-only 镜像属于同一账户数据源。逐请求查询以配置到 `第三方站点 origin` 的主站供应商为准，复用其模板、浏览器账号绑定和 CCSwitch 本地关联记录；镜像仍保留自己的 provider id、名称和模型 API Base URL。
 
 ## 模板自动识别
 
@@ -30,7 +30,7 @@ All API Hub 自动识别逐请求模板时固定使用 `limit = 10`，只验证�
 - `/api/log/token` 返回 HTTP 200 并不足以判定成功；响应必须包含 `success: true` 和数组形式的 `data`。
 - 非空 `data` 必须至少包含一条带有效请求证据的 New API 活动日志：`type = 2` 消费行，或带模型、状态码、请求路径、扣费、Token/Token 数等字段的 `type = 5` 请求错误行。全 0 Token/费用的真实失败请求仍会保留；充值、签到、管理、纯系统事件、只有 `content` 的伪请求行，以及字段存在但值全部为空或 `null` 的占位行都会按 schema 错误拒绝。
 - 空 Token 日志在没有待归属的近期本地成功请求时，只有 `/api/status` 同时返回可验证的 New API 计费结构才算模板可用，避免把任意空数组误判为逐请求接口。
-- Token 日志为空或受 WAF/403 阻断时，可以尝试浏览器账户日志，但至少两条近期本地成功请求必须在时间、模型和输入 Token 上逐条关联到同一远端 Token。其他 New API 站的输出 Token 仍必须完全相等；仅 AnyRouter 兼容其 `completion_tokens` 未包含本地 reasoning 输出的已知差异，允许远端正数小于本地输出。优先使用 `token_id`；站点删掉该字段时，只返回实际关联成功的同名 `token_name` 行，不夹带其他同名记录。
+- Token 日志为空或受 WAF/403 阻断时，可以尝试浏览器账户日志，但至少两条近期本地成功请求必须在时间、模型和输入 Token 上逐条关联到同一远端 Token。其他 New API 站的输出 Token 仍必须完全相等；仅 浏览器型供应商 兼容其 `completion_tokens` 未包含本地 reasoning 输出的已知差异，允许远端正数小于本地输出。优先使用 `token_id`；站点删掉该字段时，只返回实际关联成功的同名 `token_name` 行，不夹带其他同名记录。
 - HTTP 401 或明确的无效 API Key 不会进入浏览器账户日志回退；无法证明当前 Key 归属时会失败关闭并交给 CCSwitch 本地记录兜底。
 - 日志结构有效但 `/api/status` 计费配置不完整时，Token 记录仍可使用，但费用会标记为非精确和降级，不会伪装成供应商真实扣费。
 - `record not found`、未通过归属校验、鉴权失败、网络错误或无效响应都会使远端模板识别失败；WAF 只有在上述严格账户日志关联成功时才可恢复，否则 Hub 随后测试 `CCSwitch 本地请求记录` 回退模板。
@@ -114,8 +114,8 @@ All API Hub 自动识别逐请求模板时固定使用 `limit = 10`，只验证�
 
 以下站点具有内置 New API `/api/log/token` 尝试与回退配置。该清单表示 Hub 知道其安全 Origin 和查询方式，不表示远端接口在所有账号、地区或时刻都一定可用：
 
-- AnyRouter（直连遇到 WAF 时通过已连接的浏览器伴侣请求同一个 API Key 接口）
-- AgentRouter
+- 浏览器型供应商（直连遇到 WAF 时通过已连接的浏览器伴侣请求同一个 API Key 接口）
+- 浏览器型供应商
 - 第三方公益站（有限 API Key 直连；WAF 时由已连接的浏览器伴侣回退）
 - PackyCode
 
