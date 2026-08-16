@@ -13,6 +13,7 @@ import { KeyedBackoff } from './keyed-backoff.mjs';
 import { decodePageActionQueue } from './page-action-channel.mjs';
 import { isProcessAlive, ProcessExitMonitor } from './process-lifecycle.mjs';
 import { getDefaultDatabasePath } from './platform.mjs';
+import { secureAtomicWriteFileSync, secureMkdirSync, secureWriteFileSync } from './secure-files.mjs';
 import { acknowledgePageAction, installTargetOnce, settleTargetOperations } from './target-session.mjs';
 
 const DATABASE_WATCH_DEBOUNCE_MS = 100;
@@ -28,6 +29,7 @@ const RECENT_REQUEST_LIMIT = 10;
 const CODEX_PROCESS_POLL_MS = 1_000;
 const REMOTE_RECENT_REQUEST_SOURCES = new Set(['provider_log', 'provider_account_log', 'openai_codex_session']);
 const REMOTE_RECENT_REQUEST_REFRESH_DEBOUNCE_MS = 750;
+const MAX_USAGE_CACHE_BYTES = 1_000_000;
 
 function readLocalVersion(relativePath) {
   try {
@@ -43,21 +45,26 @@ const EXPECTED_COMPANION_VERSION = readLocalVersion('../browser-companion/manife
 const HOST_STARTED_AT = new Date().toISOString();
 
 function parseArgs(argv) {
-  const result = { port: 9334, database: getDefaultDatabasePath(), runtimeDir: path.join(process.cwd(), 'runtime'), codexPid: 0 };
+  const result = { port: 0, database: getDefaultDatabasePath(), runtimeDir: path.join(process.cwd(), 'runtime'), codexPid: 0 };
   for (let index = 0; index < argv.length; index += 1) {
+    const option = argv[index];
     const value = argv[index + 1];
-    if (argv[index] === '--port') result.port = Number(value);
-    if (argv[index] === '--database') result.database = value;
-    if (argv[index] === '--runtime-dir') result.runtimeDir = value;
-    if (argv[index] === '--codex-pid') result.codexPid = Number(value);
+    if (option === '--port') { result.port = Number(value); index += 1; }
+    else if (option === '--database') { result.database = value; index += 1; }
+    else if (option === '--runtime-dir') { result.runtimeDir = value; index += 1; }
+    else if (option === '--codex-pid') { result.codexPid = Number(value); index += 1; }
+    else throw new Error(`Unknown host argument: ${option}`);
   }
+  if (!Number.isInteger(result.port) || result.port < 1 || result.port > 65_535) throw new Error('A valid CDP port is required.');
   if (!Number.isInteger(result.codexPid) || result.codexPid <= 0) throw new Error('A live Codex root PID is required.');
+  if (!String(result.database || '').trim()) throw new Error('A CCSwitch database path is required.');
+  if (!String(result.runtimeDir || '').trim()) throw new Error('A runtime directory is required.');
   return result;
 }
 
 const args = parseArgs(process.argv.slice(2));
 if (!isProcessAlive(args.codexPid)) throw new Error(`Codex root process ${args.codexPid} is not running.`);
-fs.mkdirSync(args.runtimeDir, { recursive: true });
+secureMkdirSync(args.runtimeDir);
 const statusPath = path.join(args.runtimeDir, 'status.json');
 const pidPath = path.join(args.runtimeDir, 'host.pid');
 const cachePath = path.join(args.runtimeDir, 'usage-cache.json');
@@ -76,6 +83,7 @@ const hubService = new HubService(repository, hubQueryEngine, {
 });
 const hubServer = new HubServer(hubService, {
   tokenPath: path.join(args.runtimeDir, 'hub-token'),
+  companionTokenPath: path.join(args.runtimeDir, 'companion-token'),
   browserBroker,
   preferencesPath: path.join(args.runtimeDir, 'hub-preferences.json'),
   diagnostics: () => ({
@@ -99,15 +107,18 @@ const targetInstallBackoff = new KeyedBackoff();
 
 function readUsageCache() {
   try {
+    const stats = fs.statSync(cachePath);
+    if (!stats.isFile() || stats.size <= 0 || stats.size > MAX_USAGE_CACHE_BYTES) return null;
     const cached = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
-    return cached?.status === 'ok' && cached?.providerId ? cached : null;
+    const usage = cached?.usage;
+    if (cached?.version !== 2 || !usage || usage.status !== 'ok' || !usage.providerId) return null;
+    return { ...usage, providerSignature: String(cached.providerSignature || '') };
   } catch {
     return null;
   }
 }
 
 function writeUsageCache(payload, providerSignature = '') {
-  const temporary = `${cachePath}.tmp`;
   const cachePayload = { ...payload };
   delete cachePayload.recentRequests;
   delete cachePayload.recentRequestsLoading;
@@ -116,13 +127,15 @@ function writeUsageCache(payload, providerSignature = '') {
   delete cachePayload.recentRequestsFetchedAt;
   delete cachePayload.recentRequestsMessage;
   try {
-    fs.writeFileSync(temporary, JSON.stringify({ ...cachePayload, providerSignature }), 'utf8');
-    fs.renameSync(temporary, cachePath);
+    secureAtomicWriteFileSync(cachePath, JSON.stringify({
+      version: 2,
+      providerSignature,
+      usage: cachePayload,
+    }), { encoding: 'utf8' });
     lastUsageCacheError = '';
     return true;
   } catch (error) {
     lastUsageCacheError = safeMessage(error);
-    try { fs.rmSync(temporary, { force: true }); } catch {}
     return false;
   }
 }
@@ -141,6 +154,8 @@ if (cachedUsage) {
     if (!cacheMatchesCurrent) {
       cachedUsage = null;
       cachedProviderSignature = '';
+    } else {
+      cachedUsage = hubItemToUsagePayload(currentProvider, { status: 'ok', usage: cachedUsage });
     }
   } catch {
     cachedUsage = null;
@@ -194,7 +209,7 @@ let codexProcessMonitor = null;
 let lastUsageCacheError = '';
 let lastStatusSignature = '';
 
-fs.writeFileSync(pidPath, String(process.pid), 'utf8');
+secureWriteFileSync(pidPath, String(process.pid), { encoding: 'utf8' });
 
 function writeStatus(extra = {}) {
   const stopping = stopped || extra.running === false;
@@ -240,15 +255,12 @@ function writeStatus(extra = {}) {
   };
   const signature = JSON.stringify({ ...status, updatedAt: '' });
   if (!stopping && signature === lastStatusSignature && now - lastStatusWriteAt < STATUS_HEARTBEAT_MS) return true;
-  const temporary = `${statusPath}.tmp`;
   try {
-    fs.writeFileSync(temporary, JSON.stringify(status, null, 2), 'utf8');
-    fs.renameSync(temporary, statusPath);
+    secureAtomicWriteFileSync(statusPath, JSON.stringify(status, null, 2), { encoding: 'utf8' });
     lastStatusSignature = signature;
     lastStatusWriteAt = now;
     return true;
   } catch {
-    try { fs.rmSync(temporary, { force: true }); } catch {}
     return false;
   }
 }
@@ -583,14 +595,11 @@ async function refreshCurrentProvider(force = false) {
     if (lastPayload.status === 'ok' && lastPayload.providerId === provider.id) {
       lastPayload = { ...lastPayload, queryError: message };
     } else {
-      lastPayload = payloadWithRecentRequests({
+      lastPayload = payloadWithRecentRequests(hubItemToUsagePayload(provider, {
         status: 'error',
-        providerId: provider.id,
-        providerName: provider.name,
-        websiteUrl: provider.websiteUrl,
         message,
         updatedAt: new Date().toISOString(),
-      });
+      }));
     }
     writeStatus({ error: message });
     scheduleCurrentProviderRefresh(configurationReady ? intervalMs : 60_000);
@@ -874,7 +883,10 @@ function nextMaintenanceDelay() {
 }
 
 async function loop() {
-  await ensureHubServer(true);
+  const hubReady = await ensureHubServer(true);
+  if (!hubReady && /\bEADDRINUSE\b/i.test(String(lastHubError || ''))) {
+    throw new Error('Balance Hub 端口已被占用；拒绝启动第二个插件宿主');
+  }
   syncRecentRequests();
   await requestTargetSync({ audit: true });
   startDatabaseWatcher();

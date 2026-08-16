@@ -183,6 +183,10 @@ class LoopbackWebSocketTransport extends EventTarget {
         return;
       }
       const masked = Boolean(second & 0x80);
+      if (masked) {
+        this.#fail();
+        return;
+      }
       let length = second & 0x7f;
       let offset = 2;
       if (length === 126) {
@@ -203,18 +207,9 @@ class LoopbackWebSocketTransport extends EventTarget {
         this.#fail();
         return;
       }
-      let mask = null;
-      if (masked) {
-        if (this.receiveBuffer.length < offset + 4) return;
-        mask = this.receiveBuffer.subarray(offset, offset + 4);
-        offset += 4;
-      }
       if (this.receiveBuffer.length < offset + length) return;
-      let payload = Buffer.from(this.receiveBuffer.subarray(offset, offset + length));
+      const payload = Buffer.from(this.receiveBuffer.subarray(offset, offset + length));
       this.receiveBuffer = this.receiveBuffer.subarray(offset + length);
-      if (mask) {
-        for (let index = 0; index < payload.length; index += 1) payload[index] ^= mask[index % 4];
-      }
       if (opcode === 0x8) {
         void this.terminate();
         return;
@@ -442,6 +437,10 @@ function readJson(port, pathname, hostname) {
 }
 
 export async function listCdpTargets(port) {
+  const expectedPort = Number(port);
+  if (!Number.isInteger(expectedPort) || expectedPort < 1 || expectedPort > 65_535) {
+    throw new Error('Codex 调试接口端口无效');
+  }
   let targets;
   try {
     targets = await readJson(port, '/json/list', '127.0.0.1');
@@ -449,6 +448,23 @@ export async function listCdpTargets(port) {
     targets = await readJson(port, '/json/list', '::1');
   }
   if (!Array.isArray(targets)) throw new Error('Codex 调试接口目标列表无效');
+  for (const target of targets) {
+    if (!target?.webSocketDebuggerUrl) continue;
+    let url;
+    try { url = new URL(String(target.webSocketDebuggerUrl)); }
+    catch { throw new Error('Codex 调试目标 WebSocket 地址无效'); }
+    const targetPort = Number(url.port || 80);
+    if (
+      url.protocol !== 'ws:'
+      || !loopbackHostname(url.hostname)
+      || url.username
+      || url.password
+      || url.hash
+      || targetPort !== expectedPort
+    ) {
+      throw new Error('Codex 调试目标 WebSocket 不属于当前本机端口');
+    }
+  }
   return targets;
 }
 

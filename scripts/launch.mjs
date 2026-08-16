@@ -5,10 +5,13 @@ import { fileURLToPath } from 'node:url';
 import { closeCdpHttpClient, isCodexTargetCandidate, listCdpTargets } from '../src/cdp-client.mjs';
 import { getDefaultDatabasePath } from '../src/platform.mjs';
 import { isProcessAlive } from '../src/process-lifecycle.mjs';
+import { secureMkdirSync, secureOpenAppendSync, secureWriteFileSync } from '../src/secure-files.mjs';
 
-const DEFAULT_PORT = 9334;
+const DEFAULT_PORT = 0;
 const DEFAULT_CDP_TIMEOUT_MS = 25_000;
 const DEFAULT_RUNTIME_DIR_NAME = 'runtime';
+const MAX_PACKAGE_MARKER_BYTES = 65_536;
+const MAX_PID_FILE_BYTES = 64;
 
 function commandName(commandLine) {
   const match = /^(?:"([^"]+)"|(\S+))/.exec(String(commandLine || ''));
@@ -32,9 +35,17 @@ export function listLocalProcesses({ platform = process.platform, execFileSyncFn
   return parseProcessTable(execFileSyncFn('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' }));
 }
 
-function hasRemoteDebuggingPort(commandLine, port) {
-  const escapedPort = String(Number(port)).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(?:^|\\s)--remote-debugging-port(?:=|\\s+)${escapedPort}(?=\\s|$)`).test(String(commandLine || ''));
+export function remoteDebuggingPort(commandLine) {
+  const match = /(?:^|\s)--remote-debugging-port(?:=|\s+)(\d+)(?=\s|$)/.exec(String(commandLine || ''));
+  const port = Number(match?.[1]);
+  return Number.isInteger(port) && port > 0 && port <= 65_535 ? port : 0;
+}
+
+export function hasLoopbackDebuggingAddress(commandLine) {
+  const match = /(?:^|\s)--remote-debugging-address(?:=|\s+)([^\s]+)/.exec(String(commandLine || ''));
+  if (!match) return true;
+  const address = match[1].replace(/^\[|\]$/g, '').toLowerCase();
+  return ['127.0.0.1', 'localhost', '::1'].includes(address);
 }
 
 function isCodexProcess(processInfo) {
@@ -44,11 +55,17 @@ function isCodexProcess(processInfo) {
     || /(?:^|[\\/])(codex|chatgpt)(?:\.exe)?(?:\s|$)/i.test(commandLine);
 }
 
+function isCodexRootProcess(processInfo) {
+  return remoteDebuggingPort(processInfo?.commandLine) > 0
+    && hasLoopbackDebuggingAddress(processInfo?.commandLine)
+    && !/(?:^|\s)--type(?:=|\s)/.test(String(processInfo?.commandLine || ''))
+    && isCodexProcess(processInfo);
+}
+
 export function findCodexRootProcess(processes, port = DEFAULT_PORT) {
   return (Array.isArray(processes) ? processes : []).find(processInfo => (
-    hasRemoteDebuggingPort(processInfo?.commandLine, port)
-    && !/(?:^|\s)--type(?:=|\s)/.test(String(processInfo?.commandLine || ''))
-    && isCodexProcess(processInfo)
+    isCodexRootProcess(processInfo)
+    && (Number(port) === 0 || remoteDebuggingPort(processInfo.commandLine) === Number(port))
   )) || null;
 }
 
@@ -85,7 +102,7 @@ export function parseLauncherArgs(argv) {
     else if (option === '--help' || option === '-h') result.help = true;
     else throw new Error(`未知参数: ${option}`);
   }
-  if (!Number.isInteger(result.port) || result.port < 1 || result.port > 65_535) throw new Error('CDP 端口无效');
+  if (!Number.isInteger(result.port) || result.port < 0 || result.port > 65_535) throw new Error('CDP 端口无效');
   if (result.codexPid && (!Number.isInteger(result.codexPid) || result.codexPid <= 0)) throw new Error('Codex PID 无效');
   if (result.runtimeDir === '' && argv.includes('--runtime-dir')) throw new Error('runtime 目录不能为空');
   if (result.databasePath === '' && argv.includes('--database')) throw new Error('数据库路径不能为空');
@@ -150,7 +167,11 @@ export function buildProxyEnvironment({
 }
 
 function readJsonFile(filename, fallback = null) {
-  try { return JSON.parse(fs.readFileSync(filename, 'utf8')); } catch { return fallback; }
+  try {
+    const stats = fs.statSync(filename);
+    if (!stats.isFile() || stats.size <= 0 || stats.size > MAX_PACKAGE_MARKER_BYTES) return fallback;
+    return JSON.parse(fs.readFileSync(filename, 'utf8'));
+  } catch { return fallback; }
 }
 
 function assertInstallRoot(root) {
@@ -160,6 +181,8 @@ function assertInstallRoot(root) {
 }
 
 function readPid(filename) {
+  const stats = fs.statSync(filename);
+  if (!stats.isFile() || stats.size <= 0 || stats.size > MAX_PID_FILE_BYTES) return 0;
   const value = Number.parseInt(String(fs.readFileSync(filename, 'utf8')).trim(), 10);
   return Number.isInteger(value) && value > 0 ? value : 0;
 }
@@ -167,6 +190,11 @@ function readPid(filename) {
 function commandLineHasCodexPid(commandLine, codexPid) {
   const escapedPid = String(codexPid).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return new RegExp(`(?:^|\\s)--codex-pid(?:=|\\s+)${escapedPid}(?=\\s|$)`).test(String(commandLine || ''));
+}
+
+function commandLineHasPort(commandLine, port) {
+  const escapedPort = String(port).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|\\s)--port(?:=|\\s+)${escapedPort}(?=\\s|$)`).test(String(commandLine || ''));
 }
 
 function hostMatchesSource(processInfo, hostPath) {
@@ -213,11 +241,11 @@ async function terminateHost(pid, timeoutMs = 5_000) {
 }
 
 function startHost({ root, runtimeDir, databasePath, port, codexPid, platform = process.platform, spawnFn = defaultSpawn, env = process.env }) {
-  fs.mkdirSync(runtimeDir, { recursive: true });
+  secureMkdirSync(runtimeDir);
   const stdoutPath = path.join(runtimeDir, 'host.log');
   const stderrPath = path.join(runtimeDir, 'host-error.log');
-  const stdout = fs.openSync(stdoutPath, 'a');
-  const stderr = fs.openSync(stderrPath, 'a');
+  const stdout = secureOpenAppendSync(stdoutPath);
+  const stderr = secureOpenAppendSync(stderrPath);
   try {
     const child = spawnFn(process.execPath, buildHostArguments({ root, port, codexPid, runtimeDir, databasePath, platform }), {
       cwd: root,
@@ -243,7 +271,7 @@ export async function launch({
   if (platform === 'win32') throw new Error('Windows 请使用 scripts\\launch.ps1；此入口用于 macOS/Linux 源码运行');
   const parsed = parseLauncherArgs(argv);
   if (parsed.help) {
-    return { help: true, usage: 'node scripts/launch.mjs [--install-root PATH] [--port 9334] [--codex-pid PID] [--runtime-dir PATH] [--database PATH]' };
+    return { help: true, usage: 'node scripts/launch.mjs [--install-root PATH] [--port PORT] [--codex-pid PID] [--runtime-dir PATH] [--database PATH]' };
   }
   const root = path.resolve(parsed.installRoot);
   assertInstallRoot(root);
@@ -251,27 +279,34 @@ export async function launch({
   const databasePath = parsed.databasePath || getDefaultDatabasePath(process.env, process.cwd(), platform);
   const hostPath = path.join(root, 'src', 'host.mjs');
 
-  await waitForCodexPage(parsed.port, { listTargets });
-  closeCdpHttpClient();
   const processes = listLocalProcesses({ platform, execFileSyncFn });
   const codexRoot = parsed.codexPid > 0
-    ? { pid: parsed.codexPid }
+    ? processes.find(processInfo => processInfo.pid === parsed.codexPid && isCodexRootProcess(processInfo))
     : findCodexRootProcess(processes, parsed.port);
   if (!codexRoot?.pid || !isProcessAlive(codexRoot.pid)) {
-    throw new Error('找不到启用 CDP 的 Codex 根进程；请使用 --codex-pid 显式指定。');
+    throw new Error('找不到启用 CDP 的 Codex 根进程；请先以随机回环端口启动 Codex，或使用 --codex-pid 显式指定。');
+  }
+  const detectedPort = remoteDebuggingPort(codexRoot.commandLine);
+  if (parsed.port > 0 && detectedPort !== parsed.port) throw new Error('指定的 CDP 端口与 Codex 根进程不一致。');
+  const port = parsed.port || detectedPort;
+  try {
+    await waitForCodexPage(port, { listTargets });
+  } finally {
+    closeCdpHttpClient();
   }
 
-  fs.mkdirSync(runtimeDir, { recursive: true });
+  secureMkdirSync(runtimeDir);
+  secureWriteFileSync(path.join(runtimeDir, 'cdp-port'), String(port), { encoding: 'ascii' });
   const pidPath = path.join(runtimeDir, 'host.pid');
   const recordedPid = fs.existsSync(pidPath) ? readPid(pidPath) : 0;
   const recordedProcess = recordedPid ? processes.find(processInfo => processInfo.pid === recordedPid) : null;
   if (recordedProcess && hostMatchesSource(recordedProcess, hostPath)) {
-    if (!commandLineHasCodexPid(recordedProcess.commandLine, codexRoot.pid)) {
+    if (!commandLineHasCodexPid(recordedProcess.commandLine, codexRoot.pid) || !commandLineHasPort(recordedProcess.commandLine, port)) {
       if (!await terminateHost(recordedPid)) throw new Error(`旧插件宿主未能退出: ${recordedPid}`);
     }
     else {
-      fs.writeFileSync(path.join(runtimeDir, 'remount.request'), new Date().toISOString(), 'ascii');
-      return { launched: true, reused: true, port: parsed.port, codexProcessId: codexRoot.pid, hostProcessId: recordedPid, installRoot: root };
+      secureWriteFileSync(path.join(runtimeDir, 'remount.request'), new Date().toISOString(), { encoding: 'ascii' });
+      return { launched: true, reused: true, port, codexProcessId: codexRoot.pid, hostProcessId: recordedPid, installRoot: root };
     }
   }
 
@@ -279,14 +314,14 @@ export async function launch({
     root,
     runtimeDir,
     databasePath,
-    port: parsed.port,
+    port,
     codexPid: codexRoot.pid,
     platform,
     spawnFn,
     env: buildProxyEnvironment({ platform, execFileSyncFn }),
   });
-  fs.writeFileSync(path.join(runtimeDir, 'remount.request'), new Date().toISOString(), 'ascii');
-  return { launched: true, reused: false, port: parsed.port, codexProcessId: codexRoot.pid, hostProcessId, installRoot: root };
+  secureWriteFileSync(path.join(runtimeDir, 'remount.request'), new Date().toISOString(), { encoding: 'ascii' });
+  return { launched: true, reused: false, port, codexProcessId: codexRoot.pid, hostProcessId, installRoot: root };
 }
 
 function isMainModule() {

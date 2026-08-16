@@ -1,7 +1,7 @@
 param(
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'CodexCCSwitchUsage'),
     [int]$TimeoutSeconds = 5,
-    [int]$Port = 9334,
+    [int]$Port = 0,
     [switch]$AllInstances
 )
 $ErrorActionPreference = 'Stop'
@@ -38,7 +38,7 @@ function Test-TargetHost {
     if (-not $ProcessInfo -or $ProcessInfo.Name -ne 'node.exe' -or -not $ProcessInfo.CommandLine) { return $false }
     if ($ProcessInfo.CommandLine.IndexOf($hostPath, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
     if (-not $AllInstances) { return $false }
-    if ($ProcessInfo.CommandLine -notmatch "(?:^|\s)--port(?:\s+|=)$Port(?:\s|$)") { return $false }
+    if ($Port -gt 0 -and $ProcessInfo.CommandLine -notmatch "(?:^|\s)--port(?:\s+|=)$Port(?:\s|$)") { return $false }
     return [bool](Get-PluginHostRoot $ProcessInfo.CommandLine)
 }
 

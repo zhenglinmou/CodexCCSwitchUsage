@@ -1,6 +1,6 @@
 ﻿param(
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'CodexCCSwitchUsage'),
-    [int]$Port = 9334,
+    [int]$Port = 0,
     [switch]$AllowCodexRestart
 )
 $ErrorActionPreference = 'Stop'
@@ -167,6 +167,33 @@ function Get-CodexRoots {
     })
 }
 
+function Get-CodexDebugPort {
+    param([string]$CommandLine)
+    $match = [regex]::Match([string]$CommandLine, '(?:^|\s)--remote-debugging-port(?:=|\s+)(?<port>\d+)(?=\s|$)')
+    if (-not $match.Success) { return 0 }
+    [int]$value = 0
+    if (-not [int]::TryParse($match.Groups['port'].Value, [ref]$value) -or $value -lt 1 -or $value -gt 65535) { return 0 }
+    return $value
+}
+
+function Test-CodexLoopbackDebugging {
+    param([string]$CommandLine)
+    $match = [regex]::Match([string]$CommandLine, '(?:^|\s)--remote-debugging-address(?:=|\s+)(?<address>[^\s]+)')
+    if (-not $match.Success) { return $true }
+    $address = $match.Groups['address'].Value.Trim('[', ']').ToLowerInvariant()
+    return $address -in @('127.0.0.1', 'localhost', '::1')
+}
+
+function Get-RandomLoopbackPort {
+    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    try {
+        $listener.Start()
+        return [int]([Net.IPEndPoint]$listener.LocalEndpoint).Port
+    } finally {
+        $listener.Stop()
+    }
+}
+
 function Show-RestartPrompt {
     param([string]$Message, [string]$Title, [int]$Icon = 48)
     $shell = New-Object -ComObject WScript.Shell
@@ -175,22 +202,41 @@ function Show-RestartPrompt {
 
 $codexApplication = Find-CodexApplication
 $roots = Get-CodexRoots
-$codexRoot = $roots | Where-Object { $_.CommandLine -match "--remote-debugging-port=$Port(?:\s|$)" } | Select-Object -First 1
-$ordinaryRoots = @($roots | Where-Object { $_.CommandLine -notmatch "--remote-debugging-port=$Port(?:\s|$)" })
+$safeDebugRoots = @($roots | Where-Object {
+    (Get-CodexDebugPort $_.CommandLine) -gt 0 -and (Test-CodexLoopbackDebugging $_.CommandLine)
+})
+$unsafeDebugRoots = @($roots | Where-Object {
+    (Get-CodexDebugPort $_.CommandLine) -gt 0 -and -not (Test-CodexLoopbackDebugging $_.CommandLine)
+})
+$codexRoot = $null
+if ($Port -gt 0) {
+    $codexRoot = $safeDebugRoots | Where-Object { (Get-CodexDebugPort $_.CommandLine) -eq $Port } | Select-Object -First 1
+} else {
+    $codexRoot = $safeDebugRoots | Select-Object -First 1
+    if ($codexRoot) { $Port = Get-CodexDebugPort $codexRoot.CommandLine }
+}
+$ordinaryRoots = @($roots | Where-Object { (Get-CodexDebugPort $_.CommandLine) -eq 0 })
+if (-not $codexRoot -and $Port -gt 0 -and $safeDebugRoots.Count -gt 0) {
+    $existingPorts = @($safeDebugRoots | ForEach-Object { Get-CodexDebugPort $_.CommandLine } | Sort-Object -Unique) -join ', '
+    throw "现有 Codex 使用本地调试端口 $existingPorts，与指定端口 $Port 不一致；开发热更新不会为迁移端口而重启 Codex。"
+}
+if ($Port -le 0) { $Port = Get-RandomLoopbackPort }
+if ($Port -lt 1 -or $Port -gt 65535) { throw 'CDP 端口无效。' }
 
-if (-not $codexRoot -and $ordinaryRoots.Count -gt 0) {
+if (-not $codexRoot -and ($ordinaryRoots.Count -gt 0 -or $unsafeDebugRoots.Count -gt 0)) {
+    $restartRoots = @($ordinaryRoots) + @($unsafeDebugRoots)
     if (-not $AllowCodexRestart) {
-        [void](Show-CodexWindow -CodexProcessId $ordinaryRoots[0].ProcessId)
-        throw "现有 Codex 未启用本地调试端口 $Port。开发热更新不会自动关闭或重启 Codex；请先保存当前工作，再显式使用 -AllowCodexRestart。"
+        [void](Show-CodexWindow -CodexProcessId $restartRoots[0].ProcessId)
+        throw "现有 Codex 未启用安全的回环调试端口。开发热更新不会自动关闭或重启 Codex；请先保存当前工作，再显式使用 -AllowCodexRestart。"
     }
-    foreach ($rootProcess in $ordinaryRoots) {
+    foreach ($rootProcess in $restartRoots) {
         $process = Get-Process -Id $rootProcess.ProcessId -ErrorAction SilentlyContinue
         if ($process) { [void]$process.CloseMainWindow() }
     }
     $closeDeadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
         Start-Sleep -Milliseconds 200
-        $remainingRoots = @(Get-CodexRoots | Where-Object { $_.ProcessId -in $ordinaryRoots.ProcessId })
+        $remainingRoots = @(Get-CodexRoots | Where-Object { $_.ProcessId -in $restartRoots.ProcessId })
     } while ($remainingRoots.Count -gt 0 -and [DateTime]::UtcNow -lt $closeDeadline)
 
     if ($remainingRoots.Count -gt 0) {
@@ -210,9 +256,12 @@ if (-not $codexRoot -and $ordinaryRoots.Count -gt 0) {
     }
 }
 
+[IO.File]::WriteAllText((Join-Path $runtime 'cdp-port'), [string]$Port, [Text.Encoding]::ASCII)
+
 if (-not $codexRoot) {
     [void](Start-CodexApplication -AppUserModelId $codexApplication.AppUserModelId -Arguments @(
         "--remote-debugging-port=$Port",
+        '--remote-debugging-address=127.0.0.1',
         "--remote-allow-origins=http://127.0.0.1:$Port",
         '--no-first-run'
     ))

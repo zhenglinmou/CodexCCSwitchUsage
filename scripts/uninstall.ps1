@@ -7,7 +7,10 @@ if (Test-Path -LiteralPath $root) {
     if (-not (Test-Path -LiteralPath $marker)) { throw '扩展标识文件不存在，拒绝删除。' }
     $package = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
     if ($package.name -ne 'codex-ccswitch-usage') { throw '扩展标识不匹配，拒绝删除。' }
-    & (Join-Path $root 'scripts\stop.ps1') -InstallRoot $root | Out-Null
+    $stopHost = Join-Path $root 'scripts\stop-host.ps1'
+    if (Test-Path -LiteralPath $stopHost -PathType Leaf) {
+        & $stopHost -InstallRoot $root -AllInstances | Out-Null
+    }
 }
 
 $shortcutPaths = @(
