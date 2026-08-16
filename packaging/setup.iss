@@ -41,6 +41,12 @@ VersionInfoVersion={#AppVersion}
 VersionInfoProductName=Codex CCSwitch Usage
 VersionInfoDescription=Codex CCSwitch Usage installer
 VersionInfoCompany=Local
+#ifdef SignedBuild
+SignTool=codexsign
+SignedUninstaller=yes
+#else
+SignedUninstaller=no
+#endif
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "快捷方式："; Flags: checkedonce
@@ -53,6 +59,14 @@ Source: "{#PackageRoot}\scripts\harden-acl.ps1"; Flags: dontcopy
 
 [InstallDelete]
 Type: files; Name: "{app}\scripts\migrate-default-profile.ps1"
+Type: files; Name: "{app}\scripts\check-current.mjs"
+Type: files; Name: "{app}\scripts\install.ps1"
+Type: files; Name: "{app}\scripts\stop.ps1"
+Type: files; Name: "{app}\scripts\status.ps1"
+Type: files; Name: "{app}\scripts\uninstall.ps1"
+Type: files; Name: "{app}\src\usage-client.mjs"
+Type: files; Name: "{app}\src\evaluator.mjs"
+Type: files; Name: "{app}\src\evaluator-worker.mjs"
 
 [Dirs]
 Name: "{app}\runtime"

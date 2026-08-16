@@ -1,6 +1,7 @@
 {
   "name": "codex-ccswitch-usage",
-  "version": "2.0.20",
+  "version": "2.0.21",
+  "bundledNodeVersion": "22.22.1",
   "private": true,
   "type": "module",
   "description": "Show the active CCSwitch quota in Codex and manage all Codex providers through a local Balance Hub.",

@@ -20,15 +20,14 @@ if (Test-Path -LiteralPath $target) {
 [IO.Directory]::CreateDirectory($target) | Out-Null
 & $aclScript -InstallRoot $target
 $files = @(
-    'package.json', '.gitignore', 'README.md',
-    'src\provider-repository.mjs', 'src\evaluator-worker.mjs', 'src\evaluator.mjs',
-    'src\usage-client.mjs', 'src\http-allowlist.mjs', 'src\cdp-client.mjs', 'src\browser-callback-broker.mjs', 'src\hub-provider-adapters.mjs', 'src\provider-request-usage.mjs', 'src\provider-templates.mjs',
-    'src\hub-service.mjs', 'src\hub-page.mjs', 'src\hub-server.mjs',
+    'package.json', 'README.md',
+    'src\platform.mjs', 'src\provider-repository.mjs', 'src\http-allowlist.mjs', 'src\cdp-client.mjs', 'src\browser-callback-broker.mjs', 'src\hub-provider-adapters.mjs', 'src\provider-request-usage.mjs', 'src\provider-templates.mjs',
+    'src\usage-normalization.mjs', 'src\hub-service.mjs', 'src\hub-page.mjs', 'src\hub-preferences.mjs', 'src\hub-server.mjs', 'src\companion-auth.mjs', 'src\secure-files.mjs',
     'src\injector-script.mjs', 'src\keyed-backoff.mjs', 'src\page-action-channel.mjs', 'src\process-lifecycle.mjs', 'src\target-session.mjs', 'src\host.mjs',
-    'scripts\install.ps1', 'scripts\launch.ps1', 'scripts\stop.ps1', 'scripts\stop-host.ps1', 'scripts\harden-acl.ps1', 'scripts\check-current.mjs',
+    'scripts\launch.ps1', 'scripts\stop-host.ps1', 'scripts\harden-acl.ps1',
     'scripts\status.ps1', 'scripts\uninstall.ps1',
     'browser-companion\manifest.json', 'browser-companion\background.js', 'browser-companion\session-state.js',
-    'browser-companion\anyrouter-waf.js', 'browser-companion\protocol.js',
+    'browser-companion\anyrouter-waf.js', 'browser-companion\protocol.js', 'browser-companion\auth.js',
     'browser-companion\popup.html', 'browser-companion\popup.js', 'browser-companion\README.md'
 )
 foreach ($relative in $files) {
@@ -40,6 +39,12 @@ foreach ($relative in $files) {
 }
 
 Remove-Item -LiteralPath (Join-Path $target 'scripts\migrate-default-profile.ps1') -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $target 'scripts\check-current.mjs') -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $target 'scripts\install.ps1') -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $target 'scripts\stop.ps1') -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $target 'src\usage-client.mjs') -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $target 'src\evaluator.mjs') -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $target 'src\evaluator-worker.mjs') -Force -ErrorAction SilentlyContinue
 
 function Find-CodexExecutable {
     $running = Get-Process ChatGPT -ErrorAction SilentlyContinue |

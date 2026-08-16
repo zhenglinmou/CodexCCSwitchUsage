@@ -124,11 +124,20 @@ test('every launch and installation path ships and applies ACL hardening', () =>
   assert.match(install, /& \$aclScript -InstallRoot \$target/);
   assert.ok(install.indexOf('& $aclScript -InstallRoot $target') < install.indexOf('$files = @('));
   assert.match(install, /& \$stopHostScript -InstallRoot \$target -AllInstances/);
-  assert.doesNotMatch(install, /Join-Path \$target 'scripts\\stop\.ps1'/);
+  const installPayload = install.slice(install.indexOf('$files = @('), install.indexOf('foreach ($relative in $files)'));
+  assert.doesNotMatch(installPayload, /'scripts\\stop\.ps1'/);
+  assert.match(install, /Remove-Item -LiteralPath \(Join-Path \$target 'scripts\\stop\.ps1'\)/);
   assert.match(install, /'scripts\\harden-acl\.ps1'/);
   assert.match(install, /'scripts\\stop-host\.ps1'/);
   assert.match(build, /'scripts\\harden-acl\.ps1'/);
   assert.match(setup, /function HardenInstallAcl/);
   assert.match(setup, /ExtractTemporaryFile\('harden-acl\.ps1'\)/);
   assert.match(setup, /安装已中止/);
+});
+
+test('the standalone uninstaller stops plugin hosts without terminating Codex', () => {
+  const uninstall = read(path.join('scripts', 'uninstall.ps1'));
+  assert.match(uninstall, /stop-host\.ps1/);
+  assert.match(uninstall, /-AllInstances/);
+  assert.doesNotMatch(uninstall, /scripts[\\/]stop\.ps1/);
 });

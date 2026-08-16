@@ -70,6 +70,24 @@ function Get-FileSha256 {
     }
 }
 
+function Assert-NotarizedMacPackage {
+    param([string]$Path, [string]$Architecture)
+
+    $recordPath = "$Path.notarized.json"
+    if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) {
+        throw "macOS release package is missing its notarization record: $recordPath"
+    }
+    $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+    $actualHash = Get-FileSha256 -Path $Path
+    if ($record.version -ne 1 -or
+        $record.appVersion -ne $version -or
+        $record.architecture -ne $Architecture -or
+        $record.notarized -ne $true -or
+        $record.sha256 -ne $actualHash) {
+        throw "macOS notarization record does not match the release package: $Path"
+    }
+}
+
 function Resolve-BrowserPacker {
     param([string]$Requested)
 
@@ -175,13 +193,19 @@ $installer = Assert-WorkspaceChild (Join-Path $dist "CodexCCSwitchUsage-Setup-$v
 if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
     throw "Build the versioned installer before publishing: $installer"
 }
-$macArm64Package = Assert-WorkspaceChild (Join-Path $dist "CodexCCSwitchUsage-macos-arm64-$version.tar.gz")
-$macX64Package = Assert-WorkspaceChild (Join-Path $dist "CodexCCSwitchUsage-macos-x64-$version.tar.gz")
+$installerSignature = Get-AuthenticodeSignature -LiteralPath $installer
+if ([string]$installerSignature.Status -ne 'Valid') {
+    throw "The Windows installer must have a valid Authenticode signature before release publishing: $($installerSignature.StatusMessage)"
+}
+$macArm64Package = Assert-WorkspaceChild (Join-Path $dist "CodexCCSwitchUsage-macos-arm64-$version.zip")
+$macX64Package = Assert-WorkspaceChild (Join-Path $dist "CodexCCSwitchUsage-macos-x64-$version.zip")
 foreach ($macPackage in @($macArm64Package, $macX64Package)) {
     if (-not (Test-Path -LiteralPath $macPackage -PathType Leaf)) {
         throw "Build the macOS package before publishing: $macPackage"
     }
 }
+Assert-NotarizedMacPackage -Path $macArm64Package -Architecture 'arm64'
+Assert-NotarizedMacPackage -Path $macX64Package -Architecture 'x64'
 if (-not (Test-Path -LiteralPath $companionRoot -PathType Container)) {
     throw "Browser companion source is missing: $companionRoot"
 }

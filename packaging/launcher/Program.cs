@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -32,6 +33,8 @@ internal static class Program
         {
             try
             {
+                int verification = VerifyPackage(root);
+                if (verification != 0) throw new InvalidDataException("Package integrity verification failed with code " + verification + ".");
                 return StartDetachedHost(root, args);
             }
             catch (Exception error)
@@ -63,6 +66,8 @@ internal static class Program
 
     private static int Launch(string root)
     {
+        int verification = VerifyPackage(root);
+        if (verification != 0) throw new InvalidDataException("Package integrity verification failed with code " + verification + ".");
         string script = Path.Combine(root, "scripts", "launch.ps1");
         string nodeDirectory = Path.Combine(root, "runtime-bin");
         string node = Path.Combine(nodeDirectory, "node.exe");
@@ -150,7 +155,7 @@ internal static class Program
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cc-switch", "cc-switch.db")
         ));
         int port;
-        if (!int.TryParse(GetArgumentValue(args, "--port", "9334"), out port) || port < 1 || port > 65535)
+        if (!int.TryParse(GetArgumentValue(args, "--port", "0"), out port) || port < 1 || port > 65535)
         {
             throw new ArgumentException("Invalid CDP port.");
         }
@@ -216,12 +221,13 @@ internal static class Program
 
     private static int VerifyPackage(string root)
     {
+        if (!VerifyPayloadManifest(root)) return 4;
         string[] required = new string[] {
             Path.Combine(root, "package.json"),
             Path.Combine(root, "scripts", "launch.ps1"),
             Path.Combine(root, "scripts", "stop-host.ps1"),
             Path.Combine(root, "src", "host.mjs"),
-            Path.Combine(root, "src", "evaluator-worker.mjs"),
+            Path.Combine(root, "src", "usage-normalization.mjs"),
             Path.Combine(root, "runtime-bin", "node.exe")
         };
         for (int index = 0; index < required.Length; index += 1)
@@ -241,6 +247,60 @@ internal static class Program
             while (!process.WaitForExit(1000)) { }
             return process.ExitCode == 0 ? 0 : 3;
         }
+    }
+
+    private static bool VerifyPayloadManifest(string root)
+    {
+        string manifest = Path.Combine(root, "payload-manifest.sha256");
+        if (!File.Exists(manifest) || new FileInfo(manifest).Length > 1024 * 1024) return false;
+        if (!FixedHexEquals(FileSha256(manifest), BuildIntegrity.PayloadManifestSha256)) return false;
+
+        string rootPrefix = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        string[] lines = File.ReadAllLines(manifest, new UTF8Encoding(false, true));
+        if (lines.Length == 0 || lines.Length > 512) return false;
+        HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (int index = 0; index < lines.Length; index += 1)
+        {
+            string line = lines[index];
+            if (line.Length < 67 || line[64] != ' ' || line[65] != '*' || !IsLowerHex(line.Substring(0, 64))) return false;
+            string relative = line.Substring(66).Replace('/', Path.DirectorySeparatorChar);
+            if (relative.Length == 0 || Path.IsPathRooted(relative)) return false;
+            string filename = Path.GetFullPath(Path.Combine(root, relative));
+            if (!filename.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) || !seen.Add(filename) || !File.Exists(filename)) return false;
+            if (!FixedHexEquals(FileSha256(filename), line.Substring(0, 64))) return false;
+        }
+        return true;
+    }
+
+    private static string FileSha256(string filename)
+    {
+        using (FileStream stream = File.OpenRead(filename))
+        using (SHA256 sha256 = SHA256.Create())
+        {
+            byte[] digest = sha256.ComputeHash(stream);
+            StringBuilder result = new StringBuilder(digest.Length * 2);
+            for (int index = 0; index < digest.Length; index += 1) result.Append(digest[index].ToString("x2"));
+            return result.ToString();
+        }
+    }
+
+    private static bool IsLowerHex(string value)
+    {
+        if (value.Length != 64) return false;
+        for (int index = 0; index < value.Length; index += 1)
+        {
+            char character = value[index];
+            if (!((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f'))) return false;
+        }
+        return true;
+    }
+
+    private static bool FixedHexEquals(string left, string right)
+    {
+        if (left == null || right == null || left.Length != right.Length) return false;
+        int difference = 0;
+        for (int index = 0; index < left.Length; index += 1) difference |= left[index] ^ right[index];
+        return difference == 0;
     }
 
     private static void RequireFile(string path, string label)

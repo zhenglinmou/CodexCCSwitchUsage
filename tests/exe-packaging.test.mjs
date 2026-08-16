@@ -81,11 +81,11 @@ test('repeatable EXE build embeds the current Node runtime and emits a versioned
 
   assert.equal(packageJson.scripts['build:exe'].includes('scripts/build-exe.ps1'), true);
   assert.match(build, /runtime-bin\\node\.exe/);
-  for (const file of ['browser-callback-broker', 'hub-provider-adapters', 'hub-service', 'hub-page', 'hub-server', 'keyed-backoff', 'page-action-channel', 'process-lifecycle']) {
+  for (const file of ['browser-callback-broker', 'companion-auth', 'hub-provider-adapters', 'hub-service', 'hub-page', 'hub-server', 'keyed-backoff', 'page-action-channel', 'process-lifecycle', 'secure-files', 'usage-normalization']) {
     assert.match(build, new RegExp(`'src\\\\${file}\\.mjs'`));
     assert.match(install, new RegExp(`'src\\\\${file}\\.mjs'`));
   }
-  for (const file of ['manifest.json', 'background.js', 'session-state.js', 'anyrouter-waf.js', 'popup.html', 'popup.js', 'README.md']) {
+  for (const file of ['manifest.json', 'background.js', 'session-state.js', 'anyrouter-waf.js', 'protocol.js', 'auth.js', 'popup.html', 'popup.js', 'README.md']) {
     const escaped = file.replaceAll('.', '\\.');
     assert.match(build, new RegExp(`'browser-companion\\\\${escaped}'`));
     assert.match(install, new RegExp(`'browser-companion\\\\${escaped}'`));
@@ -93,7 +93,14 @@ test('repeatable EXE build embeds the current Node runtime and emits a versioned
   assert.doesNotMatch(build, /'src\\(?:cdp-disconnect-guard|target-discovery)\.mjs'/);
   assert.doesNotMatch(install, /'src\\(?:cdp-disconnect-guard|target-discovery)\.mjs'/);
   assert.match(build, /nodeProbe\.arch -ne 'x64'/);
-  assert.match(build, /nodeProbe\.major -lt 22/);
+  assert.match(build, /nodeProbe\.version -ne \$expectedNodeVersion/);
+  assert.match(build, /payload-manifest\.sha256/);
+  assert.match(build, /PayloadManifestSha256/);
+  assert.match(build, /CODEXCCSWITCH_SIGNING_THUMBPRINT/);
+  assert.match(build, /AllowUnsigned/);
+  assert.match(build, /Invoke-CodeSign \$launcherTarget/);
+  assert.match(build, /\/DSignedBuild=1/);
+  assert.match(build, /signtool\.exe/);
   assert.match(build, /Framework64\\v4\.0\.30319\\csc\.exe/);
   assert.match(build, /\/platform:x64/);
   assert.doesNotMatch(build, /\/platform:anycpu/);
@@ -103,6 +110,14 @@ test('repeatable EXE build embeds the current Node runtime and emits a versioned
   assert.doesNotMatch(read('packaging/launcher/Program.cs'), /AssemblyFileVersion\("1\.0\.0\.0"\)/);
   assert.match(build, /ISCC\.exe/);
   assert.match(build, /CodexCCSwitchUsage-Setup-\$version\.exe/);
+  const launcher = read('packaging/launcher/Program.cs');
+  assert.match(launcher, /VerifyPayloadManifest/);
+  assert.match(launcher, /FixedHexEquals/);
+  assert.match(launcher, /Package integrity verification failed/);
+  const setup = read('packaging/setup.iss');
+  assert.match(setup, /SignedUninstaller=yes/);
+  assert.match(setup, /scripts\\stop\.ps1/);
+  assert.doesNotMatch(build, /'scripts\\(?:install|stop|status|uninstall)\.ps1'/);
 });
 
 test('every transitive browser companion module is included in each packaging manifest', () => {
@@ -132,6 +147,8 @@ test('GitHub releases always package and explain the browser companion', () => {
   assert.match(publish, /Compress-Archive/);
   assert.match(publish, /--pack-extension-key=/);
   assert.match(publish, /CreateSigningKey/);
+  assert.match(publish, /Get-AuthenticodeSignature/);
+  assert.match(publish, /Assert-NotarizedMacPackage/);
   assert.match(publish, /CRX3/);
   assert.match(publish, /Security\.Cryptography\.SHA256/);
   assert.doesNotMatch(publish, /Get-FileHash/);
@@ -164,6 +181,12 @@ test('macOS release packages include both native architectures and writable app-
   assert.match(build, /darwin-x64/);
   assert.match(build, /runtime-bin/);
   assert.match(build, /create-macos-archive\.mjs/);
+  assert.match(build, /CodeSignIdentity/);
+  assert.match(build, /notarytool submit/);
+  assert.match(build, /stapler staple/);
+  assert.match(build, /ditto -c -k --sequesterRsrc --keepParent/);
+  assert.match(build, /AllowUnsigned/);
+  assert.match(build, /notarized\.json/);
   assert.match(archive, /prefix = path\.basename/);
   assert.match(archive, /0o755/);
   assert.match(launcher, /--runtime-dir/);
@@ -171,8 +194,9 @@ test('macOS release packages include both native architectures and writable app-
   assert.match(stopHost, /--all-instances/);
   assert.match(plist, /@VERSION@/);
   assert.match(plist, /@ARCH@/);
-  assert.match(publish, /CodexCCSwitchUsage-macos-arm64-\$version\.tar\.gz/);
-  assert.match(publish, /CodexCCSwitchUsage-macos-x64-\$version\.tar\.gz/);
+  assert.match(publish, /CodexCCSwitchUsage-macos-arm64-\$version\.zip/);
+  assert.match(publish, /CodexCCSwitchUsage-macos-x64-\$version\.zip/);
+  assert.doesNotMatch(publish, /CodexCCSwitchUsage-macos-(?:arm64|x64)-\$version\.tar\.gz/);
   assert.match(publish, /MACOS_ARM64_SHA256/);
   assert.match(publish, /MACOS_X64_SHA256/);
 });
