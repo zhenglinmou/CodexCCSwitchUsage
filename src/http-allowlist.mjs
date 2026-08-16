@@ -3,6 +3,7 @@ import path from 'node:path';
 import { getHomeDir } from './platform.mjs';
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
+const DEFAULT_LOOPBACK_PORTS = new Set(['8317']);
 const CACHE_TTL_MS = 5_000;
 const MAX_ALLOWLIST_BYTES = 64 * 1024;
 const MAX_PROVIDERS = 64;
@@ -75,9 +76,9 @@ export function isTrustedHttpUrl(value, provider = null) {
     return false;
   }
   if (url.protocol !== 'http:' || !url.hostname) return false;
-  const hostname = normalizeHost(url.hostname);
-  if (LOOPBACK_HOSTS.has(hostname)) return true;
   if (url.username || url.password) return false;
+  const hostname = normalizeHost(url.hostname);
+  if (LOOPBACK_HOSTS.has(hostname) && DEFAULT_LOOPBACK_PORTS.has(url.port)) return true;
   const providerId = normalizeProviderId(provider);
   return Boolean(providerId && readConfiguredOrigins().get(providerId)?.has(url.origin));
 }

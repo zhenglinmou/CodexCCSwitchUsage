@@ -1277,6 +1277,79 @@ test('Hub errors redact bearer tokens and preserve the last successful usage', a
   assert.match(state.message, /\[redacted\]/);
 });
 
+test('Hub redacts exact provider credentials from unlabeled state, usage, and persisted cache text', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-hub-secret-cache-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const cachePath = path.join(directory, 'hub-cache.json');
+  const apiKey = 'offline-arbitrary-key-value-123456789';
+  const accessToken = 'offline-access-value-987654321';
+  const item = {
+    ...provider('secret-provider', 'Offline secret provider'),
+    apiKey,
+    auth: { tokens: { access_token: accessToken } },
+  };
+  const service = new HubService({ getAll: () => [item] }, {
+    async query() {
+      return {
+        source: 'offline-test',
+        degraded: true,
+        message: `upstream echoed ${apiKey} and ${accessToken}`,
+        usage: {
+          status: 'ok', providerName: item.name, used: 1, remaining: 2, total: 3,
+          unit: 'USD', extra: `opaque ${apiKey}`, refreshIntervalMinutes: 5,
+        },
+      };
+    },
+  }, { cachePath });
+
+  await service.refreshProvider(item.id);
+  const serializedState = JSON.stringify(service.getState());
+  const serializedCache = fs.readFileSync(cachePath, 'utf8');
+  for (const secret of [apiKey, accessToken]) {
+    assert.doesNotMatch(serializedState, new RegExp(secret));
+    assert.doesNotMatch(serializedCache, new RegExp(secret));
+  }
+  assert.match(serializedState, /\[redacted\]/);
+  assert.match(serializedCache, /\[redacted\]/);
+});
+
+test('Hub strips provider credentials from public metadata and footer payloads', () => {
+  const apiKey = 'metadata-private-key-123456789';
+  const accessToken = 'metadata-access-token-987654321';
+  const item = {
+    ...provider('metadata-secret', `Mirror ${apiKey}`),
+    apiKey,
+    auth: { tokens: { access_token: accessToken } },
+    websiteUrl: `https://example.com/${apiKey}?token=${accessToken}`,
+  };
+  const service = new HubService({ getAll: () => [item] }, { async query() { return {}; } });
+  const footer = hubItemToUsagePayload(item, {
+    status: 'error',
+    message: `upstream echoed ${apiKey} ${accessToken}`,
+  });
+  const serialized = JSON.stringify({
+    state: service.getState(),
+    providers: service.listPublicProviders(),
+    footer,
+  });
+  assert.doesNotMatch(serialized, new RegExp(apiKey));
+  assert.doesNotMatch(serialized, new RegExp(accessToken));
+  assert.equal(footer.websiteUrl, '');
+});
+
+test('Hub ignores an oversized cache before parsing provider state', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-hub-large-cache-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const cachePath = path.join(directory, 'hub-cache.json');
+  fs.writeFileSync(cachePath, '{');
+  fs.truncateSync(cachePath, 8_000_001);
+  const item = provider('oversized-cache', 'Offline');
+  const service = new HubService({ getAll: () => [item] }, { async query() { return {}; } }, { cachePath });
+  const state = service.getState().providers[0];
+  assert.equal(state.status, 'idle');
+  assert.equal(state.usage, null);
+});
+
 test('Hub message sanitization is bounded, linear, and covers common credential labels', () => {
   const secret = 'pk_live_OFFLINE_TEST_1234567890';
   const jwt = `${'a'.repeat(18)}.${'b'.repeat(18)}.${'c'.repeat(18)}`;

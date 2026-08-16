@@ -10,6 +10,7 @@ import {
   normalizeProviderTemplateOrigin,
   ProviderTemplateStore,
 } from '../src/provider-templates.mjs';
+import { resetHttpAllowlistCache } from '../src/http-allowlist.mjs';
 
 function provider(overrides = {}) {
   return {
@@ -67,4 +68,63 @@ test('provider template store persists template ids without credentials and inva
 
   store.clear(item.id);
   assert.equal(store.get(item), null);
+});
+
+test('provider template store commits memory only after persistence succeeds', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-template-atomic-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const blocker = path.join(directory, 'blocked-parent');
+  fs.writeFileSync(blocker, 'not a directory');
+  const store = new ProviderTemplateStore(path.join(blocker, 'bindings.json'));
+  const item = provider();
+
+  assert.throws(() => store.set(item, { balanceTemplateId: 'new-api-key-quota' }));
+  assert.equal(store.get(item), null);
+});
+
+test('provider template store rejects oversized, wrong-version, and unsafe binding files', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-template-bounds-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const item = provider();
+  const oversized = path.join(directory, 'oversized.json');
+  fs.writeFileSync(oversized, '{');
+  fs.truncateSync(oversized, 262_145);
+  assert.equal(new ProviderTemplateStore(oversized).get(item), null);
+
+  const invalid = path.join(directory, 'invalid.json');
+  fs.writeFileSync(invalid, JSON.stringify({
+    version: 2,
+    providers: {
+      'provider-one': {
+        origin: 'https://user:password@api.example.test',
+        balanceTemplateId: 'new-api-key-quota',
+      },
+    },
+  }));
+  assert.equal(new ProviderTemplateStore(invalid).get(item), null);
+  assert.throws(
+    () => new ProviderTemplateStore(path.join(directory, 'write.json')).set({ ...item, id: 'x'.repeat(161) }, { balanceTemplateId: 'new-api-key-quota' }),
+    /供应商 ID 不能为空/,
+  );
+});
+
+test('provider template store restores an explicitly allowlisted HTTP binding by provider id', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-template-http-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const allowlist = path.join(directory, 'allow-http-origins.json');
+  fs.writeFileSync(allowlist, JSON.stringify({ providers: { 'provider-one': ['http://127.0.0.1:18080'] } }));
+  const previousAllowlist = process.env.CCSWITCH_HTTP_ALLOWLIST_FILE;
+  process.env.CCSWITCH_HTTP_ALLOWLIST_FILE = allowlist;
+  resetHttpAllowlistCache();
+  t.after(() => {
+    if (previousAllowlist === undefined) delete process.env.CCSWITCH_HTTP_ALLOWLIST_FILE;
+    else process.env.CCSWITCH_HTTP_ALLOWLIST_FILE = previousAllowlist;
+    resetHttpAllowlistCache();
+  });
+  const filename = path.join(directory, 'bindings.json');
+  const item = provider({ apiBaseUrl: 'http://127.0.0.1:18080/v1', baseUrl: 'http://127.0.0.1:18080/v1' });
+  const saved = new ProviderTemplateStore(filename).set(item, { balanceTemplateId: 'new-api-key-quota' });
+
+  assert.equal(saved.origin, 'http://127.0.0.1:18080');
+  assert.deepEqual(new ProviderTemplateStore(filename).get(item), saved);
 });

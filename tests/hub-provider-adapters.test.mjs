@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import {
   describeProviderQuery,
@@ -21,6 +24,7 @@ import {
   providerKind,
   summarizeWham,
 } from '../src/hub-provider-adapters.mjs';
+import { resetHttpAllowlistCache } from '../src/http-allowlist.mjs';
 
 const jianzhileStatusPayload = (overrides = {}) => ({
   success: true,
@@ -32,6 +36,29 @@ const jianzhileStatusPayload = (overrides = {}) => ({
     custom_currency_symbol: '¤',
     ...overrides,
   },
+});
+
+test('CPA local account discovery ignores oversized auth files', async t => {
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-cpa-auth-bounds-'));
+  t.after(() => fs.rmSync(homeDir, { recursive: true, force: true }));
+  const authDirectory = path.join(homeDir, '.cli-proxy-api');
+  fs.mkdirSync(authDirectory);
+  const oversized = path.join(authDirectory, 'oversized.json');
+  fs.writeFileSync(oversized, JSON.stringify({ type: 'codex', account_id: 'account-one', access_token: 'secret' }));
+  fs.truncateSync(oversized, 1_000_001);
+  let fetchCalls = 0;
+  const engine = new ProviderQueryEngine({}, null, {
+    homeDir,
+    fetchImpl: async () => { fetchCalls += 1; throw new Error('must not query oversized credentials'); },
+  });
+
+  const result = await engine.query({
+    id: 'cpa', name: 'CPA', apiBaseUrl: 'http://127.0.0.1:8317/v1', baseUrl: 'http://127.0.0.1:8317/v1',
+    websiteUrl: '', apiKey: '', auth: {}, usage: null,
+  }, { balanceTemplateId: 'cpa-local' });
+  assert.equal(result.source, 'cpa_auth_files');
+  assert.equal(result.loginRequired, true);
+  assert.equal(fetchCalls, 0);
 });
 
 function twoBrowserNewApiBroker(options = {}) {
@@ -547,7 +574,19 @@ test('browser-only providers never probe the model API when the companion is dis
   assert.doesNotMatch(calls.join(' '), /17891/);
 });
 
-test('provider API keys are never sent to remote HTTP endpoints', async () => {
+test('provider API keys are never sent to remote HTTP endpoints', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-http-provider-'));
+  const allowlist = path.join(directory, 'allow-http-origins.json');
+  fs.writeFileSync(allowlist, JSON.stringify({ providers: { 'local-http': ['http://127.0.0.1:18080'] } }));
+  const previousAllowlist = process.env.CCSWITCH_HTTP_ALLOWLIST_FILE;
+  process.env.CCSWITCH_HTTP_ALLOWLIST_FILE = allowlist;
+  resetHttpAllowlistCache();
+  t.after(() => {
+    if (previousAllowlist === undefined) delete process.env.CCSWITCH_HTTP_ALLOWLIST_FILE;
+    else process.env.CCSWITCH_HTTP_ALLOWLIST_FILE = previousAllowlist;
+    resetHttpAllowlistCache();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
   const calls = [];
   const engine = new ProviderQueryEngine({}, {}, {
     fetchImpl: async (url, options) => {
@@ -2198,8 +2237,8 @@ test('paid-site copies sharing one API key reuse the result across mirror domain
   });
   const base = { websiteUrl: '', usage: { enabled: true, code: 'old usage_script must not run' }, auth: {}, apiKey: 'shared-key' };
 
-  const first = await engine.query({ ...base, id: 'raw', name: '付费站', apiBaseUrl: 'https://raw.example', baseUrl: 'https://old-bridge.invalid' });
-  const second = await engine.query({ ...base, id: 'copy', name: '付费站 copy', apiBaseUrl: 'https://mirror.example', baseUrl: 'https://old-bridge.invalid' });
+  const first = await engine.query({ ...base, id: 'raw', name: '付费站', apiBaseUrl: 'https://rawchat.cn/codex', baseUrl: 'https://old-bridge.invalid' });
+  const second = await engine.query({ ...base, id: 'copy', name: '付费站 copy', apiBaseUrl: 'https://sharedchat.top/codex', baseUrl: 'https://old-bridge.invalid' });
 
   assert.equal(requests, 1);
   assert.equal(first.usage.remaining, 9);
@@ -2207,6 +2246,25 @@ test('paid-site copies sharing one API key reuse the result across mirror domain
   assert.match(first.usage.extra, /API Key.*无需官网登录/);
   assert.equal(second.usage.providerId, 'copy');
   assert.equal(second.usage.providerName, '付费站 copy');
+});
+
+test('name-only paid-site providers never share cached results across unknown origins', async () => {
+  const requests = [];
+  const engine = new ProviderQueryEngine({}, {}, {
+    fetchImpl: async url => {
+      requests.push(String(url));
+      return new Response('{"status":"ok","balance_3h":4,"used_3h":1,"limit_3h":5,"balance_1d":9,"used_1d":1,"limit_1d":10}', { status: 200 });
+    },
+  });
+  const base = { name: '付费站', websiteUrl: '', usage: null, auth: {}, apiKey: 'shared-key' };
+
+  await engine.query({ ...base, id: 'first', apiBaseUrl: 'https://first.example/v1' });
+  await engine.query({ ...base, id: 'second', apiBaseUrl: 'https://second.example/v1' });
+
+  assert.deepEqual(requests, [
+    'https://first.example/v1/user/balance',
+    'https://second.example/v1/user/balance',
+  ]);
 });
 
 test('manual window templates never share cached results across generic provider origins', async () => {

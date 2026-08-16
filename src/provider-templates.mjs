@@ -1,8 +1,30 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { secureAtomicWriteFileSync } from './secure-files.mjs';
 import { isTrustedHttpUrl } from './http-allowlist.mjs';
 
 export const PROVIDER_TEMPLATE_REGISTRY_VERSION = 2;
+const MAX_TEMPLATE_BINDINGS_BYTES = 262_144;
+const MAX_TEMPLATE_BINDINGS = 256;
+const RESERVED_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function cleanProviderId(value) {
+  const text = String(value || '').replace(/[\u0000-\u001f\u007f]/g, '').trim();
+  return text && text.length <= 160 && !RESERVED_OBJECT_KEYS.has(text) ? text : '';
+}
+
+function safeStoredOrigin(value, providerId) {
+  const text = String(value || '').trim();
+  if (!text || text.length > 512) return '';
+  try {
+    const url = new URL(text);
+    if (url.username || url.password) return '';
+    if (url.protocol !== 'https:' && !isTrustedHttpUrl(url, { id: providerId, apiBaseUrl: url.origin })) return '';
+    return url.origin;
+  } catch {
+    return '';
+  }
+}
 
 const BALANCE_TEMPLATES = Object.freeze([
   Object.freeze({
@@ -168,22 +190,30 @@ function safeBinding(providerId, value) {
   if (balanceTemplateId && !getBalanceTemplate(balanceTemplateId)) return null;
   if (requestUsageTemplateId && !getRequestUsageTemplate(requestUsageTemplateId)) return null;
   if (!balanceTemplateId && !requestUsageTemplateId) return null;
-  const origin = String(value.origin || '');
-  if (!origin) return null;
+  const normalizedProviderId = cleanProviderId(providerId);
+  const origin = safeStoredOrigin(value.origin, normalizedProviderId);
+  if (!normalizedProviderId || !origin) return null;
+  const updatedAtValue = String(value.updatedAt || '').slice(0, 64);
+  const updatedAtMs = Date.parse(updatedAtValue);
   return {
-    providerId: String(providerId || ''),
+    providerId: normalizedProviderId,
     origin,
     balanceTemplateId,
     requestUsageTemplateId,
-    registryVersion: Number(value.registryVersion) || PROVIDER_TEMPLATE_REGISTRY_VERSION,
-    updatedAt: String(value.updatedAt || ''),
+    registryVersion: Number.isSafeInteger(Number(value.registryVersion))
+      ? Math.max(1, Math.min(10_000, Number(value.registryVersion)))
+      : PROVIDER_TEMPLATE_REGISTRY_VERSION,
+    updatedAt: Number.isFinite(updatedAtMs) ? new Date(updatedAtMs).toISOString() : '',
   };
 }
 
 function readBindings(filename) {
   if (!filename) return new Map();
   try {
+    const stats = fs.statSync(filename);
+    if (!stats.isFile() || stats.size <= 0 || stats.size > MAX_TEMPLATE_BINDINGS_BYTES) return new Map();
     const payload = JSON.parse(fs.readFileSync(filename, 'utf8'));
+    if (payload?.version !== 1) return new Map();
     const providers = payload?.providers && typeof payload.providers === 'object' && !Array.isArray(payload.providers)
       ? payload.providers
       : {};
@@ -191,6 +221,7 @@ function readBindings(filename) {
     for (const [providerId, value] of Object.entries(providers)) {
       const binding = safeBinding(providerId, value);
       if (binding) entries.push([providerId, binding]);
+      if (entries.length >= MAX_TEMPLATE_BINDINGS) break;
     }
     return new Map(entries);
   } catch {
@@ -206,7 +237,7 @@ export class ProviderTemplateStore {
   }
 
   get(provider) {
-    const providerId = String(provider?.id || '');
+    const providerId = cleanProviderId(provider?.id);
     const origin = normalizeProviderTemplateOrigin(provider);
     const binding = this.bindings.get(providerId);
     if (!binding || !origin || binding.origin !== origin) return null;
@@ -214,7 +245,7 @@ export class ProviderTemplateStore {
   }
 
   set(provider, selection = {}) {
-    const providerId = String(provider?.id || '');
+    const providerId = cleanProviderId(provider?.id);
     const origin = normalizeProviderTemplateOrigin(provider);
     if (!providerId) throw new Error('供应商 ID 不能为空');
     if (!origin) throw new Error('供应商没有可安全绑定模板的 HTTPS Base URL');
@@ -231,34 +262,40 @@ export class ProviderTemplateStore {
       registryVersion: PROVIDER_TEMPLATE_REGISTRY_VERSION,
       updatedAt: new Date(this.now()).toISOString(),
     };
-    this.bindings.set(providerId, binding);
-    this.#write();
+    const nextBindings = new Map(this.bindings);
+    if (!nextBindings.has(providerId) && nextBindings.size >= MAX_TEMPLATE_BINDINGS) {
+      throw new Error('供应商模板绑定数量已达到上限');
+    }
+    nextBindings.set(providerId, binding);
+    this.#write(nextBindings);
+    this.bindings = nextBindings;
     return { ...binding };
   }
 
   clear(providerId) {
-    const key = String(providerId || '');
-    const changed = this.bindings.delete(key);
-    if (changed) this.#write();
+    const key = cleanProviderId(providerId);
+    if (!this.bindings.has(key)) return null;
+    const nextBindings = new Map(this.bindings);
+    nextBindings.delete(key);
+    this.#write(nextBindings);
+    this.bindings = nextBindings;
     return null;
   }
 
-  #write() {
+  #write(bindings) {
     if (!this.filename) return;
-    const directory = path.dirname(this.filename);
-    fs.mkdirSync(directory, { recursive: true });
     const providers = Object.fromEntries(
-      [...this.bindings.entries()]
+      [...bindings.entries()]
         .sort(([left], [right]) => left.localeCompare(right))
         .map(([providerId, binding]) => [providerId, { ...binding, providerId: undefined }]),
     );
     for (const value of Object.values(providers)) delete value.providerId;
-    const temporary = `${this.filename}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify({
+    const serialized = JSON.stringify({
       version: 1,
       registryVersion: PROVIDER_TEMPLATE_REGISTRY_VERSION,
       providers,
-    }, null, 2), 'utf8');
-    fs.renameSync(temporary, this.filename);
+    }, null, 2);
+    if (Buffer.byteLength(serialized, 'utf8') > MAX_TEMPLATE_BINDINGS_BYTES) throw new Error('供应商模板绑定过大');
+    secureAtomicWriteFileSync(this.filename, serialized, { encoding: 'utf8' });
   }
 }

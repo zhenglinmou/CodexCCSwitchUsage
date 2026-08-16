@@ -19,8 +19,11 @@ import {
   listProviderTemplates,
   PROVIDER_TEMPLATE_REGISTRY_VERSION,
 } from './provider-templates.mjs';
+import { secureAtomicWriteFileSync } from './secure-files.mjs';
 
 const MAX_SAFE_MESSAGE_CHARS = 8_192;
+const MAX_HUB_CACHE_BYTES = 8_000_000;
+const MAX_HUB_CACHE_PROVIDERS = 1_024;
 const DEFAULT_TEMPLATE_PROBE_TIMEOUT_MS = 12_000;
 const DEFAULT_TEMPLATE_PROBE_SPECULATION_DELAY_MS = 100;
 const LABELED_CREDENTIAL_PATTERN = /(["']?)(openai[_-]api[_-]key|api[_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|cookie|authorization|secret)\1(\s*[=:]\s*)(?:Bearer\s+)?(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\]]+)/gi;
@@ -68,18 +71,57 @@ function redactJwtLikeTokens(value) {
   return chunks.join('');
 }
 
-function safeMessage(error) {
-  const rawMessage = error instanceof Error ? error.message : String(error || '未知错误');
+function providerSecrets(provider) {
+  const values = new Set();
+  const add = value => {
+    const text = String(value || '');
+    if (text.length >= 4 && text.length <= 32_768) values.add(text);
+  };
+  add(provider?.apiKey);
+  const visit = (value, depth = 0) => {
+    if (!value || typeof value !== 'object' || depth > 5) return;
+    for (const [key, item] of Object.entries(value)) {
+      if (typeof item === 'string' && /(api[_-]?key|auth(?:orization)?|access[_-]?token|refresh[_-]?token|id[_-]?token|secret|password|cookie)/i.test(key)) {
+        add(item);
+      } else if (item && typeof item === 'object') {
+        visit(item, depth + 1);
+      }
+    }
+  };
+  visit(provider?.auth);
+  return [...values].sort((left, right) => right.length - left.length);
+}
+
+function sanitizedCredentialText(value, secrets = [], maximum = MAX_SAFE_MESSAGE_CHARS) {
+  const rawMessage = value instanceof Error ? value.message : String(value || '');
   const truncated = rawMessage.length > MAX_SAFE_MESSAGE_CHARS;
-  const message = rawMessage.slice(0, MAX_SAFE_MESSAGE_CHARS)
+  let message = rawMessage.slice(0, maximum);
+  for (const secret of secrets) {
+    const credential = String(secret || '');
+    if (credential.length >= 4) message = message.split(credential).join('[redacted]');
+  }
+  message = message
     .replace(LABELED_CREDENTIAL_PATTERN, '$1$2$1$3[redacted]')
-    .replace(/Bearer\s+[^\s,;]+/gi, 'Bearer [redacted]')
+    .replace(/Bearer\s+(?!API\s+Key\b)[^\s,;，；]+/gi, 'Bearer [redacted]')
     .replace(/sk-[A-Za-z0-9_-]+/g, '[redacted]');
   const redacted = redactJwtLikeTokens(message);
   return truncated ? `${redacted}… [truncated]` : redacted;
 }
 
-function safeWebsiteUrl(value) {
+function safeMessage(error, secrets = []) {
+  const value = error instanceof Error ? error.message : (error == null ? '未知错误' : String(error));
+  return sanitizedCredentialText(value, secrets);
+}
+
+function containsCredential(value, secrets = []) {
+  const candidate = String(value || '').toLowerCase();
+  return secrets.some(secret => {
+    const credential = String(secret || '');
+    return credential.length >= 4 && candidate.includes(credential.toLowerCase());
+  });
+}
+
+function safeWebsiteUrl(value, secrets = []) {
   try {
     const url = new URL(String(value || ''));
     if (url.protocol !== 'https:') return '';
@@ -87,10 +129,39 @@ function safeWebsiteUrl(value) {
     url.password = '';
     url.search = '';
     url.hash = '';
-    return url.href;
+    return containsCredential(url.href, secrets) ? '' : url.href;
   } catch {
     return '';
   }
+}
+
+function safeQueryUrl(value, secrets = []) {
+  try {
+    const url = new URL(String(value || ''));
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return '';
+    return containsCredential(url.href, secrets) ? '' : url.href;
+  } catch {
+    return '';
+  }
+}
+
+function safeQueryMethod(value, secrets = []) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const result = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (['requestUrl', 'configurationUrl'].includes(key)) {
+      result[key] = safeQueryUrl(item, secrets);
+    } else if (key === 'notes') {
+      result.notes = (Array.isArray(item) ? item : [])
+        .slice(0, 16)
+        .map(note => sanitizedCredentialText(note, secrets, 500));
+    } else if (typeof item === 'string') {
+      result[key] = sanitizedCredentialText(item, secrets, 500);
+    } else if (typeof item === 'boolean' || typeof item === 'number' || item == null) {
+      result[key] = item;
+    }
+  }
+  return result;
 }
 
 function localRequestNumber(value, fallback = null) {
@@ -276,16 +347,16 @@ function templateSelectionFor(provider, templateStore) {
   };
 }
 
-function safeProbeUsage(usage, source = '') {
+function safeProbeUsage(usage, source = '', secrets = []) {
   if (!usage || typeof usage !== 'object') return null;
   const finiteOrNull = value => value == null || value === '' || !Number.isFinite(Number(value)) ? null : Number(value);
   return {
-    providerName: String(usage.providerName || '').slice(0, 80),
+    providerName: sanitizedCredentialText(usage.providerName, secrets, 80),
     remaining: finiteOrNull(usage.remaining),
     used: finiteOrNull(usage.used),
     total: finiteOrNull(usage.total),
-    unit: String(usage.unit || '').slice(0, 24),
-    source: String(source || '').slice(0, 80),
+    unit: sanitizedCredentialText(usage.unit, secrets, 24),
+    source: sanitizedCredentialText(source, secrets, 80),
   };
 }
 
@@ -348,47 +419,95 @@ function sameAccountBinding(left, right) {
     && first.accountRef === second.accountRef;
 }
 
-function safeUsage(payload) {
+function safeUsage(payload, secrets = []) {
   if (!payload || payload.status !== 'ok') return null;
   const numberOrNull = value => value == null || value === '' || !Number.isFinite(Number(value)) ? null : Number(value);
   return {
-    providerName: String(payload.providerName || ''),
-    accountBrowser: String(payload.accountBrowser || '').replace(/\s+/g, ' ').trim().slice(0, 64),
-    extra: payload.extra ? safeMessage(payload.extra) : '',
-    periodLabel: String(payload.periodLabel || ''),
+    providerName: sanitizedCredentialText(payload.providerName, secrets, 160),
+    accountBrowser: sanitizedCredentialText(payload.accountBrowser, secrets, 64).replace(/\s+/g, ' ').trim(),
+    extra: payload.extra ? safeMessage(payload.extra, secrets) : '',
+    periodLabel: sanitizedCredentialText(payload.periodLabel, secrets, 160),
     hideTotal: payload.hideTotal === true,
     refreshIntervalMinutes: Math.max(1, Number(payload.refreshIntervalMinutes) || 5),
     used: numberOrNull(payload.used),
     remaining: numberOrNull(payload.remaining),
     total: numberOrNull(payload.total),
-    unit: String(payload.unit || ''),
-    updatedAt: String(payload.updatedAt || new Date().toISOString()),
-    queryError: payload.queryError ? safeMessage(payload.queryError) : '',
+    unit: sanitizedCredentialText(payload.unit, secrets, 32),
+    updatedAt: String(payload.updatedAt || new Date().toISOString()).slice(0, 64),
+    queryError: payload.queryError ? safeMessage(payload.queryError, secrets) : '',
   };
 }
 
 function readCache(cachePath) {
   if (!cachePath) return {};
   try {
+    const stats = fs.statSync(cachePath);
+    if (!stats.isFile() || stats.size <= 0 || stats.size > MAX_HUB_CACHE_BYTES) return {};
     const value = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
     if (!value || typeof value !== 'object' || !Array.isArray(value.providers)) return {};
-    return Object.fromEntries(value.providers.filter(item => item?.id).map(item => [String(item.id), item]));
+    const entries = [];
+    for (const item of value.providers.slice(0, MAX_HUB_CACHE_PROVIDERS)) {
+      const id = String(item?.id || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 160);
+      if (!id || entries.some(([existing]) => existing === id)) continue;
+      entries.push([id, {
+        id,
+        providerFingerprint: String(item.providerFingerprint || '').slice(0, 128),
+        status: ['idle', 'loading', 'ok', 'degraded', 'error', 'login-required'].includes(String(item.status || ''))
+          ? String(item.status)
+          : 'idle',
+        message: String(item.message || '').slice(0, MAX_SAFE_MESSAGE_CHARS),
+        source: String(item.source || '').slice(0, 160),
+        sessionSyncRequired: item.sessionSyncRequired === true,
+        websiteLoginRequired: item.websiteLoginRequired === true,
+        accountBindingRequired: item.accountBindingRequired === true,
+        accountBinding: safeAccountBinding(item.accountBinding),
+        usage: item.usage && typeof item.usage === 'object' ? { ...item.usage } : null,
+        updatedAt: String(item.updatedAt || '').slice(0, 64),
+        lastSuccessAt: String(item.lastSuccessAt || '').slice(0, 64),
+        lastAttemptAt: String(item.lastAttemptAt || '').slice(0, 64),
+        queryDurationMs: Number.isFinite(Number(item.queryDurationMs)) ? Math.max(0, Number(item.queryDurationMs)) : null,
+      }]);
+    }
+    return Object.fromEntries(entries);
   } catch {
     return {};
   }
 }
 
+function cacheItem(item, provider) {
+  const secrets = providerSecrets(provider);
+  return {
+    id: String(item?.id || '').slice(0, 160),
+    providerFingerprint: String(item?.providerFingerprint || '').slice(0, 128),
+    status: String(item?.status || 'idle'),
+    message: safeMessage(item?.message || '', secrets),
+    source: sanitizedCredentialText(item?.source, secrets, 160),
+    sessionSyncRequired: item?.sessionSyncRequired === true,
+    websiteLoginRequired: item?.websiteLoginRequired === true,
+    accountBindingRequired: item?.accountBindingRequired === true,
+    accountBinding: safeAccountBinding(item?.accountBinding),
+    usage: item?.usage ? safeUsage({ status: 'ok', ...item.usage }, secrets) : null,
+    updatedAt: String(item?.updatedAt || '').slice(0, 64),
+    lastSuccessAt: String(item?.lastSuccessAt || '').slice(0, 64),
+    lastAttemptAt: String(item?.lastAttemptAt || '').slice(0, 64),
+    queryDurationMs: Number.isFinite(Number(item?.queryDurationMs)) ? Math.max(0, Number(item.queryDurationMs)) : null,
+  };
+}
+
 export function hubItemToUsagePayload(provider, item) {
-  const usage = item?.usage;
+  const secrets = providerSecrets(provider);
+  const providerName = sanitizedCredentialText(provider?.name || '供应商', secrets, 160) || '供应商';
+  const websiteUrl = safeWebsiteUrl(provider?.websiteUrl, secrets);
+  const usage = item?.usage ? safeUsage({ status: 'ok', ...item.usage }, secrets) : null;
   if (usage) {
-    const queryError = item.status === 'ok' ? '' : String(item.message || '最近一次 Hub 查询未成功');
+    const queryError = item.status === 'ok' ? '' : safeMessage(item.message || '最近一次 Hub 查询未成功', secrets);
     return {
       status: 'ok',
       providerId: provider.id,
-      providerDisplayName: String(provider.name || usage.providerName || '供应商'),
-      providerName: usage.providerName || provider.name,
+      providerDisplayName: providerName || usage.providerName,
+      providerName: usage.providerName || providerName,
       accountBrowser: usage.accountBrowser || '',
-      websiteUrl: provider.websiteUrl,
+      websiteUrl,
       extra: usage.extra,
       periodLabel: usage.periodLabel,
       hideTotal: usage.hideTotal,
@@ -404,11 +523,11 @@ export function hubItemToUsagePayload(provider, item) {
   return {
     status: item?.status === 'idle' || item?.status === 'loading' ? 'loading' : 'error',
     providerId: provider.id,
-    providerDisplayName: String(provider.name || '供应商'),
-    providerName: provider.name,
+    providerDisplayName: providerName,
+    providerName,
     accountBrowser: '',
-    websiteUrl: provider.websiteUrl,
-    message: String(item?.message || 'Balance Hub 尚未返回额度'),
+    websiteUrl,
+    message: safeMessage(item?.message || 'Balance Hub 尚未返回额度', secrets),
     updatedAt: item?.updatedAt || new Date().toISOString(),
   };
 }
@@ -459,13 +578,16 @@ export class HubService {
     this.requestUsageEngine?.clearStatusCache?.();
     const activeIds = new Set();
     for (const provider of providers) {
+      const secrets = providerSecrets(provider);
       activeIds.add(provider.id);
       this.providers.set(provider.id, provider);
       const templateSelection = templateSelectionFor(provider, this.templateStore);
       const balanceTemplateOption = selectedTemplateOption(templateSelection, 'balance');
       const loginConfig = loginConfiguration(provider, balanceTemplateOption);
       const livePrevious = this.items.get(provider.id);
-      const savedPrevious = livePrevious || this.cachedItems[provider.id] || {};
+      const savedPrevious = livePrevious || (this.cachedItems[provider.id]
+        ? cacheItem(this.cachedItems[provider.id], provider)
+        : {});
       const providerFingerprint = providerConfigurationFingerprint(provider, templateSelection);
       const activeRefresh = this.refreshes.get(provider.id);
       if (activeRefresh && activeRefresh.fingerprint !== providerFingerprint) {
@@ -499,8 +621,8 @@ export class HubService {
       this.items.set(provider.id, {
         id: provider.id,
         providerFingerprint,
-        name: provider.name,
-        websiteUrl: safeWebsiteUrl(provider.websiteUrl),
+        name: sanitizedCredentialText(provider.name, secrets, 160),
+        websiteUrl: safeWebsiteUrl(provider.websiteUrl, secrets),
         current: provider.isCurrent,
         status: configurationChanged || previous.status === 'loading' || obsoleteSource ? 'idle' : (staleBrowserFailure ? 'degraded' : (previous.status || 'idle')),
         message: configurationChanged
@@ -516,7 +638,7 @@ export class HubService {
             : String(previous.message || ''),
         source: configurationChanged ? '' : (obsoleteSource ? 'cached_previous' : String(previous.source || '')),
         loginSupported: Boolean(loginConfig),
-        loginUrl: safeWebsiteUrl(loginConfig?.loginUrl),
+        loginUrl: safeWebsiteUrl(loginConfig?.loginUrl, secrets),
         sessionSyncSupported: Boolean(loginConfig?.userHeader),
         sessionSyncRequired,
         websiteLoginRequired,
@@ -601,20 +723,21 @@ export class HubService {
   listPublicProviders() {
     if (this.publicProvidersCache) return this.publicProvidersCache;
     this.publicProvidersCache = [...this.providers.values()].map(provider => {
+      const secrets = providerSecrets(provider);
       const templateSelection = templateSelectionFor(provider, this.templateStore);
       const balanceTemplateOption = selectedTemplateOption(templateSelection, 'balance');
       const loginConfig = loginConfiguration(provider, balanceTemplateOption);
       return {
         id: provider.id,
-        name: provider.name,
-        aliases: providerAliases(provider),
+        name: sanitizedCredentialText(provider.name, secrets, 160),
+        aliases: providerAliases(provider).filter(alias => !containsCredential(alias, secrets)),
         current: provider.isCurrent,
         loginSupported: Boolean(loginConfig),
-        loginUrl: safeWebsiteUrl(loginConfig?.loginUrl),
+        loginUrl: safeWebsiteUrl(loginConfig?.loginUrl, secrets),
         sessionSyncSupported: Boolean(loginConfig?.userHeader),
         accountBindingSupported: providerKind(provider) === 'anyrouter',
         templateSelection,
-        queryMethod: describeProviderQuery(provider, balanceTemplateOption),
+        queryMethod: safeQueryMethod(describeProviderQuery(provider, balanceTemplateOption), secrets),
         balanceUrl: `/v1/balance/${encodeURIComponent(provider.id)}`,
       };
     });
@@ -790,6 +913,7 @@ export class HubService {
       && String(this.items.get(id)?.providerFingerprint || '') === refreshFingerprint
       && sameAccountBinding(previous.accountBinding, this.items.get(id)?.accountBinding);
     const promise = Promise.resolve().then(async () => {
+      const secrets = providerSecrets(provider);
       try {
         const anyRouterCredentials = providerKind(provider) === 'anyrouter'
           ? new Set([...this.providers.values()]
@@ -806,7 +930,7 @@ export class HubService {
         });
         if (!isCurrentSnapshot()) return this.items.get(id) || null;
         const attemptedAt = new Date(this.now()).toISOString();
-        const usage = safeUsage(result.usage);
+        const usage = safeUsage(result.usage, secrets);
         const targets = providerKind(provider) === 'anyrouter'
           ? [...this.providers.values()].filter(candidate => {
               if (candidate.id === provider.id) return true;
@@ -832,9 +956,9 @@ export class HubService {
             status: targetUsage ? (result.degraded ? 'degraded' : 'ok') : (result.loginRequired ? 'login-required' : 'error'),
             message: targetUsage
               ? (result.degraded
-                ? safeMessage(result.message || 'API 可用性检查未通过，显示本地统计')
+                ? safeMessage(result.message || 'API 可用性检查未通过，显示本地统计', secrets)
                 : '')
-              : safeMessage(result.message || '没有返回可显示的额度数据'),
+              : safeMessage(result.message || '没有返回可显示的额度数据', secrets),
             source: String(result.source || ''),
             sessionSyncRequired: result.sessionSyncRequired === true,
             websiteLoginRequired: result.websiteLoginRequired === true,
@@ -849,7 +973,7 @@ export class HubService {
       } catch (error) {
         if (!isCurrentSnapshot()) return this.items.get(id) || null;
         const previous = this.items.get(id);
-        const message = safeMessage(error);
+        const message = safeMessage(error, secrets);
         const lastSuccessAt = String(previous.lastSuccessAt || previous.usage?.updatedAt || previous.updatedAt || '');
         const next = {
           ...previous,
@@ -1010,6 +1134,7 @@ export class HubService {
     const sharedAcrossApps = credentialAppTypes.some(appType => appType !== 'codex');
     const getLocalRequestRows = createLocalRequestRowsReader(this.repository, requestProvider.id, limit);
     const accountBinding = this.items.get(requestProvider.id)?.accountBinding || null;
+    const secrets = [...new Set([...providerSecrets(provider), ...providerSecrets(requestProvider)])];
     let remoteResult;
     if (!this.requestUsageEngine || typeof this.requestUsageEngine.query !== 'function') {
       remoteResult = {
@@ -1056,29 +1181,35 @@ export class HubService {
           fetchedAt: new Date(this.now()).toISOString(),
           items: [],
           errorType: 'provider',
-          message: safeMessage(error),
+          message: safeMessage(error, secrets),
         };
       }
     }
     if (remoteResult?.success === true) {
       return {
         ...remoteResult,
+        message: remoteResult.message ? safeMessage(remoteResult.message, secrets) : '',
         appType: 'codex',
         credentialSharedAcrossApps: sharedAcrossApps,
         fallback: false,
         preciseCostAvailable: remoteResult?.billing?.exact === true,
       };
     }
+    remoteResult = {
+      ...remoteResult,
+      message: remoteResult?.message ? safeMessage(remoteResult.message, secrets) : '',
+    };
     if (typeof this.repository?.getRecentRequests !== 'function') return remoteResult;
     try {
       const rows = getLocalRequestRows ? getLocalRequestRows(limit) : this.repository.getRecentRequests(provider.id, limit);
       if (!Array.isArray(rows)) return remoteResult;
-      return ccswitchRequestUsageFallback(provider, rows, remoteResult, limit, this.now);
+      const fallback = ccswitchRequestUsageFallback(provider, rows, remoteResult, limit, this.now);
+      return { ...fallback, fallbackReason: safeMessage(fallback.fallbackReason, secrets), message: safeMessage(fallback.message, secrets) };
     } catch (error) {
       return {
         ...remoteResult,
         fallback: false,
-        fallbackError: safeMessage(error),
+        fallbackError: safeMessage(error, secrets),
       };
     }
   }
@@ -1135,7 +1266,7 @@ export class HubService {
       return {
         ...this.#publicItem(this.items.get(provider.id)),
         bindingAttemptFailed: true,
-        message: safeMessage(result.failure.message || 'AnyRouter 账号绑定失败'),
+        message: safeMessage(result.failure.message || 'AnyRouter 账号绑定失败', providerSecrets(provider)),
       };
     }
     const binding = safeAccountBinding(result?.binding);
@@ -1235,7 +1366,7 @@ export class HubService {
       websiteLoginRequired: action?.opened === true,
       message: safeMessage(action?.message || (action?.opened
         ? `已在${action?.browser ? ` ${action.browser} 浏览器` : '现有浏览器'}中打开登录页；登录完成后回到 Hub 将自动检查一次`
-        : '未能同步现有浏览器会话，请先在官网确认登录状态')),
+        : '未能同步现有浏览器会话，请先在官网确认登录状态'), providerSecrets(provider)),
     });
     this.revision += 1;
     return this.#publicItem(this.items.get(id));
@@ -1328,6 +1459,7 @@ export class HubService {
   }
 
   async #probeBalanceTemplate(provider, templateId, options = {}) {
+    const secrets = providerSecrets(provider);
     const template = getBalanceTemplate(templateId);
     const base = {
       templateId,
@@ -1350,7 +1482,7 @@ export class HubService {
       const localFallback = result?.degraded === true
         || source === 'muyuan_local_usage'
         || source === 'api_health_and_local_usage';
-      const usage = safeProbeUsage(result?.usage, source);
+      const usage = safeProbeUsage(result?.usage, source, secrets);
       if (usage && (!localFallback || templateId === 'api-health-local')) {
         return { ...base, status: 'success', message: '调用成功', preview: usage };
       }
@@ -1361,15 +1493,16 @@ export class HubService {
       return {
         ...base,
         status: needsAction ? 'needs-action' : 'failed',
-        message: safeMessage(result?.message || (localFallback ? '只取得本地回退数据，未验证远端额度结构' : '没有返回可验证的额度数据')),
+        message: safeMessage(result?.message || (localFallback ? '只取得本地回退数据，未验证远端额度结构' : '没有返回可验证的额度数据'), secrets),
         ...(result?.schemaValidated === true ? { schemaValidated: true } : {}),
       };
     } catch (error) {
-      return { ...base, message: safeMessage(error) };
+      return { ...base, message: safeMessage(error, secrets) };
     }
   }
 
   async #probeRequestUsageTemplate(provider, templateId, options = {}) {
+    const secrets = providerSecrets(provider);
     const template = getRequestUsageTemplate(templateId);
     const base = {
       templateId,
@@ -1392,7 +1525,7 @@ export class HubService {
           preview: { requestCount, source: 'ccswitch_local', costExact: false },
         };
       } catch (error) {
-        return { ...base, message: safeMessage(error) };
+        return { ...base, message: safeMessage(error, secrets) };
       }
     }
     if (!this.requestUsageEngine?.query) return { ...base, message: '第三方逐请求查询引擎未启用' };
@@ -1417,7 +1550,7 @@ export class HubService {
         return {
           ...base,
           status: 'success',
-          message: result?.degraded ? safeMessage(result.message || '调用成功，但计费配置不完整') : '调用成功',
+          message: result?.degraded ? safeMessage(result.message || '调用成功，但计费配置不完整', secrets) : '调用成功',
           preview: {
             requestCount: Math.max(0, Number(result.requestCount) || 0),
             source: String(result.source || '').slice(0, 80),
@@ -1426,9 +1559,9 @@ export class HubService {
           },
         };
       }
-      return { ...base, message: safeMessage(result?.message || '没有返回可验证的逐请求日志') };
+      return { ...base, message: safeMessage(result?.message || '没有返回可验证的逐请求日志', secrets) };
     } catch (error) {
-      return { ...base, message: safeMessage(error) };
+      return { ...base, message: safeMessage(error, secrets) };
     } finally {
       clearTimeout(timer);
     }
@@ -1436,6 +1569,7 @@ export class HubService {
 
   #publicItem(item, refreshing = false) {
     if (!item) return null;
+    const secrets = providerSecrets(this.providers.get(item.id));
     const {
       providerFingerprint: _providerFingerprint,
       accountBinding: internalAccountBinding,
@@ -1443,6 +1577,13 @@ export class HubService {
     } = item;
     return {
       ...publicItem,
+      name: sanitizedCredentialText(publicItem.name, secrets, 160),
+      message: safeMessage(publicItem.message || '', secrets),
+      source: sanitizedCredentialText(publicItem.source, secrets, 160),
+      websiteUrl: safeWebsiteUrl(publicItem.websiteUrl, secrets),
+      loginUrl: safeWebsiteUrl(publicItem.loginUrl, secrets),
+      queryMethod: safeQueryMethod(publicItem.queryMethod, secrets),
+      usage: publicItem.usage ? safeUsage({ status: 'ok', ...publicItem.usage }, secrets) : null,
       accountBinding: publicAccountBinding(internalAccountBinding),
       refreshing,
     };
@@ -1452,30 +1593,31 @@ export class HubService {
     if (!item) {
       return { success: false, provider: '', message: '供应商缓存不存在', login_required: false };
     }
-    const queryable = ['ok', 'degraded'].includes(item.status) && item.usage;
+    const publicItem = this.#publicItem(item, this.refreshes.has(item.id));
+    const queryable = ['ok', 'degraded'].includes(publicItem.status) && publicItem.usage;
     if (!queryable) {
       return {
         success: false,
-        provider: item.id,
-        message: item.message || '余额查询失败',
-        login_required: item.status === 'login-required',
+        provider: publicItem.id,
+        message: publicItem.message || '余额查询失败',
+        login_required: publicItem.status === 'login-required',
       };
     }
     return {
       success: true,
-      provider: item.id,
+      provider: publicItem.id,
       data: {
         isValid: true,
-        planName: item.usage.providerName || item.name,
-        remaining: item.usage.remaining,
-        used: item.usage.used,
-        total: item.usage.total,
-        unit: item.usage.unit,
-        extra: item.usage.extra,
-        periodLabel: item.usage.periodLabel,
-        hideTotal: item.usage.hideTotal,
-        updatedAt: item.usage.updatedAt,
-        source: item.source,
+        planName: publicItem.usage.providerName || publicItem.name,
+        remaining: publicItem.usage.remaining,
+        used: publicItem.usage.used,
+        total: publicItem.usage.total,
+        unit: publicItem.usage.unit,
+        extra: publicItem.usage.extra,
+        periodLabel: publicItem.usage.periodLabel,
+        hideTotal: publicItem.usage.hideTotal,
+        updatedAt: publicItem.usage.updatedAt,
+        source: publicItem.source,
       },
     };
   }
@@ -1486,18 +1628,23 @@ export class HubService {
       this.cacheDirty = true;
       return true;
     }
-    const temporary = `${this.cachePath}.tmp`;
     try {
-      fs.mkdirSync(path.dirname(this.cachePath), { recursive: true });
-      fs.writeFileSync(temporary, JSON.stringify({ version: 2, providers: [...this.items.values()] }), 'utf8');
-      fs.renameSync(temporary, this.cachePath);
+      const providers = [];
+      let serializedBytes = Buffer.byteLength('{"version":3,"providers":[]}');
+      for (const item of [...this.items.values()].slice(0, MAX_HUB_CACHE_PROVIDERS)) {
+        const safeItem = cacheItem(item, this.providers.get(item.id));
+        const itemBytes = Buffer.byteLength(JSON.stringify(safeItem)) + (providers.length ? 1 : 0);
+        if (serializedBytes + itemBytes > MAX_HUB_CACHE_BYTES) break;
+        providers.push(safeItem);
+        serializedBytes += itemBytes;
+      }
+      secureAtomicWriteFileSync(this.cachePath, JSON.stringify({ version: 3, providers }), { encoding: 'utf8' });
       this.cacheDirty = false;
       this.cacheError = '';
       return true;
     } catch (error) {
       this.cacheDirty = true;
       this.cacheError = safeMessage(error);
-      try { fs.rmSync(temporary, { force: true }); } catch {}
       return false;
     }
   }

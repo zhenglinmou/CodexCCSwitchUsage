@@ -20,6 +20,41 @@ function writeJsonLines(filename, events) {
   fs.writeFileSync(filename, `${events.map(event => JSON.stringify(event)).join('\n')}\n`, 'utf8');
 }
 
+function writeCodexAuth(codexHome, accountId, extraTokens = {}, observedAt = '2026-01-01T00:00:00.000Z') {
+  const filename = path.join(codexHome, 'auth.json');
+  fs.writeFileSync(filename, JSON.stringify({ tokens: { account_id: accountId, ...extraTokens } }), 'utf8');
+  fs.utimesSync(filename, new Date(observedAt), new Date(observedAt));
+  return filename;
+}
+
+test('OpenAI Official rejects an entire session file containing an oversized JSONL record', async t => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-large-line-'));
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  writeCodexAuth(codexHome, 'bounded-account');
+  const filename = path.join(codexHome, 'sessions', 'oversized.jsonl');
+  const events = [
+    { timestamp: '2026-07-09T08:35:17.000Z', type: 'session_meta', payload: { id: 'bounded-session', model_provider: 'openai' } },
+    { timestamp: '2026-07-09T08:35:19.000Z', type: 'turn_context', payload: { model: 'gpt-5.5' } },
+    {
+      timestamp: '2026-07-09T08:36:16.000Z', type: 'event_msg', payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { total_tokens: 13 },
+          last_token_usage: { input_tokens: 10, output_tokens: 3, total_tokens: 13 },
+        },
+      },
+    },
+  ];
+  fs.mkdirSync(path.dirname(filename), { recursive: true });
+  fs.writeFileSync(filename, `${events.map(event => JSON.stringify(event)).join('\n')}\n${'x'.repeat(1_000_001)}\n`, 'utf8');
+
+  const reader = new CodexSessionUsageReader({ codexHome });
+  const result = await reader.query({ auth: { tokens: { account_id: 'bounded-account' } } });
+  assert.deepEqual(result.items, []);
+  assert.equal(result.totalRecords, 0);
+  assert.equal(result.officialSessionCount, 0);
+});
+
 function statusPayload(overrides = {}) {
   return {
     success: true,
@@ -52,9 +87,7 @@ function accountLogPayload(rows, total = rows.length) {
 test('OpenAI Official reads per-request Token usage from account-scoped Codex session events', async t => {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-session-'));
   t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
-  fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
-    tokens: { account_id: 'official-account-one', access_token: 'must-never-be-returned' },
-  }), 'utf8');
+  writeCodexAuth(codexHome, 'official-account-one', { access_token: 'must-never-be-returned' });
 
   writeJsonLines(path.join(codexHome, 'sessions', '2026', '07', '09', 'official.jsonl'), [
     { timestamp: '2026-07-09T08:35:17.000Z', type: 'session_meta', payload: { id: 'official-session', model_provider: 'openai' } },
@@ -163,9 +196,7 @@ test('OpenAI Official reads per-request Token usage from account-scoped Codex se
 test('OpenAI Official session index scans newest files first and stays bounded', async t => {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-index-'));
   t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
-  fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
-    tokens: { account_id: 'indexed-account' },
-  }), 'utf8');
+  writeCodexAuth(codexHome, 'indexed-account');
   const baseTime = Date.now() - 60_000;
   for (let index = 0; index < 8; index += 1) {
     const eventTime = baseTime - index * 60_000;
@@ -207,9 +238,7 @@ test('OpenAI Official session index scans newest files first and stays bounded',
 test('OpenAI Official session query selects newest files before applying the file limit', async t => {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-file-limit-'));
   t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
-  fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
-    tokens: { account_id: 'file-limit-account' },
-  }), 'utf8');
+  writeCodexAuth(codexHome, 'file-limit-account');
 
   const sessions = [
     ['00-old', '2026-08-01T00:00:00.000Z'],
@@ -250,6 +279,52 @@ test('OpenAI Official session query selects newest files before applying the fil
   assert.equal(result.complete, false, 'the bounded file list must report that older sessions were omitted');
 });
 
+test('OpenAI Official session index resets at an account switch and excludes prior-account events', async t => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-account-switch-'));
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  const indexPath = path.join(codexHome, 'runtime', 'codex-session-index.json');
+  const writeSession = (id, timestamp) => {
+    const filename = path.join(codexHome, 'sessions', `${id}.jsonl`);
+    writeJsonLines(filename, [
+      { timestamp, type: 'session_meta', payload: { id, model_provider: 'openai' } },
+      { timestamp, type: 'turn_context', payload: { model: 'gpt-5.6-sol' } },
+      {
+        timestamp, type: 'event_msg', payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: { total_tokens: 1 },
+            last_token_usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 },
+          },
+        },
+      },
+    ]);
+    fs.utimesSync(filename, new Date(timestamp), new Date(timestamp));
+    return filename;
+  };
+
+  writeCodexAuth(codexHome, 'account-a', {}, '2026-07-01T00:00:00.000Z');
+  const historicFilename = writeSession('historic-a', '2026-08-01T00:00:00.000Z');
+  const reader = new CodexSessionUsageReader({ codexHome, indexPath });
+  const providerA = { id: 'openai-a', name: 'OpenAI Official', auth: { tokens: { account_id: 'account-a' } } };
+  assert.deepEqual((await reader.query(providerA, { limit: 10 })).items.map(item => item.id.split(':')[0]), ['historic-a']);
+
+  writeCodexAuth(codexHome, 'account-b', {}, '2026-08-10T00:00:00.000Z');
+  fs.utimesSync(historicFilename, new Date('2026-08-12T00:00:00.000Z'), new Date('2026-08-12T00:00:00.000Z'));
+  writeSession('current-b', '2026-08-11T00:00:00.000Z');
+  const providerB = { id: 'openai-b', name: 'OpenAI Official', auth: { tokens: { account_id: 'account-b' } } };
+  const result = await reader.query(providerB, { limit: 10 });
+
+  assert.deepEqual(result.items.map(item => item.id.split(':')[0]), ['current-b']);
+  assert.equal(result.officialSessionCount, 1);
+  const persisted = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+  assert.equal(persisted.version, 3);
+  assert.deepEqual(persisted.account, {
+    id: 'account-b',
+    boundaryMs: Date.parse('2026-08-10T00:00:00.000Z'),
+  });
+  assert.doesNotMatch(JSON.stringify(persisted), /historic-a/);
+});
+
 test('request usage status cache evicts old provider origins at its configured bound', async () => {
   const engine = new ProviderRequestUsageEngine({
     statusCacheMaximumEntries: 2,
@@ -285,9 +360,7 @@ test('request usage engine creates the official session reader lazily', () => {
 test('Codex session reader defers index loading until its first query', async t => {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-lazy-index-'));
   t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
-  fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
-    tokens: { account_id: 'lazy-index-account' },
-  }), 'utf8');
+  writeCodexAuth(codexHome, 'lazy-index-account');
   const filename = path.join(codexHome, 'sessions', 'active.jsonl');
   writeJsonLines(filename, [
     { timestamp: '2026-08-05T00:00:00.000Z', type: 'session_meta', payload: { id: 'active-session', model_provider: 'openai' } },
@@ -296,7 +369,8 @@ test('Codex session reader defers index loading until its first query', async t 
   const indexPath = path.join(codexHome, 'runtime', 'codex-session-index.json');
   fs.mkdirSync(path.dirname(indexPath), { recursive: true });
   fs.writeFileSync(indexPath, JSON.stringify({
-    version: 1,
+    version: 3,
+    account: { id: 'lazy-index-account', boundaryMs: Date.parse('2026-01-01T00:00:00.000Z') },
     files: [{
       filename,
       entry: {
@@ -306,6 +380,7 @@ test('Codex session reader defers index loading until its first query', async t 
         birthtimeMs: stat.birthtimeMs,
         result: {
           official: true,
+          scopeEligible: true,
           recordCount: 1,
           items: [{
             id: 'active-session:0:1',
@@ -337,16 +412,13 @@ test('Codex session index persistence uses an awaited asynchronous file write', 
   const source = fs.readFileSync(new URL('../src/provider-request-usage.mjs', import.meta.url), 'utf8');
 
   assert.match(source, /await this\.\#writeIndex\(\);/);
-  assert.match(source, /fs\.promises\.writeFile/);
-  assert.match(source, /fs\.promises\.rename/);
+  assert.match(source, /await secureAtomicWriteFile\(this\.indexPath/);
 });
 
 test('OpenAI Official session index parses only appended JSONL records', async t => {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-append-'));
   t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
-  fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
-    tokens: { account_id: 'append-account' },
-  }), 'utf8');
+  writeCodexAuth(codexHome, 'append-account');
   const filename = path.join(codexHome, 'sessions', 'active.jsonl');
   writeJsonLines(filename, [
     { timestamp: '2026-07-29T01:00:00.000Z', type: 'session_meta', payload: { id: 'active-session', model_provider: 'openai' } },
@@ -391,9 +463,7 @@ test('OpenAI Official session index parses only appended JSONL records', async t
 test('OpenAI Official session index rejects a rewritten append boundary', async t => {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-rewrite-'));
   t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
-  fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
-    tokens: { account_id: 'rewrite-account' },
-  }), 'utf8');
+  writeCodexAuth(codexHome, 'rewrite-account');
   const filename = path.join(codexHome, 'sessions', 'active.jsonl');
   writeJsonLines(filename, [
     { timestamp: '2026-07-29T01:00:00.000Z', type: 'session_meta', payload: { id: 'old-session', model_provider: 'openai' } },

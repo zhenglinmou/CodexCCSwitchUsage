@@ -1,11 +1,11 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createInterface } from 'node:readline';
 import { fetchJson, parseBrowserJson, providerKind } from './hub-provider-adapters.mjs';
 import { getRequestUsageTemplate } from './provider-templates.mjs';
 import { isTrustedHttpUrl } from './http-allowlist.mjs';
 import { getCodexHomeDir } from './platform.mjs';
+import { secureAtomicWriteFile } from './secure-files.mjs';
 
 export const DEFAULT_REQUEST_USAGE_LIMIT = 10;
 export const MAX_REQUEST_USAGE_LIMIT = 50;
@@ -22,6 +22,8 @@ const OPENAI_CODEX_SESSION_SOURCE = 'openai_codex_session';
 const CODEX_SESSION_FILE_LIMIT = 5_000;
 const CODEX_SESSION_INDEX_MAX_BYTES = 8_000_000;
 const CODEX_SESSION_APPEND_BOUNDARY_BYTES = 4_096;
+const CODEX_AUTH_MAX_BYTES = 1_000_000;
+const CODEX_SESSION_MAX_LINE_BYTES = 1_000_000;
 
 const EXCLUDED_PROVIDER_KINDS = new Set(['cpa']);
 const NEW_API_LOG_ADAPTERS = Object.freeze([
@@ -102,7 +104,7 @@ function configuredOrigin(provider) {
 
 function redactedMessage(value, secrets = []) {
   let message = cleanText(value, 240)
-    .replace(/Bearer\s+[^\s,;]+/gi, 'Bearer [redacted]')
+    .replace(/Bearer\s+(?!API\s+Key\b)[^\s,;，；]+/gi, 'Bearer [redacted]')
     .replace(/(sk-|api[_-]?key|token|secret|authorization)\s*[=:]\s*[^\s,;]+/gi, '$1=[redacted]');
   for (const secret of secrets) {
     const valueToRedact = String(secret || '');
@@ -294,8 +296,35 @@ function accountScopeError(message) {
   return error;
 }
 
-async function listCodexSessionFiles(root, output, maximum) {
+async function* boundedUtf8Lines(input, maximumBytes = CODEX_SESSION_MAX_LINE_BYTES) {
+  let line = '';
+  let lineBytes = 0;
+  for await (const chunk of input) {
+    let start = 0;
+    while (start < chunk.length) {
+      const newline = chunk.indexOf('\n', start);
+      const end = newline < 0 ? chunk.length : newline;
+      const part = chunk.slice(start, end);
+      lineBytes += Buffer.byteLength(part, 'utf8');
+      if (lineBytes > maximumBytes) {
+        const error = new Error('Codex 会话记录单行过大');
+        error.code = 'CODEX_SESSION_LINE_TOO_LARGE';
+        throw error;
+      }
+      line += part;
+      if (newline < 0) break;
+      yield line.endsWith('\r') ? line.slice(0, -1) : line;
+      line = '';
+      lineBytes = 0;
+      start = newline + 1;
+    }
+  }
+  if (line) yield line.endsWith('\r') ? line.slice(0, -1) : line;
+}
+
+export async function listCodexSessionFiles(root, output, maximum) {
   if (!root) return false;
+  if (output.length >= maximum) return true;
   let entries;
   try {
     entries = await fs.promises.readdir(root, { withFileTypes: true });
@@ -303,7 +332,13 @@ async function listCodexSessionFiles(root, output, maximum) {
     return false;
   }
   let truncated = false;
-  for (const entry of entries) {
+  entries.sort((left, right) => right.name.localeCompare(left.name, 'en-US'));
+  for (let index = 0; index < entries.length; index += 1) {
+    if (output.length >= maximum) {
+      truncated = true;
+      break;
+    }
+    const entry = entries[index];
     const filename = path.join(root, entry.name);
     if (entry.isDirectory()) {
       truncated = (await listCodexSessionFiles(filename, output, maximum)) || truncated;
@@ -313,11 +348,6 @@ async function listCodexSessionFiles(root, output, maximum) {
         output.push({ filename, size: stat.size, mtimeMs: stat.mtimeMs, birthtimeMs: stat.birthtimeMs });
       } catch {}
     }
-  }
-  output.sort((left, right) => right.mtimeMs - left.mtimeMs || right.birthtimeMs - left.birthtimeMs || right.filename.localeCompare(left.filename));
-  if (output.length > maximum) {
-    output.length = maximum;
-    truncated = true;
   }
   return truncated;
 }
@@ -377,11 +407,14 @@ export class CodexSessionUsageReader {
     this.indexLoadPromise = null;
     this.indexWritePromise = Promise.resolve();
     this.indexRevision = 0;
+    this.indexAccountId = '';
+    this.accountBoundaryMs = 0;
   }
 
   async query(provider, options = {}) {
     const configuredAccountId = codexSessionAccountId(provider);
-    const currentAccountId = this.#currentAccountId();
+    const currentAccount = this.#currentAccount();
+    const currentAccountId = currentAccount.accountId;
     if (!configuredAccountId) throw accountScopeError('OpenAI Official 配置缺少 account_id，无法归属 Codex 官方会话');
     if (!currentAccountId) throw accountScopeError('当前 Codex 没有可识别的官方登录账号');
     if (configuredAccountId !== currentAccountId) {
@@ -389,9 +422,15 @@ export class CodexSessionUsageReader {
     }
 
     await this.#ensureIndexLoaded();
-    const files = [];
-    const sessionsTruncated = await listCodexSessionFiles(path.join(this.codexHome, 'sessions'), files, this.maximumFiles);
-    const archivedSessionsTruncated = await listCodexSessionFiles(path.join(this.codexHome, 'archived_sessions'), files, this.maximumFiles);
+    this.#applyAccountScope(currentAccountId, currentAccount.observedAtMs);
+    const sessionFiles = [];
+    const archivedFiles = [];
+    const sessionsTruncated = await listCodexSessionFiles(path.join(this.codexHome, 'sessions'), sessionFiles, this.maximumFiles);
+    const archivedSessionsTruncated = await listCodexSessionFiles(path.join(this.codexHome, 'archived_sessions'), archivedFiles, this.maximumFiles);
+    const combinedFiles = [...sessionFiles, ...archivedFiles]
+      .sort((left, right) => right.mtimeMs - left.mtimeMs || right.birthtimeMs - left.birthtimeMs || right.filename.localeCompare(left.filename));
+    const combinedTruncated = combinedFiles.length > this.maximumFiles;
+    const files = combinedFiles.slice(0, this.maximumFiles);
     const activeFiles = new Set(files.map(file => file.filename));
     for (const filename of this.fileCache.keys()) {
       if (!activeFiles.has(filename)) this.fileCache.delete(filename);
@@ -409,14 +448,17 @@ export class CodexSessionUsageReader {
     const items = [];
     let officialSessionCount = 0;
     let totalRecords = 0;
-    let complete = !sessionsTruncated && !archivedSessionsTruncated;
+    let complete = !sessionsTruncated && !archivedSessionsTruncated && !combinedTruncated;
     for (let index = 0; index < files.length; index += 1) {
       const file = files[index];
+      if (file.mtimeMs < this.accountBoundaryMs) continue;
       const result = await this.#scanFile(file);
-      if (!result.official) continue;
+      if (!result.official || result.scopeEligible !== true) continue;
+      const scopedItems = result.items.filter(item => Date.parse(item.createdAt) >= this.accountBoundaryMs);
+      if (!scopedItems.length) continue;
       officialSessionCount += 1;
-      totalRecords += result.recordCount;
-      items.push(...result.items);
+      totalRecords += scopedItems.length;
+      items.push(...scopedItems);
       const nextFile = files[index + 1];
       if (!nextFile || index < 3 || items.length < limit) continue;
       const nextSignature = `${nextFile.size}:${nextFile.mtimeMs}:${nextFile.birthtimeMs}`;
@@ -445,14 +487,30 @@ export class CodexSessionUsageReader {
     };
   }
 
-  #currentAccountId() {
-    if (!this.codexHome) return '';
+  #currentAccount() {
+    if (!this.codexHome) return { accountId: '', observedAtMs: 0 };
     try {
-      const auth = JSON.parse(fs.readFileSync(path.join(this.codexHome, 'auth.json'), 'utf8'));
-      return String(auth?.tokens?.account_id || auth?.auth?.tokens?.account_id || '').trim();
+      const authPath = path.join(this.codexHome, 'auth.json');
+      const stats = fs.statSync(authPath);
+      if (!stats.isFile() || stats.size > CODEX_AUTH_MAX_BYTES) return { accountId: '', observedAtMs: 0 };
+      const auth = JSON.parse(fs.readFileSync(authPath, 'utf8'));
+      return {
+        accountId: String(auth?.tokens?.account_id || auth?.auth?.tokens?.account_id || '').trim(),
+        observedAtMs: Number.isFinite(stats.mtimeMs) ? stats.mtimeMs : Date.now(),
+      };
     } catch {
-      return '';
+      return { accountId: '', observedAtMs: 0 };
     }
+  }
+
+  #applyAccountScope(accountId, observedAtMs) {
+    if (this.indexAccountId === accountId && this.accountBoundaryMs > 0) return;
+    this.fileCache.clear();
+    this.persistedIndex.clear();
+    this.indexAccountId = accountId;
+    this.accountBoundaryMs = Math.max(0, Math.trunc(Number(observedAtMs) || Date.now()));
+    this.indexDirty = true;
+    this.indexRevision += 1;
   }
 
   #scanFile(file) {
@@ -482,7 +540,8 @@ export class CodexSessionUsageReader {
           state,
         };
         this.#rememberFile(file.filename, entry);
-        this.persistedIndex.set(file.filename, entry);
+        if (result.scopeEligible === true) this.persistedIndex.set(file.filename, entry);
+        else this.persistedIndex.delete(file.filename);
         this.#prunePersistedIndex();
         this.indexDirty = true;
         this.indexRevision += 1;
@@ -501,21 +560,24 @@ export class CodexSessionUsageReader {
       ...(previous ? { start: previous.size } : {}),
       ...(targetSize > 0 ? { end: targetSize - 1 } : {}),
     });
-    const lines = createInterface({ input, crlfDelay: Infinity });
     let official = previous ? previous.result.official : null;
     let sessionId = previous?.state?.sessionId || path.basename(filename, path.extname(filename));
     let model = previous?.state?.model || '';
     let previousCumulative = Math.max(0, Number(previous?.state?.previousCumulative) || 0);
     let segment = Math.max(0, Number(previous?.state?.segment) || 0);
     let recordCount = Math.max(0, Number(previous?.result?.recordCount) || 0);
+    let scopeEligible = previous ? previous.result.scopeEligible === true : true;
     const items = Array.isArray(previous?.result?.items) ? previous.result.items.slice(0, this.maximumItemsPerFile) : [];
+    let lineTooLarge = false;
     try {
-      for await (const line of lines) {
+      for await (const line of boundedUtf8Lines(input)) {
         if (official !== true && line.includes('"type":"session_meta"')) {
           try {
             const event = JSON.parse(line);
             sessionId = cleanText(event?.payload?.id || sessionId, 128) || sessionId;
             official = String(event?.payload?.model_provider || '') === 'openai';
+            const eventAt = Date.parse(String(event?.timestamp || ''));
+            if (!Number.isFinite(eventAt) || eventAt < this.accountBoundaryMs) scopeEligible = false;
           } catch {
             official = false;
           }
@@ -527,6 +589,8 @@ export class CodexSessionUsageReader {
           try {
             const event = JSON.parse(line);
             model = cleanText(event?.payload?.model, 160);
+            const eventAt = Date.parse(String(event?.timestamp || ''));
+            if (!Number.isFinite(eventAt) || eventAt < this.accountBoundaryMs) scopeEligible = false;
           } catch {}
           continue;
         }
@@ -538,6 +602,8 @@ export class CodexSessionUsageReader {
           continue;
         }
         if (event?.payload?.type !== 'token_count' || !event?.payload?.info) continue;
+        const eventAt = Date.parse(String(event?.timestamp || ''));
+        if (!Number.isFinite(eventAt) || eventAt < this.accountBoundaryMs) scopeEligible = false;
         const cumulativeTokens = codexSessionInteger(event.payload.info?.total_token_usage?.total_tokens);
         if (cumulativeTokens == null) continue;
         if (cumulativeTokens < previousCumulative) {
@@ -557,8 +623,14 @@ export class CodexSessionUsageReader {
           if (items.length > this.maximumItemsPerFile) items.length = this.maximumItemsPerFile;
         }
       }
+    } catch (error) {
+      if (error?.code !== 'CODEX_SESSION_LINE_TOO_LARGE') throw error;
+      lineTooLarge = true;
+      official = false;
+      scopeEligible = false;
+      recordCount = 0;
+      items.length = 0;
     } finally {
-      lines.close();
       input.destroy();
     }
     items.sort((left, right) => {
@@ -566,13 +638,13 @@ export class CodexSessionUsageReader {
       return timeDifference || right.id.localeCompare(left.id);
     });
     return {
-      result: { official: official === true, items, recordCount },
+      result: { official: official === true, scopeEligible, items, recordCount },
       state: {
         sessionId,
         model,
         previousCumulative,
         segment,
-        canAppend: targetSize === 0 || this.#fileEndsWithNewline(filename, targetSize),
+        canAppend: !lineTooLarge && (targetSize === 0 || this.#fileEndsWithNewline(filename, targetSize)),
         appendBoundaryHash: this.#appendBoundaryHash(filename, targetSize),
       },
     };
@@ -644,29 +716,35 @@ export class CodexSessionUsageReader {
   async #ensureIndexLoaded() {
     if (!this.indexLoadPromise) {
       this.indexLoadPromise = this.#readIndex().then(index => {
-        this.persistedIndex = index;
+        this.persistedIndex = index.files;
+        this.indexAccountId = index.accountId;
+        this.accountBoundaryMs = index.boundaryMs;
       });
     }
     await this.indexLoadPromise;
   }
 
   async #readIndex() {
-    if (!this.indexPath) return new Map();
+    const empty = () => ({ files: new Map(), accountId: '', boundaryMs: 0 });
+    if (!this.indexPath) return empty();
     try {
-      if ((await fs.promises.stat(this.indexPath)).size > CODEX_SESSION_INDEX_MAX_BYTES) return new Map();
+      if ((await fs.promises.stat(this.indexPath)).size > CODEX_SESSION_INDEX_MAX_BYTES) return empty();
       const payload = JSON.parse(await fs.promises.readFile(this.indexPath, 'utf8'));
-      if (payload?.version !== 1 || !Array.isArray(payload.files)) return new Map();
-      return new Map(payload.files.slice(0, this.maximumCachedFiles).flatMap(record => {
+      const accountId = String(payload?.account?.id || '').trim();
+      const boundaryMs = Number(payload?.account?.boundaryMs);
+      if (payload?.version !== 3 || !accountId || !Number.isFinite(boundaryMs) || boundaryMs <= 0 || !Array.isArray(payload.files)) return empty();
+      const files = new Map(payload.files.slice(0, this.maximumCachedFiles).flatMap(record => {
         const filename = String(record?.filename || '');
         const entry = record?.entry;
-        if (!filename || !entry || typeof entry !== 'object' || !entry.result || !entry.state) return [];
+        if (!filename || !entry || typeof entry !== 'object' || !entry.result || !entry.state || entry.result.scopeEligible !== true) return [];
         const items = Array.isArray(entry.result.items)
           ? entry.result.items.slice(0, this.maximumItemsPerFile)
           : [];
         return [[filename, { ...entry, result: { ...entry.result, items } }]];
       }));
+      return { files, accountId, boundaryMs };
     } catch {
-      return new Map();
+      return empty();
     }
   }
 
@@ -676,13 +754,12 @@ export class CodexSessionUsageReader {
     const operation = previous.catch(() => {}).then(async () => {
       if (!this.indexDirty) return;
       const revision = this.indexRevision;
-      const temporary = `${this.indexPath}.tmp`;
       try {
         const candidates = [...this.persistedIndex.entries()]
           .sort(([, left], [, right]) => Number(right.mtimeMs) - Number(left.mtimeMs))
           .slice(0, this.maximumCachedFiles);
         const files = [];
-        let serializedBytes = Buffer.byteLength('{"version":1,"files":[]}');
+        let serializedBytes = Buffer.byteLength('{"version":3,"account":{"id":"","boundaryMs":0},"files":[]}');
         for (const [filename, entry] of candidates) {
           const record = { filename, entry };
           const recordBytes = Buffer.byteLength(JSON.stringify(record)) + (files.length ? 1 : 0);
@@ -690,12 +767,13 @@ export class CodexSessionUsageReader {
           files.push(record);
           serializedBytes += recordBytes;
         }
-        await fs.promises.mkdir(path.dirname(this.indexPath), { recursive: true });
-        await fs.promises.writeFile(temporary, JSON.stringify({ version: 1, files }), 'utf8');
-        await fs.promises.rename(temporary, this.indexPath);
+        await secureAtomicWriteFile(this.indexPath, JSON.stringify({
+          version: 3,
+          account: { id: this.indexAccountId, boundaryMs: this.accountBoundaryMs },
+          files,
+        }), { encoding: 'utf8' });
         if (this.indexRevision === revision) this.indexDirty = false;
       } catch {
-        try { await fs.promises.rm(temporary, { force: true }); } catch {}
       }
     });
     this.indexWritePromise = operation;

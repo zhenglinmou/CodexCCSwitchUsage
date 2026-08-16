@@ -18,6 +18,7 @@ test('remote HTTP opt-in is pinned to one provider id and exact origin', async t
   fs.writeFileSync(filename, JSON.stringify({
     providers: {
       'company-provider': ['http://company.example.test:28080/v1'],
+      'local-provider': ['http://127.0.0.1:28081/v1'],
     },
   }));
   process.env.CCSWITCH_HTTP_ALLOWLIST_FILE = filename;
@@ -43,6 +44,10 @@ test('remote HTTP opt-in is pinned to one provider id and exact origin', async t
   assert.equal(isTrustedHttpUrl('http://company.example.test:28081/v1', provider), false);
   assert.equal(isTrustedHttpUrl(provider.apiBaseUrl, { ...provider, id: 'other-provider' }), false);
   assert.equal(isTrustedHttpUrl('http://127.0.0.1:8317/v1', { id: 'other-provider' }), true);
+  assert.equal(isTrustedHttpUrl('http://127.0.0.1:17891/v1', { id: 'other-provider' }), false);
+  assert.equal(isTrustedHttpUrl('http://127.0.0.1:9334/json/list', { id: 'other-provider' }), false);
+  assert.equal(isTrustedHttpUrl('http://user:password@127.0.0.1:8317/v1', { id: 'other-provider' }), false);
+  assert.equal(isTrustedHttpUrl('http://127.0.0.1:28081/v1', { id: 'local-provider' }), true);
   assert.equal(normalizeProviderTemplateOrigin(provider), 'http://company.example.test:28080');
   assert.equal(normalizeProviderTemplateOrigin({ ...provider, id: 'other-provider' }), '');
 

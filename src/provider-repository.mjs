@@ -3,6 +3,19 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { getDefaultDatabasePath } from './platform.mjs';
 
+const MAX_CODEX_PROVIDERS = 512;
+const MAX_PROVIDER_CONFIG_CHARS = 65_536;
+const MAX_CREDENTIAL_MATCH_ROWS = 64;
+const PROVIDER_SELECT_COLUMNS = `
+  substr(id, 1, 160) AS id,
+  substr(name, 1, 160) AS name,
+  substr(website_url, 1, 2048) AS website_url,
+  is_current,
+  sort_index,
+  CASE WHEN settings_config IS NULL OR length(settings_config) <= ${MAX_PROVIDER_CONFIG_CHARS} THEN settings_config ELSE '{}' END AS settings_config,
+  CASE WHEN meta IS NULL OR length(meta) <= ${MAX_PROVIDER_CONFIG_CHARS} THEN meta ELSE '{}' END AS meta
+`;
+
 function parseJson(text, fallback) {
   try {
     return JSON.parse(text);
@@ -42,19 +55,21 @@ export function parseProviderRow(row) {
   const meta = parseJson(row.meta, {});
   const usage = meta?.usage_script;
   const auth = settings?.auth && typeof settings.auth === 'object' ? settings.auth : {};
-  const apiBaseUrl = findBaseUrl(settings?.config || '');
+  const apiBaseUrl = findBaseUrl(settings?.config || '').trim().slice(0, 2_048);
 
+  const id = String(row.id || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 160);
+  if (!id) return null;
   return {
-    id: String(row.id),
-    name: String(row.name || '当前供应商'),
-    websiteUrl: row.website_url || '',
+    id,
+    name: String(row.name || '当前供应商').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160) || '当前供应商',
+    websiteUrl: String(row.website_url || '').trim().slice(0, 2_048),
     isCurrent: Boolean(row.is_current),
     sortIndex: row.sort_index != null && Number.isFinite(Number(row.sort_index)) ? Number(row.sort_index) : null,
     usage: usage && typeof usage === 'object' ? usage : null,
     auth,
-    apiKey: String(auth.OPENAI_API_KEY || auth.openai_api_key || ''),
+    apiKey: String(auth.OPENAI_API_KEY || auth.openai_api_key || '').slice(0, 16_384),
     apiBaseUrl,
-    baseUrl: String(usage?.baseUrl || apiBaseUrl).replace(/\/+$/, ''),
+    baseUrl: String(usage?.baseUrl || apiBaseUrl).trim().slice(0, 2_048).replace(/\/+$/, ''),
   };
 }
 
@@ -146,7 +161,7 @@ export class ProviderRepository {
     const db = this.ensureDatabase();
     if (!this.currentStatement) {
       this.currentStatement = db.prepare(`
-        SELECT id, name, website_url, is_current, sort_index, settings_config, meta
+        SELECT ${PROVIDER_SELECT_COLUMNS}
         FROM providers
         WHERE app_type = 'codex' AND is_current = 1
         ORDER BY sort_index, name
@@ -165,7 +180,7 @@ export class ProviderRepository {
     const db = this.ensureDatabase();
     if (!this.byNameStatement) {
       this.byNameStatement = db.prepare(`
-        SELECT id, name, website_url, is_current, sort_index, settings_config, meta
+        SELECT ${PROVIDER_SELECT_COLUMNS}
         FROM providers
         WHERE app_type = 'codex' AND name = ?
         LIMIT 1
@@ -184,7 +199,7 @@ export class ProviderRepository {
     const db = this.ensureDatabase();
     if (!this.byIdStatement) {
       this.byIdStatement = db.prepare(`
-        SELECT id, name, website_url, is_current, sort_index, settings_config, meta
+        SELECT ${PROVIDER_SELECT_COLUMNS}
         FROM providers
         WHERE app_type = 'codex' AND id = ?
         LIMIT 1
@@ -204,13 +219,17 @@ export class ProviderRepository {
     const db = this.ensureDatabase();
     if (!this.allStatement) {
       this.allStatement = db.prepare(`
-        SELECT id, name, website_url, is_current, sort_index, settings_config, meta
+        SELECT ${PROVIDER_SELECT_COLUMNS}
         FROM providers
         WHERE app_type = 'codex'
         ORDER BY COALESCE(sort_index, 2147483647), name
+        LIMIT ${MAX_CODEX_PROVIDERS + 1}
       `);
     }
     const rows = this.allStatement.all();
+    if (rows.length > MAX_CODEX_PROVIDERS) {
+      throw new Error(`CCSwitch Codex 供应商数量超过安全上限 ${MAX_CODEX_PROVIDERS}`);
+    }
     const signature = JSON.stringify(rows.map(providerRowSignature));
     if (this.allCache?.signature === signature) return this.allCache.value;
     const value = rows.map(parseProviderRow).filter(Boolean);
@@ -261,12 +280,18 @@ export class ProviderRepository {
     const db = this.ensureDatabase();
     if (!this.credentialAppTypesStatement) {
       this.credentialAppTypesStatement = db.prepare(`
-        SELECT app_type, settings_config
+        SELECT substr(app_type, 1, 64) AS app_type, settings_config
         FROM providers
+        WHERE length(settings_config) <= ${MAX_PROVIDER_CONFIG_CHARS}
+          AND (instr(settings_config, ?) > 0 OR instr(settings_config, ?) > 0)
+        LIMIT ${MAX_CREDENTIAL_MATCH_ROWS + 1}
       `);
     }
     const appTypes = new Set();
-    for (const row of this.credentialAppTypesStatement.all()) {
+    const escapedTarget = JSON.stringify(target).slice(1, -1);
+    const rows = this.credentialAppTypesStatement.all(target, escapedTarget);
+    if (rows.length > MAX_CREDENTIAL_MATCH_ROWS) return ['unknown'];
+    for (const row of rows) {
       const settings = parseJson(row.settings_config, {});
       if (providerCredentialValues(settings).includes(target)) appTypes.add(String(row.app_type || ''));
     }

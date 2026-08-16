@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { PROVIDER_QUERY_TIMEOUT_MS } from '../browser-companion/protocol.js';
-import { normalizeUsage, readResponseTextLimited } from './usage-client.mjs';
+import { normalizeUsage, readResponseTextLimited } from './usage-normalization.mjs';
 import { getBalanceTemplate, normalizeProviderTemplateOrigin } from './provider-templates.mjs';
 import { isTrustedHttpUrl } from './http-allowlist.mjs';
 import { getHomeDir } from './platform.mjs';
@@ -13,6 +13,9 @@ const WHAM_BROWSER_PROBE_TIMEOUT_MS = 5_000;
 const WHAM_BROWSER_RACE_DELAY_MS = 400;
 const WHAM_DIRECT_BACKOFF_MS = 300_000;
 const WHAM_RESULT_CACHE_MS = 30_000;
+const MAX_CPA_AUTH_FILES = 64;
+const MAX_CPA_AUTH_DIRECTORY_ENTRIES = 4_096;
+const MAX_CPA_AUTH_FILE_BYTES = 1_000_000;
 const PROVIDER_SCOPED_NAME = Symbol('providerScopedName');
 const API_KEY_NO_LOGIN = 'API Key 直接查询，无需官网登录';
 
@@ -699,6 +702,13 @@ function hasLoopbackProviderBase(provider) {
   return ['127.0.0.1', 'localhost', '::1'].includes(configuredProviderApiHostname(provider));
 }
 
+function paidMirrorFamily(provider) {
+  const hostname = configuredProviderApiHostname(provider);
+  return hostname && ['rawchat.cn', 'sharedchat.top'].some(domain => hostnameMatches(hostname, domain))
+    ? 'rawchat-sharedchat'
+    : '';
+}
+
 export function providerKind(provider) {
   const name = String(provider?.name || '').toLowerCase().replace(/\s+/g, '');
   const hasOpenAiCredentials = Boolean(provider?.auth?.tokens?.account_id && provider?.auth?.tokens?.access_token);
@@ -1062,8 +1072,11 @@ export class ProviderQueryEngine {
         : allowSoleSessionFallback ? 'auto' : 'binding-required';
       return `browser:${balanceTemplateId}:${kind}:${crypto.createHash('sha256').update(accountIdentity).update('\0').update(bindingIdentity).digest('base64url')}`;
     }
-    const baseIdentity = balanceTemplateId === 'window-balance' && kind === 'paid'
-      ? ''
+    const paidFamily = balanceTemplateId === 'window-balance' && kind === 'paid'
+      ? paidMirrorFamily(provider)
+      : '';
+    const baseIdentity = paidFamily
+      ? `paid-mirror:${paidFamily}`
       : providerApiBase(provider);
     const material = [balanceTemplateId, baseIdentity, provider.apiKey].join('\0');
     return crypto.createHash('sha256').update(material).digest('base64url');
@@ -2208,17 +2221,36 @@ export class ProviderQueryEngine {
 
   #cpaAuthFiles() {
     const directory = path.join(this.homeDir, '.cli-proxy-api');
+    let handle;
     try {
-      return fs.readdirSync(directory, { withFileTypes: true })
-        .filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith('.json'))
-        .map(entry => path.join(directory, entry.name));
+      handle = fs.opendirSync(directory);
+      const candidates = [];
+      for (let scanned = 0; scanned < MAX_CPA_AUTH_DIRECTORY_ENTRIES; scanned += 1) {
+        const entry = handle.readSync();
+        if (!entry) break;
+        if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.json')) continue;
+        const filename = path.join(directory, entry.name);
+        try {
+          const stats = fs.statSync(filename);
+          if (!stats.isFile() || stats.size <= 0 || stats.size > MAX_CPA_AUTH_FILE_BYTES) continue;
+          candidates.push({ filename, modifiedAt: Number(stats.mtimeMs) || 0 });
+        } catch {}
+      }
+      return candidates
+        .sort((left, right) => right.modifiedAt - left.modifiedAt || right.filename.localeCompare(left.filename))
+        .slice(0, MAX_CPA_AUTH_FILES)
+        .map(item => item.filename);
     } catch {
       return [];
+    } finally {
+      try { handle?.closeSync(); } catch {}
     }
   }
 
   #readCpaAuth(filename) {
     try {
+      const stats = fs.statSync(filename);
+      if (!stats.isFile() || stats.size <= 0 || stats.size > MAX_CPA_AUTH_FILE_BYTES) return null;
       const auth = JSON.parse(fs.readFileSync(filename, 'utf8'));
       return auth?.type === 'codex' ? auth : null;
     } catch {
@@ -2231,7 +2263,11 @@ export class ProviderQueryEngine {
     const candidates = this.#cpaAuthFiles()
       .map(filename => ({ filename, auth: this.#readCpaAuth(filename) }))
       .filter(item => String(item.auth?.account_id || '') === accountId)
-      .map(item => ({ ...item, modifiedAt: fs.statSync(item.filename).mtimeMs }))
+      .map(item => {
+        try { return { ...item, modifiedAt: fs.statSync(item.filename).mtimeMs }; }
+        catch { return null; }
+      })
+      .filter(Boolean)
       .sort((left, right) => right.modifiedAt - left.modifiedAt);
     return candidates[0]?.auth || null;
   }

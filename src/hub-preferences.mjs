@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { secureAtomicWriteFileSync } from './secure-files.mjs';
 
 const SORT_OPTIONS = new Set(['smart', 'name', 'remaining', 'updated', 'latency']);
 const VIEW_OPTIONS = new Set(['cards', 'compact']);
@@ -7,15 +8,17 @@ const MAX_FAVORITES = 256;
 const MAX_IGNORED_PROVIDERS = 256;
 const MAX_BROWSER_ALIASES = 32;
 const MAX_PROVIDER_BROWSERS = 256;
+const MAX_PREFERENCES_BYTES = 262_144;
+const RESERVED_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 function cleanProviderId(value) {
   const text = String(value || '').replace(/[\u0000-\u001f\u007f]/g, '').trim();
-  return text && text.length <= 160 ? text : '';
+  return text && text.length <= 160 && !RESERVED_OBJECT_KEYS.has(text) ? text : '';
 }
 
 function cleanClientRef(value) {
   const text = String(value || '').trim();
-  return /^[A-Za-z0-9_-]{8,64}$/.test(text) ? text : '';
+  return /^[A-Za-z0-9_-]{8,64}$/.test(text) && !RESERVED_OBJECT_KEYS.has(text) ? text : '';
 }
 
 function cleanAlias(value) {
@@ -97,6 +100,8 @@ export function normalizeHubPreferences(value = {}) {
 function readPreferences(filePath) {
   if (!filePath) return normalizeHubPreferences();
   try {
+    const stats = fs.statSync(filePath);
+    if (!stats.isFile() || stats.size <= 0 || stats.size > MAX_PREFERENCES_BYTES) return normalizeHubPreferences();
     return normalizeHubPreferences(JSON.parse(fs.readFileSync(filePath, 'utf8')));
   } catch {
     return normalizeHubPreferences();
@@ -185,16 +190,16 @@ export class HubPreferences {
       }
       next.providerBrowsers = normalizeProviderBrowsers(next.providerBrowsers);
     }
-    this.value = normalizeHubPreferences(next);
-    this.#write();
+    const normalized = normalizeHubPreferences(next);
+    this.#write(normalized);
+    this.value = normalized;
     return this.get();
   }
 
-  #write() {
+  #write(value) {
     if (!this.filePath) return;
-    fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-    const temporary = `${this.filePath}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify(this.value, null, 2), { encoding: 'utf8', mode: 0o600 });
-    fs.renameSync(temporary, this.filePath);
+    const serialized = JSON.stringify(value, null, 2);
+    if (Buffer.byteLength(serialized, 'utf8') > MAX_PREFERENCES_BYTES) throw new Error('Hub 偏好设置过大');
+    secureAtomicWriteFileSync(this.filePath, serialized, { encoding: 'utf8' });
   }
 }
