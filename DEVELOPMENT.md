@@ -4,7 +4,7 @@
 
 This document is the operational guide for developing, testing, running, packaging, upgrading, and rolling back CodexCCSwitchUsage on this computer.
 
-The current v2 source metadata is application version `2.0.20`, injector version `94`, and browser-companion version `0.1.25`. Read `package.json` and `browser-companion\manifest.json` when starting a later release; the values below describe the current checkout and are not a substitute for those files.
+The current v2 source metadata is application version `2.0.21`, injector version `94`, and browser-companion version `0.1.26`. Read `package.json` and `browser-companion\manifest.json` when starting a later release; the values below describe the current checkout and are not a substitute for those files.
 
 ## 1. Source of truth and generated copies
 
@@ -46,17 +46,18 @@ The installer preserves the stable `runtime` directory during an upgrade. A real
 | `src\host.mjs` | Long-running host, quota refresh scheduling, database watcher, and HTTP-only target audits |
 | `src\injector-script.mjs` | Composer footer DOM, styles, responsive layout, tooltips, refresh UI |
 | `src\provider-repository.mjs` | Read-only CCSwitch SQLite access |
-| `src\usage-client.mjs` | Legacy `usage_script` compatibility utilities; not used by the v2 Hub runtime |
+| `src\usage-client.mjs`, `src\evaluator.mjs`, `src\evaluator-worker.mjs` | Legacy v1 compatibility/test sources; never imported by or shipped with the v2 runtime |
 | `src\hub-provider-adapters.mjs` | v2 provider routing and built-in balance adapters |
+| `src\usage-normalization.mjs` | Non-executing response bounds and normalized usage schema used by v2 adapters |
 | `src\provider-request-usage.mjs` | Third-party per-request Token and charge adapters |
 | `src\provider-templates.mjs` | Independent balance/request template registry and credential-free bindings |
 | `src\hub-service.mjs` | Safe multi-provider Hub state, cache, refresh concurrency, and login actions |
 | `src\hub-server.mjs` / `src\hub-page.mjs` | Loopback-only Balance Hub API and page |
 | `src\hub-preferences.mjs` | Credential-free Hub view mode, favorites, sorting, and browser display aliases |
 | `src\browser-callback-broker.mjs` | Same-port job queue and callbacks for the user's existing browser profile |
+| `src\companion-auth.mjs` / `browser-companion\auth.js` | Companion protocol v3 mutual HMAC authentication and replay protection |
+| `src\secure-files.mjs` | Atomic private runtime writes and POSIX owner-only modes |
 | `browser-companion\` | MV3 companion loaded into the user's normal Edge/Chrome profile |
-| `src\evaluator.mjs` | Worker lifecycle and timeout handling for provider scripts |
-| `src\evaluator-worker.mjs` | Sandboxed `node:vm` execution of `usage_script` |
 | `src\cdp-client.mjs` | Short-lived CDP HTTP/WebSocket client and strict target filtering |
 | `src\target-session.mjs` | One-shot injector installation, hot replacement, and payload delivery |
 | `src\keyed-backoff.mjs` | Target-keyed bounded retry state for failed one-shot injector installations |
@@ -69,7 +70,8 @@ The installer preserves the stable `runtime` directory during an upgrade. A real
 | `scripts\stop.ps1` | Stops plugin hosts and the Codex process tree; not for normal development reloads |
 | `packaging\launcher\Program.cs` | Hidden Windows EXE wrapper that launches the existing PowerShell flow |
 | `packaging\setup.iss` | Inno Setup installer definition |
-| `scripts\build-exe.ps1` | Repeatable launcher/installer build |
+| `scripts\build-exe.ps1` | Exact-runtime Windows build, payload integrity manifest, and Authenticode signing gate |
+| `scripts\build-macos-package.ps1` | Allowlisted macOS payload build plus Developer ID signing/notarization and metadata-preserving release ZIP gate |
 
 ### v2 single balance center
 
@@ -77,17 +79,21 @@ The v2 host is the only balance-query center. The Codex footer, Hub page, and lo
 
 The stable gateway listens on `127.0.0.1:17891` and exposes cache-only `/v1/balance/{provider}`, `/v1/balances`, and legacy-compatible `/usage/{provider}` reads, plus `/v1/providers` and `/v1/health`. Explicit external refreshes use the token-protected Hub POST route. CCSwitch remains read-only and its existing scripts are not rewritten during v2 development.
 
-The installer and source installer protect the complete target tree with a non-inherited Windows DACL owned by the current user and grant access only to that user, SYSTEM, and Administrators. Development launches reapply the same policy to `runtime` before the host reads or writes `hub-token`. ACL hardening rejects reparse-point roots and fails closed; it never continues startup or installation with a broadly readable token or modifiable installed source tree.
+Provider requests require HTTPS by default. Only the conventional CPA loopback endpoint on port `8317` is implicitly allowed over HTTP; every other loopback or intranet HTTP origin must be explicitly allowlisted for the exact provider ID and origin. This prevents a provider record from turning the host into a reader for Balance Hub, CDP, or unrelated local services.
 
-源码宿主本身支持 Windows 和 macOS。Windows 的发布版仍由 PowerShell、隐藏 EXE 启动器和 Inno Setup 负责；macOS 不使用这些 Windows 组件，而是通过 `scripts/launch.mjs` 和 `scripts/stop-host.mjs` 运行源码。macOS 入口要求 Codex 已带 `9334` CDP 启动，不会自动关闭或重启 Codex；宿主只监控传入的 Codex 根 PID。Windows 上的 ACL 加固和 EXE 打包约束不适用于 macOS。
+The installer and source installer protect the complete target tree with a non-inherited Windows DACL owned by the current user and grant access only to that user, SYSTEM, and Administrators. Development launches reapply the same policy to `runtime` before the host reads or writes either local token. ACL hardening rejects reparse-point roots and fails closed. On macOS/Linux, runtime directories use mode `0700` and state/token files use mode `0600`, including atomic replacements.
 
-The token-protected `/api/<hub-token>/request-usage` route is the per-request usage source for the current-provider recent-request popover. Opening or refreshing that popover requests the latest 10 Codex records. It prefers a supported third party's real token/quota charge records and falls back to clearly marked CCSwitch `proxy_request_logs` estimates when the remote interface is unavailable. OpenAI Official is a local exception: it reads Codex `token_count` events from `~/.codex/sessions` and `~/.codex/archived_sessions`, returns the official input/output/cache/reasoning Token counts, and leaves per-request cost unavailable because a ChatGPT subscription does not expose a per-call charge. The reader parses only `session_meta`, `turn_context`, and `token_count`, ignores conversation content, rejects non-OpenAI sessions, and activates only when the provider account id matches the current `~/.codex/auth.json` account. It scans newest files first, persists a bounded derived index under `runtime`, incrementally parses only verified append-only tails, and caps both retained files and per-file rows; the index contains no conversation text or credentials. Local fallback SQL is fixed to `app_type = 'codex'`. When one API Key is reused by Codex and Claude/Claude Desktop, remote rows are classified before applying the 10-row limit: `/v1/responses` and OpenAI-compatible paths are Codex, `/v1/messages` and Anthropic paths are Claude, and model families are used only when the path is absent. Ambiguous rows from a cross-app shared Key are excluded rather than mixed into the Codex list.
+源码宿主本身支持 Windows 和 macOS。Windows 的发布版仍由 PowerShell、隐藏 EXE 启动器和 Inno Setup 负责；macOS 通过 `scripts/launch.mjs` 和 `scripts/stop-host.mjs` 运行源码。macOS 入口从已运行且只绑定回环地址的 Codex 根进程自动发现随机 CDP 端口，不会自动关闭或重启 Codex。Windows 使用 ACL，macOS/Linux 使用 owner-only POSIX modes；正式 macOS 包还必须完成 Developer ID 签名、公证和 stapling。
+
+CDP has no application-layer authentication. A fresh Windows launch chooses an OS-assigned random port, passes `--remote-debugging-address=127.0.0.1`, and stores the selected port in private `runtime\cdp-port`; an existing loopback-only Codex may retain any port, including a legacy `9334` session, so a hot update never restarts Codex merely to migrate the port. Portable launch rejects explicit non-loopback debug addresses. These controls do not isolate an already-compromised same-user local process, which can still inspect process arguments or reach loopback.
+
+The token-protected `/api/<hub-token>/request-usage` route is the per-request usage source for the current-provider recent-request popover. Opening or refreshing that popover requests the latest 10 Codex records. It prefers a supported third party's real token/quota charge records and falls back to clearly marked CCSwitch `proxy_request_logs` estimates when the remote interface is unavailable. OpenAI Official is a local exception: it reads Codex `token_count` events from `~/.codex/sessions` and `~/.codex/archived_sessions`, returns the official input/output/cache/reasoning Token counts, and leaves per-request cost unavailable because a ChatGPT subscription does not expose a per-call charge. The reader parses only `session_meta`, `turn_context`, and `token_count`, ignores conversation content, rejects non-OpenAI sessions, and activates only when the provider account id matches the current `~/.codex/auth.json` account. Its v3 derived index is bounded and account-scoped: an auth-file timestamp establishes the conservative account boundary, an account switch clears memory and disk state, and any session whose relevant metadata crosses that boundary is rejected even when its file mtime is later touched. Local fallback SQL is fixed to `app_type = 'codex'`. When one API Key is reused by Codex and Claude/Claude Desktop, remote rows are classified before applying the 10-row limit: `/v1/responses` and OpenAI-compatible paths are Codex, `/v1/messages` and Anthropic paths are Claude, and model families are used only when the path is absent. Ambiguous rows from a cross-app shared Key are excluded rather than mixed into the Codex list.
 
 Balance and per-request usage templates are selected independently. Hub exposes token-protected template catalog, probe, and selection routes. Balance and per-request probes run together under one 12,000 ms budget; identical URL/authentication requests share one in-memory parsed response, balance schemas retain their priority order, and only normalized previews through the first validated schema are returned. Packy/effective-Key and standard Key capabilities are checked before a browser-account default, including for providers whose built-in profile currently prefers browser balances. A validated standard unlimited-Key response remains a template match even when browser login or session synchronization is still required. Once a higher-priority match is selected, the shared probe controller aborts speculative loser requests so their retry timers and sockets do not remain active in the background. Window quota payloads must also satisfy `total = used + remaining` for every window. Manual bindings are written to `runtime\hub-template-bindings.json` with provider id, configured origin, template ids, and timestamps only. Changing the provider origin invalidates the binding, and API Keys are never persisted in this file.
 
 Per-request template auto-detection always probes with a limit of 10 and never persists its recommendation. A non-empty `/api/log/token` response must contain at least one recognizable New API request-activity row: either a `type = 2` consumption row or a `type = 5` request-error row with meaningful model, quota, Token, timing, or request metadata. Zero-Token/zero-cost error rows remain valid, while account-only events, content-only lookalikes, and rows whose request fields exist only as empty/null placeholders are rejected. An empty Token log is accepted as zero only when `/api/status` independently validates the New API billing schema and no recent local evidence requires stricter attribution. Empty or WAF-blocked Token logs may instead use `/api/log/self` only after at least two recent successful local requests correlate to one remote Token identity. Correlation requires matching time, model, and input Tokens. Completion Tokens must match exactly for other New API providers; 浏览器型供应商 alone may accept a positive remote completion count below the local output count because its account log omits reasoning output. `token_id` is authoritative; a compatibility fallback without it returns only the individually correlated `token_name` rows. Same-key 浏览器型供应商 API-only mirrors use the canonical `第三方站点 origin` provider's request template, browser binding, and local correlation records while retaining their own public provider identity and model Base URL. HTTP 401 never enters the account-log fallback. Valid Token logs with unavailable billing configuration remain usable but degraded and non-exact; unverified account scope, `record not found`, authentication, network, and schema failures continue to the CCSwitch-local fallback probe.
 
-Provider adapters first use the CCSwitch API Key and configured Base URL when the third-party site supports a balance endpoint. Remote HTTP remains denied by default. A local `~/.cc-switch/allow-http-origins.json` may opt in one exact provider id plus HTTP origin; the exception is direct-host-only, is port-pinned, and never expands browser-companion permissions. Sites whose model API keys cannot access dashboard balances use the MV3 browser companion after one-time pairing with the Hub token. The companion runs requests inside the user's existing Edge/Chrome profile, keeps Cookie values in that browser, and returns only request results through the same port. Hub opening never triggers refresh. A balance query never creates or activates a website tab; session synchronization and login pages require an explicit user action.
+Provider adapters first use the CCSwitch API Key and configured Base URL when the third-party site supports a balance endpoint. Remote HTTP remains denied by default. A local `~/.cc-switch/allow-http-origins.json` may opt in one exact provider id plus HTTP origin; the exception is direct-host-only, is port-pinned, and never expands browser-companion permissions. Sites whose model API keys cannot access dashboard balances use the MV3 browser companion after one-time pairing with a companion-only secret that is separate from the Hub management token. The companion runs requests inside the user's existing Edge/Chrome profile, keeps Cookie values in that browser, and returns only request results through the same port. Hub opening never triggers refresh. A balance query never creates or activates a website tab; session synchronization and login pages require an explicit user action.
 
 Configured third-party public-benefit profiles query finite API Keys directly and use the browser companion when a site reports a standard unlimited Key whose real balance belongs to the logged-in account. Their site display configuration controls quota units and exchange rates; placeholder unlimited values are never rendered as balances. A configured third-party profile can also use a same-origin browser API fallback for finite Keys blocked by WAF and a clearly marked CCSwitch-local estimate if the remote query still fails. Packy is treated as a New API family extension, not a separate protocol: a `/api/usage/token/` response with `total_available`, `total_used`, and `quota_reset_period` is an effective Key quota that remains directly queryable even when `unlimited_quota` is true. Auto-detection tests this more specific capability before the standard New API Key/account behavior. Routing is pinned to the configured API hostname, so a provider name alone cannot send credentials to any fixed domain.
 
@@ -95,7 +101,9 @@ Every provider with a built-in HTTPS login configuration always exposes that san
 
 Hub workspace preferences are separate from provider and credential state. Card/compact view mode, favorites, sorting, opaque browser-client display aliases, and provider-to-browser preferences containing only a provider id, opaque client reference, and normalized browser name are validated and written atomically to `runtime\hub-preferences.json`; this file never contains API Keys, Cookie values, login identities, request bodies, or CCSwitch configuration. Browser-type provider rows expose the resolved Edge/Chrome target in the status column. Resolution prefers an explicit account binding, the user's last provider-specific choice, the last successful account browser, and a unique validated same-origin session; ambiguous multi-browser sessions remain visibly unassigned. Rows requiring website authentication, session synchronization, or account binding keep a separate refresh action visible beside the corrective action, so the second step never depends on expanding row details. The browser task center groups corrective actions by the exact opaque Edge/Chrome client reference and limits batch rechecks to those providers. After a user explicitly opens a login page, the Hub keeps only a tab-scoped, credential-free pending marker; leaving and returning to the Hub triggers one refresh attempt, and a failed attempt becomes a manual recheck instead of polling indefinitely. The token-protected Hub state includes a whitelisted host diagnostic snapshot, while the five-second companion-status route remains lightweight and never rebuilds full provider state.
 
-The companion stores its pairing token, stable client id, browser scope, validated HTTPS origins, and the numeric New API user id required beside browser cookies in `chrome.storage.local`; it never stores Cookie values, Token values, or localStorage source text. Edge and Chrome may connect simultaneously with independent client ids and sessions. The host also scopes its live connection key by client id plus browser, publishes only an opaque client reference to Hub, and uses that reference for explicit “在 Chrome / Edge 验证” actions. Upgrading from an older companion migrates a copied cross-browser client id to a browser-specific identity. For multiple accounts on one New API origin, the host sends account probes to each exact client, checks the site's masked token listing against the provider API Key locally, and accepts only the owning account; the complete API Key is never sent to either browser. 浏览器型供应商 deployments that return a structurally valid empty Token list support an explicit provider-to-browser binding. Binding stores an opaque SHA-256 account reference in `hub-cache.json`, never the numeric user id, and every refresh targets only that exact Edge or Chrome client. A changed browser account invalidates the reference and clears the old balance instead of falling back to another browser. Duplicate 浏览器型供应商 providers share a binding and result only when their complete API Keys are identical; distinct Keys are isolated and require separate bindings. A single distinct 浏览器型供应商 credential may still use the sole validated browser session before it is explicitly bound. Each startup or reconnect begins with one session heartbeat; subsequent long polls carry only client identity and wait for explicit jobs. Heartbeats and job polls negotiate companion protocol version `2` plus an explicit capability set. Each claimed job receives a random one-time result proof bound to the exact client id, browser, and MV3 worker instance; stale or different clients cannot complete it. Client, session, waiter, and pending-job tables have hard limits, and expired clients are deleted rather than retained as inactive entries. Ordinary loopback callbacks have a 10,000 ms client timeout, 25,000 ms server long polls have a 30,000 ms client timeout, and each 120-poll batch hands off immediately instead of waiting for the next one-minute alarm. A complete provider query, broker callback wait, and browser job use aligned 45,000 / 44,000 / 40,000 ms deadlines. Browser jobs carry the host expiration time and reserve 2,000 ms to deliver their result. The extension-context request is the fast path for an existing browser session; an awake same-origin tab is a bounded fallback. Each transport attempt is limited to 8,000 ms, and an HTML or Cloudflare challenge response is classified from its headers without waiting for an unbounded response body. `Content-Length` is only an early oversize guard because Fetch exposes decoded bytes; completion requires either a valid complete JSON value or stream end. A polling iteration reuses one configuration snapshot, repeated status/session values are not rewritten, and event-driven heartbeats are coalesced as a single-flight 350 ms trailing update. New API sites such as 浏览器型供应商 and 浏览器型供应商 are never restored from arbitrary Cookie presence alone. The provider response is authoritative: successful responses retain the hint, while an explicit authentication failure removes it; ordinary provider or WAF failures preserve the last validated hint. A connected companion may attempt the real same-origin query even before a hint is restored, so a host restart cannot be misclassified as logout. Each Hub provider card exposes a safe “模板” dialog for independent balance/request selection plus the actual request URL, method, authentication category, executor, browser/WAF dependency, and current normalized source; credentials are never included.
+The companion stores its companion-only pairing secret, stable client id, browser scope, validated HTTPS origins, and the numeric New API user id required beside browser cookies in `chrome.storage.local`; it never persists Cookie values, API Keys, bearer tokens, or localStorage source text. Edge and Chrome may connect simultaneously with independent client ids and sessions. The host publishes only an opaque client reference to Hub and uses it for explicit “在 Chrome / Edge 验证” actions. Account ownership probes compare masked token listings locally. A finite-Key WAF fallback is the explicit exception: the allowlisted `Authorization` header may exist transiently in the selected service worker for one same-origin request, but is never written to extension storage, Hub state, or logs.
+
+Companion protocol version `3` uses a secret that is separate from the Hub management URL. Every request and response is HMAC-SHA256 authenticated over method/status, exact path/query, timestamp, nonce, and body hash; the host rejects expired or replayed nonces, and the worker verifies the response is bound to its request nonce. Jobs are restricted to `query-json` and `open-login`, HTTPS same-origin URLs, and an explicit header allowlist. Each claimed job also receives a one-time result proof bound to the exact client id, browser, and MV3 worker instance. Client, session, waiter, and pending-job tables have hard limits, and expired clients are deleted. Ordinary callbacks use a 10,000 ms client timeout, 25,000 ms server long polls use a 30,000 ms client timeout, and each 120-poll batch hands off immediately. Complete provider/broker/browser deadlines remain 45,000 / 44,000 / 40,000 ms. Browser jobs reserve 2,000 ms for delivery; each transport attempt is limited to 8,000 ms, decoded response bodies are bounded, and HTML/Cloudflare responses are classified without unbounded reads. Provider responses remain authoritative for session hints, and no balance query creates or activates a third-party tab.
 
 The loopback Hub origin is a required host permission. HTTPS is only an optional permission envelope; each heartbeat supplies the exact origins required by the current provider templates, and the popup requests only those origins after an explicit user click. Before every provider job the worker checks the exact origin with `chrome.permissions.contains`; a withheld Edge/Chrome site-access permission is reported as a website-permission problem, never as a logged-out browser session.
 
@@ -127,9 +135,9 @@ $root = (Get-Location).Path
   -InstallRoot $root
 ```
 
-`stop-host.ps1` does not close Codex. When Codex is already running with port `9334`, `launch.ps1` reuses that Codex process and starts only the workspace host.
+`stop-host.ps1` does not close Codex. When Codex is already running with any safe loopback CDP port, `launch.ps1` discovers and reuses that Codex process and starts only the workspace host.
 
-If only an ordinary Codex process without port `9334` is running, workspace development mode stops and reports that hot update is unavailable; it does not ask Codex to close. A user-facing installed shortcut passes the explicit `-AllowCodexRestart` authority. With that authority, `launch.ps1` asks Codex to close normally and restarts it with CDP enabled; if Codex has not exited after 10 seconds, it still asks before force-terminating because that can interrupt active work or unsent input.
+If only an ordinary Codex process without a safe loopback CDP port is running, workspace development mode stops and reports that hot update is unavailable; it does not ask Codex to close. A user-facing installed shortcut passes the explicit `-AllowCodexRestart` authority. With that authority, `launch.ps1` asks Codex to close normally and restarts it on a random loopback port; if Codex has not exited after 10 seconds, it still asks before force-terminating because that can interrupt active work or unsent input.
 
 While the workspace host is active, do not click “Codex + CCSwitch 用量” on the desktop or Start menu. Those shortcuts intentionally point to the stable EXE installation.
 
@@ -298,13 +306,13 @@ The following sequence is forbidden during ordinary development:
 stop or close ChatGPT.exe → restart Codex → reload plugin
 ```
 
-Never call `scripts\stop.ps1` for a development reload because it intentionally terminates the Codex process tree. If port `9334` is not available on the existing Codex process, stop and report the condition instead of restarting Codex without explicit user approval.
+Never call `scripts\stop.ps1` for a development reload because it intentionally terminates the Codex process tree and is not shipped in v2 packages. If the existing Codex process has no safe loopback CDP port, stop and report the condition instead of restarting Codex without explicit user approval.
 
 ### Injector changes
 
 If a change affects UI, CSS, DOM structure, responsive behavior, observers, event handlers, tooltips, or injected page helpers, increment the current `INJECTOR_VERSION` integer in `src\injector-script.mjs` by one. Do not copy a fixed example value from this document. Without a version increase, an already-open Codex page can keep the previous injector because the target session sees the same installed version.
 
-Changes limited to the host, SQLite repository, quota request, evaluator, CDP transport, or PowerShell scripts do not require an injector version increase.
+Changes limited to the host, SQLite repository, provider adapters, CDP transport, or launcher scripts do not require an injector version increase.
 
 ## 5. Return to the stable EXE without packaging
 
@@ -350,17 +358,18 @@ After the user gives that confirmation and development behavior is satisfactory:
 ```powershell
 Set-Location 'D:\software\CodexCCSwitchUsage'
 npm test
+$env:CODEXCCSWITCH_SIGNING_THUMBPRINT = '<current-user code-signing certificate thumbprint>'
 npm run build:exe
 ```
 
 The build script validates all of the following before producing an installer:
 
-- Node is version 22 or newer;
-- Node architecture is x64;
+- Node exactly matches `package.json` `bundledNodeVersion` and is x64;
 - `node:sqlite` loads successfully;
 - the .NET Framework launcher compiles;
-- the launcher can find and execute the bundled Node runtime;
-- Inno Setup successfully compiles the installer.
+- the launcher verifies the embedded SHA-256 payload manifest and can execute the bundled Node runtime;
+- the launcher, installer, and generated uninstaller are Authenticode signed with an RFC 3161 timestamp;
+- Inno Setup successfully compiles and verifies the installer.
 
 The result is written to:
 
@@ -374,9 +383,9 @@ dist\CodexCCSwitchUsage-Setup-<version>.exe
 
 Every v2 GitHub Release must publish five artifacts from the same versioned tag:
 
-1. `CodexCCSwitchUsage-Setup-<version>.exe`;
-2. `CodexCCSwitchUsage-macos-arm64-<version>.tar.gz`;
-3. `CodexCCSwitchUsage-macos-x64-<version>.tar.gz`;
+1. `CodexCCSwitchUsage-Setup-<version>.exe`, with a valid Authenticode signature;
+2. `CodexCCSwitchUsage-macos-arm64-<version>.zip`, Developer ID signed and Apple-notarized;
+3. `CodexCCSwitchUsage-macos-x64-<version>.zip`, Developer ID signed and Apple-notarized;
 4. `CCSwitch-Browser-Companion-<companion-version>.zip`;
 5. `CCSwitch-Browser-Companion-<companion-version>.crx`, signed with the persistent browser-companion private key.
 
@@ -390,7 +399,7 @@ npm run release:github -- `
   -NotesFile .\release-notes.md
 ```
 
-`scripts\publish-release.ps1` refuses to publish when the remote tag, Windows installer, macOS packages, release notes, ZIP contents, signed CRX3 package, or private signing key are missing. It appends the macOS installation instructions, browser-companion instructions, and all five SHA-256 values to the release body, then creates or updates the GitHub Release. Use `-DryRun` to build and validate the five assets without changing GitHub. The signing key defaults to `%LOCALAPPDATA%\CodexCCSwitchUsage\signing\ccswitch-browser-companion.pem`; it is outside the repository and must be backed up securely. `-CreateSigningKey` is only for intentionally establishing a new extension identity.
+`scripts\publish-release.ps1` refuses to publish when the remote tag, valid Windows Authenticode signature, hash-bound macOS notarization records, release notes, ZIP contents, signed CRX3 package, or private CRX signing key are missing. It appends installation instructions and all five SHA-256 values to the release body, then creates or updates the GitHub Release. Use `-DryRun` to validate without changing GitHub. The CRX signing key defaults to `%LOCALAPPDATA%\CodexCCSwitchUsage\signing\ccswitch-browser-companion.pem`; it is outside the repository and must be backed up securely.
 
 ## 7. Install or upgrade the stable EXE
 
@@ -412,7 +421,7 @@ After installation, verify:
 
 ```powershell
 $stable = 'D:\software\CodexCCSwitchUsageApp\CodexCCSwitchUsage'
-& "$stable\scripts\status.ps1" -InstallRoot $stable
+Get-Content -LiteralPath (Join-Path $stable 'runtime\status.json') -Raw | ConvertFrom-Json
 ```
 
 The registered application name is `Codex CCSwitch Usage <version>` and it can be removed from Windows “Installed apps”.
@@ -436,7 +445,7 @@ winget install `
   --accept-package-agreements
 ```
 
-The EXE is currently unsigned because it is for personal use. Windows may show an unknown-publisher warning. Do not claim it is signed.
+Formal builds require `CODEXCCSWITCH_SIGNING_THUMBPRINT` to identify a CurrentUser code-signing certificate with a private key. `scripts\build-exe.ps1 -AllowUnsigned` exists only for private local smoke artifacts and must never be published. Formal macOS builds run on macOS with `CODEXCCSWITCH_MACOS_SIGNING_IDENTITY` and `CODEXCCSWITCH_MACOS_NOTARY_PROFILE`; their release ZIP is created with macOS `ditto` so signing metadata and the stapled ticket survive distribution. The explicit `-AllowUnsigned` macOS mode only creates a reproducible private `tar.gz` and is likewise non-release.
 
 ## 9. Uninstall rules
 
