@@ -1,9 +1,11 @@
-export const COMPANION_PROTOCOL_VERSION = 2;
+export const COMPANION_PROTOCOL_VERSION = 3;
 export const COMPANION_CAPABILITIES = Object.freeze([
   'query-json-v1',
   'open-login-v1',
   'session-hints-v1',
   'job-claim-proof-v1',
+  'mutual-hmac-v1',
+  'constrained-request-v1',
 ]);
 
 // One provider query owns 45 seconds. The broker stops waiting at 44 seconds,

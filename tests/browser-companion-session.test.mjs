@@ -427,12 +427,19 @@ test('browser companion bounds loopback traffic, transport attempts, and result 
   assert.match(source, /const HUB_POLL_TIMEOUT_MS = 30_000/);
   assert.match(source, /async function requestHub\(/);
   assert.match(source, /signal: controller\.signal/);
+  assert.match(source, /readLimitedResponseText\(response, MAX_BROWSER_RESPONSE_BYTES, 'Balance Hub 响应过大'\)/);
+  assert.doesNotMatch(source.slice(source.indexOf('async function requestHub('), source.indexOf('async function cookieSessions(')), /response\.text\(\)/);
   assert.equal(BROWSER_FETCH_ATTEMPT_TIMEOUT_MS, 8_000);
   assert.equal(BROWSER_RESULT_DELIVERY_RESERVE_MS, 2_000);
   assert.match(source, /function browserAttemptTime\(deadline\)/);
   assert.match(query, /fetchInsideTab\([^;]*browserAttemptTime\(deadline\)/s);
   assert.match(query, /fetchFromExtension\([^;]*browserAttemptTime\(deadline\)/s);
   assert.match(source, /hostExpiresAt - BROWSER_RESULT_DELIVERY_RESERVE_MS/);
+  assert.match(source, /const MAX_COMPANION_RESULT_REQUEST_BYTES = 2_000_000/);
+  assert.match(source, /JSON\.stringify\(\{ \.\.\.claim, ok: true, value \}\)/);
+  assert.match(source, /浏览器查询结果过大，无法安全回传/);
+  assert.match(source, /\.slice\(0, 500\)/);
+  assert.equal((source.match(/redirect: 'error'/g) || []).length, 3);
 });
 
 test('browser companion migrates copied client identity into a browser-scoped identity', () => {
@@ -445,6 +452,17 @@ test('browser companion migrates copied client identity into a browser-scoped id
   assert.match(configSource, /chrome\.storage\.local\.set\(\{ clientId, clientBrowser: currentBrowser \}\)/);
   assert.match(source, /browser: resolved\.browser/);
   assert.match(source, /browser: current\.browser/);
+});
+
+test('browser companion removes the legacy management token while preserving the re-pair prompt', () => {
+  const source = fs.readFileSync(new URL('../browser-companion/background.js', import.meta.url), 'utf8');
+  const configSource = source.slice(source.indexOf('async function config()'), source.indexOf('function updateStatus('));
+
+  assert.match(configSource, /pairingUpgradeRequired/);
+  assert.match(configSource, /chrome\.storage\.local\.set\(\{ pairingUpgradeRequired: true \}\)/);
+  assert.match(configSource, /obsoleteKeys\.push\('hubToken'\)/);
+  assert.match(configSource, /chrome\.storage\.local\.remove\(obsoleteKeys\)/);
+  assert.equal(source.slice(source.indexOf('async function requestHub(')).includes('/api/${token}'), false);
 });
 
 test('only an explicit login job may create or focus a website tab', () => {
@@ -485,7 +503,7 @@ test('successful browser queries remember user identity and explicit auth failur
 test('a successful browser job never submits a synthetic failure when result delivery fails', () => {
   const source = fs.readFileSync(new URL('../browser-companion/background.js', import.meta.url), 'utf8');
   const poll = source.slice(source.indexOf('async function pollOnce('), source.indexOf('async function startPolling('));
-  const successPost = poll.indexOf("{ ...claim, ok: true, value }");
+  const successPost = poll.lastIndexOf("{ ...claim, ok: true, value }");
   const failurePost = poll.indexOf("{\n      ...claim,\n      ok: false,");
 
   assert.ok(successPost >= 0, 'successful jobs must submit their actual value');
@@ -537,7 +555,7 @@ test('each polling iteration reuses one config and persists lastError only when 
   const source = fs.readFileSync(new URL('../browser-companion/background.js', import.meta.url), 'utf8');
   const poll = source.slice(source.indexOf('async function pollOnce('), source.indexOf('async function startPolling('));
   const polling = source.slice(source.indexOf('async function startPolling('), source.indexOf('async function wake('));
-  const status = source.slice(source.indexOf('function updateStatus('), source.indexOf('function apiUrl('));
+  const status = source.slice(source.indexOf('function updateStatus('), source.indexOf('function sameOrigins('));
 
   assert.match(poll, /async function pollOnce\(current\)/);
   assert.doesNotMatch(poll, /\bconfig\(\)/);

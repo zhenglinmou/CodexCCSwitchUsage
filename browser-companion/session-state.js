@@ -36,17 +36,21 @@ export function browserResponseMetadata(status, contentType, cfMitigated) {
   };
 }
 
-export async function readLimitedResponseText(response, maximumBytes = MAX_BROWSER_RESPONSE_BYTES) {
+export async function readLimitedResponseText(
+  response,
+  maximumBytes = MAX_BROWSER_RESPONSE_BYTES,
+  oversizedMessage = '第三方网站响应过大',
+) {
   const limit = Math.max(1, Math.trunc(Number(maximumBytes) || MAX_BROWSER_RESPONSE_BYTES));
   const contentLengthHeader = response?.headers?.get?.('content-length');
   const contentLength = contentLengthHeader == null || String(contentLengthHeader).trim() === ''
     ? null
     : Number(contentLengthHeader);
-  if (Number.isFinite(contentLength) && contentLength > limit) throw new Error('第三方网站响应过大');
+  if (Number.isFinite(contentLength) && contentLength > limit) throw new Error(oversizedMessage);
 
   if (!response?.body || typeof response.body.getReader !== 'function') {
     const text = await response.text();
-    if (new TextEncoder().encode(text).byteLength > limit) throw new Error('第三方网站响应过大');
+    if (new TextEncoder().encode(text).byteLength > limit) throw new Error(oversizedMessage);
     return text;
   }
 
@@ -67,7 +71,7 @@ export async function readLimitedResponseText(response, maximumBytes = MAX_BROWS
       const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
       receivedBytes += bytes.byteLength;
       if (receivedBytes > limit) {
-        const error = new Error('第三方网站响应过大');
+        const error = new Error(oversizedMessage);
         cancel(error);
         throw error;
       }

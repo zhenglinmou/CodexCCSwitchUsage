@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CCSwitch Balance Browser Companion",
-  "version": "0.1.25",
+  "version": "0.1.26",
   "description": "Use the current browser profile and its existing website sessions for CCSwitch Balance Hub callbacks.",
   "permissions": [
     "alarms",

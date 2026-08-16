@@ -10,10 +10,67 @@ import {
 function normalizeOrigin(value) {
   try {
     const url = new URL(String(value || ''));
-    return url.protocol === 'https:' ? url.origin : '';
+    return url.protocol === 'https:' && url.hostname && !url.username && !url.password ? url.origin : '';
   } catch {
     return '';
   }
+}
+
+const ALLOWED_BROWSER_HEADERS = new Map([
+  ['accept', 'Accept'],
+  ['authorization', 'Authorization'],
+  ['chatgpt-account-id', 'ChatGPT-Account-Id'],
+  ['new-api-user', 'New-Api-User'],
+]);
+
+function normalizeBrowserHeaders(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const headers = {};
+  for (const [rawName, rawValue] of Object.entries(value)) {
+    const name = ALLOWED_BROWSER_HEADERS.get(String(rawName || '').trim().toLowerCase());
+    const headerValue = String(rawValue ?? '');
+    if (!name) throw new Error(`浏览器任务包含不允许的请求头: ${String(rawName || '').slice(0, 80)}`);
+    if (!headerValue || headerValue.length > 16_384 || /[\r\n\0]/.test(headerValue)) {
+      throw new Error(`浏览器任务请求头无效: ${name}`);
+    }
+    headers[name] = headerValue;
+  }
+  return headers;
+}
+
+export function normalizeBrowserJobRequest(type, request = {}) {
+  const jobType = String(type || '');
+  if (!['query-json', 'open-login'].includes(jobType)) throw new Error('浏览器任务类型无效');
+  const origin = normalizeOrigin(request.baseUrl || request.loginUrl || request.origin);
+  if (!origin) throw new Error('浏览器任务必须使用有效的 HTTPS Origin');
+  let requestPath = String(request.requestPath || '/').trim();
+  if (!requestPath.startsWith('/') || requestPath.length > 2_048 || /[\r\n\0]/.test(requestPath)) {
+    throw new Error('浏览器任务请求路径无效');
+  }
+  const requestUrl = new URL(requestPath, origin);
+  if (requestUrl.origin !== origin || requestUrl.username || requestUrl.password || requestUrl.hash) {
+    throw new Error('浏览器任务请求必须保持 HTTPS 同源');
+  }
+  requestPath = `${requestUrl.pathname}${requestUrl.search}`;
+  let loginUrl = '';
+  if (request.loginUrl) {
+    const candidate = new URL(String(request.loginUrl));
+    if (candidate.protocol !== 'https:' || candidate.origin !== origin || candidate.username || candidate.password || candidate.hash) {
+      throw new Error('浏览器任务登录地址必须保持 HTTPS 同源');
+    }
+    loginUrl = candidate.href;
+  }
+  const userHeader = String(request.userHeader || '').trim();
+  if (userHeader && userHeader.toLowerCase() !== 'new-api-user') throw new Error('浏览器任务用户标识请求头无效');
+  return {
+    baseUrl: origin,
+    requestPath,
+    headers: normalizeBrowserHeaders(request.headers),
+    ...(loginUrl ? { loginUrl } : {}),
+    ...(userHeader ? { userHeader: 'New-Api-User' } : {}),
+    navigateRequest: request.navigateRequest === true,
+    origin,
+  };
 }
 
 function cleanClientId(value) {
@@ -309,7 +366,13 @@ export class BrowserCallbackBroker {
     if (this.pending.size >= this.maxPendingJobs) return Promise.reject(new Error('浏览器余额任务数量已达到上限'));
     const signal = options?.signal;
     if (signal?.aborted) return Promise.reject(signal.reason || new Error('浏览器余额回调已取消'));
-    const origin = normalizeOrigin(request?.baseUrl || request?.loginUrl || request?.origin);
+    let safeRequest;
+    try {
+      safeRequest = normalizeBrowserJobRequest(type, request);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const origin = safeRequest.origin;
     const targetClientKey = String(options?.targetClientKey || '');
     if (targetClientKey && !this.#isActiveClientKey(targetClientKey)) {
       return Promise.reject(new Error('指定的浏览器余额伴侣未连接'));
@@ -323,7 +386,7 @@ export class BrowserCallbackBroker {
       protocolVersion: COMPANION_PROTOCOL_VERSION,
       createdAt: new Date(createdAt).toISOString(),
       expiresAt: new Date(createdAt + timeoutMs).toISOString(),
-      request: { ...request, origin },
+      request: safeRequest,
     };
     return new Promise((resolve, reject) => {
       const cleanup = () => signal?.removeEventListener('abort', abort);

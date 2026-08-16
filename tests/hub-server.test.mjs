@@ -6,7 +6,32 @@ import path from 'node:path';
 import test from 'node:test';
 import { BrowserCallbackBroker } from '../src/browser-callback-broker.mjs';
 import { getOrCreateHubToken, HubServer, isAllowedHubHost } from '../src/hub-server.mjs';
+import { COMPANION_API_PREFIX, signCompanionRequest } from '../src/companion-auth.mjs';
+import { verifyCompanionResponse } from '../browser-companion/auth.js';
 import { companionHandshake } from '../browser-companion/protocol.js';
+
+const COMPANION_TOKEN = 'companion-test-token-0000000000000001';
+
+async function companionFetch(server, pathSuffix, options = {}) {
+  const method = String(options.method || 'GET').toUpperCase();
+  const body = String(options.body || '');
+  const target = `${COMPANION_API_PREFIX}${pathSuffix}`;
+  const authentication = signCompanionRequest(COMPANION_TOKEN, { method, target, body });
+  const response = await fetch(`http://127.0.0.1:${server.boundPort}${target}`, {
+    ...options,
+    method,
+    body: method === 'GET' || method === 'HEAD' ? undefined : body,
+    headers: { ...(options.headers || {}), ...authentication.headers },
+  });
+  const text = response.status === 204 ? '' : await response.text();
+  await verifyCompanionResponse(COMPANION_TOKEN, {
+    requestNonce: authentication.nonce,
+    status: response.status,
+    body: text,
+    headers: response.headers,
+  });
+  return { response, payload: text ? JSON.parse(text) : null };
+}
 
 test('Hub path token persists across host restarts without becoming guessable', t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hub-token-'));
@@ -18,6 +43,18 @@ test('Hub path token persists across host restarts without becoming guessable', 
 
   assert.equal(first, second);
   assert.match(first, /^[A-Za-z0-9_-]{32}$/);
+});
+
+test('Hub replaces an oversized token file without reading it as a credential', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hub-large-token-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const filename = path.join(directory, 'hub-token');
+  fs.writeFileSync(filename, 'x');
+  fs.truncateSync(filename, 1_000_000);
+
+  const token = getOrCreateHubToken(filename);
+  assert.match(token, /^[A-Za-z0-9_-]{32}$/);
+  assert.equal(fs.statSync(filename).size, 32);
 });
 
 test('Hub health uses the lightweight service summary instead of building full provider state', async t => {
@@ -41,6 +78,23 @@ test('Hub health uses the lightweight service summary instead of building full p
   assert.equal(payload.providers, 20);
   assert.equal(payload.refreshing, true);
   assert.equal(summaryCalls, 1);
+});
+
+test('Hub listener applies bounded local connection lifetimes', async t => {
+  const server = new HubServer({ getSummary: () => ({ providers: 0, refreshing: false }) }, {
+    port: 0,
+    token: 'test-token',
+    companionToken: COMPANION_TOKEN,
+    openUrl() {},
+  });
+  await server.start();
+  t.after(() => server.close());
+
+  assert.equal(server.server.maxConnections, 128);
+  assert.equal(server.server.headersTimeout, 10_000);
+  assert.equal(server.server.requestTimeout, 30_000);
+  assert.equal(server.server.keepAliveTimeout, 5_000);
+  assert.equal(server.server.maxRequestsPerSocket, 1_000);
 });
 
 test('Hub server protects its local page and API with an unguessable path token', async t => {
@@ -110,6 +164,7 @@ test('Hub server protects its local page and API with an unguessable path token'
   const server = new HubServer(service, {
     port: 0,
     token: 'test-token',
+    companionToken: COMPANION_TOKEN,
     openUrl() {},
     diagnostics: () => ({
       appVersion: '2.0.10', injectorVersion: 82, expectedCompanionVersion: '0.1.24',
@@ -167,6 +222,18 @@ test('Hub server protects its local page and API with an unguessable path token'
   assert.equal(companionPayload.diagnostics.injectorVersion, 82);
   assert.equal(companionPayload.diagnostics.apiKey, undefined);
   assert.equal(companionPayload.browserOrigins, undefined, 'the five-second companion status stays lightweight');
+  const pairing = await fetch(`http://127.0.0.1:${server.boundPort}/api/test-token/companion/pairing`);
+  assert.equal(pairing.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await pairing.json(), { success: true, companionToken: COMPANION_TOKEN });
+  assert.notEqual(server.token, server.companionToken);
+  const managementSignedTarget = `${COMPANION_API_PREFIX}/heartbeat`;
+  const managementSigned = signCompanionRequest(server.token, {
+    method: 'POST', target: managementSignedTarget, body: '{}',
+  });
+  const managementAuthAttempt = await fetch(`http://127.0.0.1:${server.boundPort}${managementSignedTarget}`, {
+    method: 'POST', headers: managementSigned.headers, body: '{}',
+  });
+  assert.equal(managementAuthAttempt.status, 401, 'the management URL token must not authenticate companion requests');
 
   const preferenceUpdate = await fetch(`http://127.0.0.1:${server.boundPort}/api/test-token/preferences`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -381,7 +448,7 @@ test('Hub server can retry after its port is released', async t => {
   assert.equal(url, `http://127.0.0.1:${port}/hub/test-token`);
 });
 
-test('browser companion jobs and callbacks share the Hub server and token', async t => {
+test('browser companion jobs and callbacks use a separate mutually authenticated channel', async t => {
   const service = {
     getState: () => ({ version: 2, providers: [] }),
     listPublicProviders: () => [],
@@ -392,16 +459,21 @@ test('browser companion jobs and callbacks share the Hub server and token', asyn
     listBrowserOrigins: () => ['https://relay.example'],
   };
   const broker = new BrowserCallbackBroker();
-  const server = new HubServer(service, { port: 0, token: 'test-token', browserBroker: broker, openUrl() {} });
+  const server = new HubServer(service, {
+    port: 0,
+    token: 'test-token',
+    companionToken: COMPANION_TOKEN,
+    browserBroker: broker,
+    openUrl() {},
+  });
   await server.start();
   t.after(async () => { broker.close(); await server.close(); });
-  const api = `http://127.0.0.1:${server.boundPort}/api/test-token`;
-  const heartbeat = await fetch(`${api}/companion/heartbeat`, {
+  const heartbeat = await companionFetch(server, '/heartbeat', {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ ...companionHandshake(), clientId: 'edge-client-one', instanceId: 'edge-worker-one', browser: 'Edge', sessions: ['https://anyrouter.top'] }),
   });
-  assert.equal(heartbeat.status, 200);
-  assert.deepEqual((await heartbeat.json()).providerOrigins, ['https://relay.example']);
+  assert.equal(heartbeat.response.status, 200);
+  assert.deepEqual(heartbeat.payload.providerOrigins, ['https://relay.example']);
 
   const resultPromise = broker.queryJson({ baseUrl: 'https://anyrouter.top', requestPath: '/api/user/self' });
   const sessionQuery = new URLSearchParams({
@@ -411,18 +483,23 @@ test('browser companion jobs and callbacks share the Hub server and token', asyn
   for (const capability of companionHandshake().capabilities) sessionQuery.append('capability', capability);
   sessionQuery.append('session', 'https://anyrouter.top');
   sessionQuery.append('session', 'https://chatgpt.com');
-  const jobResponse = await fetch(`${api}/companion/job?${sessionQuery}`);
-  const job = (await jobResponse.json()).job;
+  const jobResponse = await companionFetch(server, `/job?${sessionQuery}`);
+  const job = jobResponse.payload.job;
   assert.equal(broker.hasSession('https://chatgpt.com'), true);
-  const callback = await fetch(`${api}/companion/result/${job.id}`, {
+  const callback = await companionFetch(server, `/result/${job.id}`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       clientId: 'edge-client-one', instanceId: 'edge-worker-one', browser: 'Edge', claimToken: job.claimToken,
       ok: true, value: { status: 200, text: '{"success":true}' },
     }),
   });
-  assert.equal(callback.status, 200);
+  assert.equal(callback.response.status, 200);
   assert.deepEqual(await resultPromise, { status: 200, text: '{"success":true}' });
+
+  const legacy = await fetch(`http://127.0.0.1:${server.boundPort}/api/test-token/companion/heartbeat`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(legacy.status, 404);
 });
 
 test('disconnecting a companion long poll removes its broker waiter immediately', async t => {
@@ -431,7 +508,13 @@ test('disconnecting a companion long poll removes its broker waiter immediately'
     listPublicProviders: () => [],
   };
   const broker = new BrowserCallbackBroker();
-  const server = new HubServer(service, { port: 0, token: 'test-token', browserBroker: broker, openUrl() {} });
+  const server = new HubServer(service, {
+    port: 0,
+    token: 'test-token',
+    companionToken: COMPANION_TOKEN,
+    browserBroker: broker,
+    openUrl() {},
+  });
   await server.start();
   t.after(async () => { broker.close(); await server.close(); });
 
@@ -441,9 +524,7 @@ test('disconnecting a companion long poll removes its broker waiter immediately'
   });
   for (const capability of companionHandshake().capabilities) query.append('capability', capability);
   const controller = new AbortController();
-  const poll = fetch(`http://127.0.0.1:${server.boundPort}/api/test-token/companion/job?${query}`, {
-    signal: controller.signal,
-  });
+  const poll = companionFetch(server, `/job?${query}`, { signal: controller.signal });
   for (let attempt = 0; attempt < 50 && broker.waiters.length === 0; attempt += 1) {
     await new Promise(resolve => setTimeout(resolve, 2));
   }

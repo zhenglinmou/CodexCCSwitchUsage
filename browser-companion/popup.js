@@ -89,8 +89,8 @@ async function wakeHub() {
 }
 
 async function load() {
-  const stored = await chrome.storage.local.get(['hubToken']);
-  tokenInput.value = stored.hubToken || '';
+  const stored = await chrome.storage.local.get(['companionToken']);
+  tokenInput.value = stored.companionToken || '';
   let result;
   try {
     result = await sendRuntimeMessage({ type: 'status' });
@@ -99,7 +99,7 @@ async function load() {
     return;
   }
   const permissionsGranted = await refreshWebsiteOrigins(result);
-  if (!result.configured) return show('尚未配置 Hub 连接码');
+  if (!result.configured) return show(result.legacyPairingRequired ? '安全协议已升级，请从 Hub 重新复制连接码' : '尚未配置 Hub 连接码');
   if (websiteOrigins.length && !permissionsGranted) {
     return show(`已连接本机 Hub，等待授权 ${websiteOrigins.length} 个供应商站点`, 'error');
   }
@@ -113,7 +113,8 @@ async function load() {
 save.addEventListener('click', async () => {
   const token = tokenInput.value.trim();
   if (!/^[A-Za-z0-9_-]{32,128}$/.test(token)) return show('连接码格式不正确', 'error');
-  await chrome.storage.local.set({ hubToken: token, lastError: '' });
+  await chrome.storage.local.set({ companionToken: token, lastError: '' });
+  await chrome.storage.local.remove(['hubToken', 'pairingUpgradeRequired']);
   show('正在连接…');
   try {
     await wakeHub();
@@ -151,7 +152,12 @@ grantSites.addEventListener('click', () => {
 openHub.addEventListener('click', async () => {
   const token = tokenInput.value.trim();
   if (!token) return show('请先填写连接码', 'error');
-  await chrome.tabs.create({ url: `http://127.0.0.1:17891/hub/${encodeURIComponent(token)}` });
+  try {
+    const result = await sendRuntimeMessage({ type: 'open-hub' });
+    if (!result.opened) throw new Error(result.error || 'Hub 未能打开');
+  } catch (error) {
+    show(`打开失败：${error.message}`, 'error');
+  }
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {

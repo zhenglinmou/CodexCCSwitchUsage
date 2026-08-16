@@ -23,13 +23,16 @@ import {
   BROWSER_RESULT_DELIVERY_RESERVE_MS,
   companionHandshake,
 } from './protocol.js';
+import { buildCompanionAuth, verifyCompanionResponse } from './auth.js';
 
 const HUB_ORIGIN = 'http://127.0.0.1:17891';
+const COMPANION_API_PREFIX = '/companion/v3';
 const POLL_ALARM = 'ccswitch-balance-companion-poll';
 const HEARTBEAT_DEBOUNCE_MS = 350;
 const HUB_REQUEST_TIMEOUT_MS = 10_000;
 const HUB_POLL_TIMEOUT_MS = 30_000;
 const POLL_BATCH_SIZE = 120;
+const MAX_COMPANION_RESULT_REQUEST_BYTES = 2_000_000;
 const PROVIDER_ORIGINS_KEY = 'providerWebsiteOrigins';
 const PENDING_ORIGINS_KEY = 'pendingWebsiteOrigins';
 const manifest = chrome.runtime.getManifest();
@@ -63,7 +66,18 @@ function browserName() {
 }
 
 async function config() {
-  const stored = await chrome.storage.local.get(['hubToken', 'clientId', 'clientBrowser', 'lastError']);
+  const stored = await chrome.storage.local.get([
+    'companionToken', 'hubToken', 'pairingUpgradeRequired', 'clientId', 'clientBrowser', 'lastError',
+  ]);
+  const legacyPairingRequired = !stored.companionToken
+    && Boolean(stored.hubToken || stored.pairingUpgradeRequired);
+  if (stored.hubToken && !stored.companionToken) {
+    await chrome.storage.local.set({ pairingUpgradeRequired: true });
+  }
+  const obsoleteKeys = [];
+  if (stored.hubToken) obsoleteKeys.push('hubToken');
+  if (stored.companionToken && stored.pairingUpgradeRequired) obsoleteKeys.push('pairingUpgradeRequired');
+  if (obsoleteKeys.length) await chrome.storage.local.remove(obsoleteKeys);
   const currentBrowser = browserName();
   let clientId = stored.clientId;
   if (
@@ -74,7 +88,13 @@ async function config() {
     await chrome.storage.local.set({ clientId, clientBrowser: currentBrowser });
   }
   lastErrorValue = String(stored.lastError || '');
-  return { token: String(stored.hubToken || '').trim(), clientId, browser: currentBrowser, lastError: lastErrorValue };
+  return {
+    token: String(stored.companionToken || '').trim(),
+    legacyPairingRequired,
+    clientId,
+    browser: currentBrowser,
+    lastError: lastErrorValue,
+  };
 }
 
 function updateStatus({ lastHeartbeatAt, lastError } = {}) {
@@ -94,10 +114,6 @@ function updateStatus({ lastHeartbeatAt, lastError } = {}) {
     return true;
   });
   return statusUpdateChain;
-}
-
-function apiUrl(token, path) {
-  return `${HUB_ORIGIN}/api/${encodeURIComponent(token)}${path}`;
 }
 
 function sameOrigins(left, right) {
@@ -142,12 +158,35 @@ async function watchedSessionOrigins() {
   ]);
 }
 
-async function requestHub(url, options = {}, timeoutMs = HUB_REQUEST_TIMEOUT_MS) {
+async function requestHub(token, path, options = {}, timeoutMs = HUB_REQUEST_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
-    const payload = response.status === 204 ? null : await response.json();
+    const method = String(options.method || 'GET').toUpperCase();
+    const body = String(options.body || '');
+    const target = `${COMPANION_API_PREFIX}${path}`;
+    const authentication = await buildCompanionAuth(token, { method, target, body });
+    const response = await fetch(`${HUB_ORIGIN}${target}`, {
+      ...options,
+      method,
+      redirect: 'error',
+      headers: { ...(options.headers || {}), ...authentication.headers },
+      signal: controller.signal,
+    });
+    const text = response.status === 204
+      ? ''
+      : await readLimitedResponseText(response, MAX_BROWSER_RESPONSE_BYTES, 'Balance Hub 响应过大');
+    await verifyCompanionResponse(token, {
+      requestNonce: authentication.nonce,
+      status: response.status,
+      body: text,
+      headers: response.headers,
+    });
+    let payload = null;
+    if (text) {
+      try { payload = JSON.parse(text); }
+      catch { throw new Error('Balance Hub 返回了无效 JSON'); }
+    }
     return { response, payload };
   } finally {
     clearTimeout(timer);
@@ -174,7 +213,7 @@ async function knownSessions() {
 }
 
 async function post(token, path, body) {
-  const { response, payload } = await requestHub(apiUrl(token, path), {
+  const { response, payload } = await requestHub(token, path, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
@@ -195,7 +234,7 @@ async function performHeartbeat(current) {
     ...companionHandshake(),
     sessions: await knownSessions(),
   };
-  const result = await post(resolved.token, '/companion/heartbeat', payload);
+  const result = await post(resolved.token, '/heartbeat', payload);
   const providerOrigins = Array.isArray(result?.providerOrigins)
     ? await replaceStoredOrigins(PROVIDER_ORIGINS_KEY, result.providerOrigins)
     : normalizeSessionOrigins((await chrome.storage.local.get([PROVIDER_ORIGINS_KEY]))?.[PROVIDER_ORIGINS_KEY]);
@@ -331,6 +370,7 @@ async function fetchInsideTab(tabId, request, timeoutMs) {
           method: 'GET',
           credentials: 'include',
           cache: 'no-store',
+          redirect: 'error',
           headers: outgoing,
           signal: controller.signal,
         });
@@ -391,6 +431,7 @@ async function fetchFromExtension(request, userId, timeoutMs) {
       method: 'GET',
       credentials: 'include',
       cache: 'no-store',
+      redirect: 'error',
       headers: outgoing,
       signal: controller.signal,
     });
@@ -532,7 +573,8 @@ async function pollOnce(current) {
   });
   for (const capability of handshake.capabilities) query.append('capability', capability);
   const { response, payload } = await requestHub(
-    apiUrl(current.token, `/companion/job?${query}`),
+    current.token,
+    `/job?${query}`,
     { cache: 'no-store' },
     HUB_POLL_TIMEOUT_MS,
   );
@@ -570,16 +612,20 @@ async function pollOnce(current) {
       await sessionHints.forget(sessionOrigin);
       await sessionIdentities.forget(sessionOrigin);
     }
+    const serialized = JSON.stringify({ ...claim, ok: true, value });
+    if (new TextEncoder().encode(serialized).byteLength > MAX_COMPANION_RESULT_REQUEST_BYTES) {
+      throw new Error('浏览器查询结果过大，无法安全回传');
+    }
   } catch (error) {
-    await post(current.token, `/companion/result/${encodeURIComponent(job.id)}`, {
+    await post(current.token, `/result/${encodeURIComponent(job.id)}`, {
       ...claim,
       ok: false,
-      message: error instanceof Error ? error.message : String(error),
+      message: String(error instanceof Error ? error.message : error).slice(0, 500),
     });
     scheduleHeartbeat();
     return true;
   }
-  await post(current.token, `/companion/result/${encodeURIComponent(job.id)}`, { ...claim, ok: true, value });
+  await post(current.token, `/result/${encodeURIComponent(job.id)}`, { ...claim, ok: true, value });
   if (outcome) scheduleHeartbeat();
   return true;
 }
@@ -664,12 +710,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     Promise.all([config(), chrome.storage.local.get(['lastHeartbeatAt', PROVIDER_ORIGINS_KEY, PENDING_ORIGINS_KEY])]).then(([current, state]) => {
       sendResponse({
         configured: Boolean(current.token),
+        legacyPairingRequired: current.legacyPairingRequired,
         lastHeartbeatAt: state.lastHeartbeatAt || '',
         lastError: current.lastError,
         providerOrigins: normalizeSessionOrigins(state[PROVIDER_ORIGINS_KEY]),
         pendingOrigins: normalizeSessionOrigins(state[PENDING_ORIGINS_KEY]),
       });
     });
+    return true;
+  }
+  if (message?.type === 'open-hub') {
+    config().then(current => {
+      if (!current.token) throw new Error('请先配置 Hub 连接码');
+      return post(current.token, '/open-hub', {});
+    }).then(() => sendResponse({ opened: true }), error => sendResponse({ opened: false, error: error.message }));
     return true;
   }
   return false;

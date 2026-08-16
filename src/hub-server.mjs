@@ -5,6 +5,8 @@ import path from 'node:path';
 import { buildHubPage } from './hub-page.mjs';
 import { HubPreferences } from './hub-preferences.mjs';
 import { openExternalUrl } from './platform.mjs';
+import { CompanionAuthenticator, COMPANION_API_PREFIX } from './companion-auth.mjs';
+import { secureAtomicWriteFileSync, secureCreateFileSync } from './secure-files.mjs';
 
 function isLoopbackRequest(request) {
   const value = request?.socket?.remoteAddress || '';
@@ -31,7 +33,7 @@ export function isAllowedHubHost(value, port) {
   }
 }
 
-function readBody(request, maximumBytes = 16_384) {
+function readRawBody(request, maximumBytes = 16_384) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
@@ -45,11 +47,21 @@ function readBody(request, maximumBytes = 16_384) {
       chunks.push(chunk);
     });
     request.on('end', () => {
-      try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}); }
-      catch { reject(new Error('请求 JSON 无效')); }
+      resolve(chunks.length ? Buffer.concat(chunks) : Buffer.alloc(0));
     });
     request.on('error', reject);
   });
+}
+
+async function readBody(request, maximumBytes = 16_384) {
+  const raw = await readRawBody(request, maximumBytes);
+  try { return raw.length ? JSON.parse(raw.toString('utf8')) : {}; }
+  catch { throw new Error('请求 JSON 无效'); }
+}
+
+function parseBody(raw) {
+  try { return raw.length ? JSON.parse(raw.toString('utf8')) : {}; }
+  catch { throw new Error('请求 JSON 无效'); }
 }
 
 function jsonResponse(response, status, payload) {
@@ -63,15 +75,29 @@ function jsonResponse(response, status, payload) {
   response.end(body);
 }
 
+function readStoredHubToken(tokenPath) {
+  try {
+    const stats = fs.statSync(tokenPath);
+    if (!stats.isFile() || stats.size <= 0 || stats.size > 256) return '';
+    const token = fs.readFileSync(tokenPath, 'utf8').trim();
+    return /^[A-Za-z0-9_-]{32,128}$/.test(token) ? token : '';
+  } catch {
+    return '';
+  }
+}
+
 export function getOrCreateHubToken(tokenPath) {
   if (!tokenPath) return crypto.randomBytes(24).toString('base64url');
-  try {
-    const existing = fs.readFileSync(tokenPath, 'utf8').trim();
-    if (/^[A-Za-z0-9_-]{32,128}$/.test(existing)) return existing;
-  } catch {}
+  const existing = readStoredHubToken(tokenPath);
+  if (existing) {
+    if (process.platform !== 'win32') try { fs.chmodSync(tokenPath, 0o600); } catch {}
+    return existing;
+  }
   const token = crypto.randomBytes(24).toString('base64url');
-  fs.mkdirSync(path.dirname(tokenPath), { recursive: true });
-  fs.writeFileSync(tokenPath, token, { encoding: 'utf8', mode: 0o600 });
+  if (secureCreateFileSync(tokenPath, token, { encoding: 'utf8' })) return token;
+  const winner = readStoredHubToken(tokenPath);
+  if (winner) return winner;
+  secureAtomicWriteFileSync(tokenPath, token, { encoding: 'utf8' });
   return token;
 }
 
@@ -83,6 +109,8 @@ export class HubServer {
     this.diagnostics = typeof options.diagnostics === 'function' ? options.diagnostics : () => ({});
     this.port = Number.isFinite(Number(options.port)) ? Number(options.port) : 17891;
     this.token = options.token || getOrCreateHubToken(options.tokenPath);
+    this.companionToken = options.companionToken || getOrCreateHubToken(options.companionTokenPath);
+    this.companionAuthenticator = new CompanionAuthenticator(this.companionToken, options.companionAuthOptions);
     this.openUrl = options.openUrl || (url => openExternalUrl(url));
     this.server = null;
     this.boundPort = 0;
@@ -160,6 +188,11 @@ export class HubServer {
           jsonResponse(response, 500, { success: false, message: error.message });
         });
       });
+      server.maxConnections = 128;
+      server.headersTimeout = 10_000;
+      server.requestTimeout = 30_000;
+      server.keepAliveTimeout = 5_000;
+      server.maxRequestsPerSocket = 1_000;
       this.server = server;
       try {
         await this.#listen(server, this.port);
@@ -200,6 +233,10 @@ export class HubServer {
       return;
     }
     const url = new URL(request.url || '/', `http://127.0.0.1:${this.boundPort || 80}`);
+    if (url.pathname === COMPANION_API_PREFIX || url.pathname.startsWith(`${COMPANION_API_PREFIX}/`)) {
+      await this.#handleCompanion(request, response, url);
+      return;
+    }
     const crossSite = String(request.headers['sec-fetch-site'] || '').toLowerCase() === 'cross-site';
     if (crossSite && (url.pathname.startsWith('/v1/') || url.pathname.startsWith('/usage/'))) {
       jsonResponse(response, 403, { success: false, message: 'Cross-site browser requests are not allowed' });
@@ -274,6 +311,10 @@ export class HubServer {
       });
       return;
     }
+    if (request.method === 'GET' && url.pathname === `${this.apiPath}/companion/pairing`) {
+      jsonResponse(response, 200, { success: true, companionToken: this.companionToken });
+      return;
+    }
     if (request.method === 'GET' && url.pathname === `${this.apiPath}/preferences`) {
       jsonResponse(response, 200, { success: true, preferences: this.preferences.get() });
       return;
@@ -330,72 +371,6 @@ export class HubServer {
       jsonResponse(response, result?.notFound ? 404 : 200, result);
       return;
     }
-    if (request.method === 'POST' && url.pathname === `${this.apiPath}/companion/heartbeat`) {
-      if (!this.browserBroker) throw new Error('浏览器伴侣回调未启用');
-      const body = await readBody(request);
-      jsonResponse(response, 200, {
-        success: true,
-        companion: this.browserBroker.heartbeat(body),
-        providerOrigins: this.service.listBrowserOrigins?.() || [],
-      });
-      return;
-    }
-    if (request.method === 'POST' && url.pathname === `${this.apiPath}/companion/session`) {
-      if (!this.browserBroker) throw new Error('浏览器伴侣回调未启用');
-      const body = await readBody(request);
-      const accepted = this.browserBroker.noteSession(body.clientId, body.origin, body.browser);
-      jsonResponse(response, accepted ? 200 : 400, { success: accepted });
-      return;
-    }
-    if (request.method === 'GET' && url.pathname === `${this.apiPath}/companion/job`) {
-      if (!this.browserBroker) throw new Error('浏览器伴侣回调未启用');
-      const sessions = url.searchParams.has('sessionsKnown') || url.searchParams.has('session')
-        ? url.searchParams.getAll('session')
-        : undefined;
-      const pollController = new AbortController();
-      const abortPoll = () => pollController.abort();
-      const closePoll = () => {
-        if (!response.writableEnded) abortPoll();
-      };
-      request.once('aborted', abortPoll);
-      response.once('close', closePoll);
-      let job;
-      try {
-        job = await this.browserBroker.nextJob({
-          clientId: url.searchParams.get('clientId'),
-          instanceId: url.searchParams.get('instanceId'),
-          browser: url.searchParams.get('browser'),
-          version: url.searchParams.get('version'),
-          protocolVersion: url.searchParams.get('protocolVersion'),
-          capabilities: url.searchParams.getAll('capability'),
-          sessions,
-        }, 25_000, { signal: pollController.signal });
-      } finally {
-        request.off('aborted', abortPoll);
-        response.off('close', closePoll);
-      }
-      if (pollController.signal.aborted || response.destroyed) return;
-      if (!job) {
-        response.writeHead(204, { 'cache-control': 'no-store' });
-        response.end();
-      } else {
-        jsonResponse(response, 200, { success: true, job });
-      }
-      return;
-    }
-    const companionResultMatch = url.pathname.match(new RegExp(`^${this.apiPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/companion/result/([^/]+)$`));
-    if (request.method === 'POST' && companionResultMatch) {
-      if (!this.browserBroker) throw new Error('浏览器伴侣回调未启用');
-      const body = await readBody(request, 2_100_000);
-      const { clientId, instanceId, browser, claimToken, ...result } = body;
-      const accepted = this.browserBroker.complete(
-        decodeURIComponent(companionResultMatch[1]),
-        result,
-        { clientId, instanceId, browser, claimToken },
-      );
-      jsonResponse(response, accepted ? 200 : 404, { success: accepted });
-      return;
-    }
     if (request.method === 'POST' && url.pathname === `${this.apiPath}/refresh`) {
       const body = await readBody(request);
       const providerSelector = String(body.providerId || '').trim();
@@ -441,6 +416,109 @@ export class HubServer {
       return;
     }
     jsonResponse(response, 404, { success: false, message: 'Not found' });
+  }
+
+  async #handleCompanion(request, response, url) {
+    const resultMatch = url.pathname.match(/^\/companion\/v3\/result\/([^/]+)$/);
+    const maximumBytes = resultMatch ? 2_100_000 : 16_384;
+    let raw = Buffer.alloc(0);
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      try {
+        raw = await readRawBody(request, maximumBytes);
+      } catch {
+        jsonResponse(response, 413, { success: false, message: '请求内容过大' });
+        return;
+      }
+    }
+    let authentication;
+    try {
+      authentication = this.companionAuthenticator.verifyRequest(request, url, raw);
+    } catch {
+      jsonResponse(response, 401, { success: false, message: '浏览器伴侣认证失败' });
+      return;
+    }
+    const send = (status, payload) => this.#companionResponse(response, status, payload, authentication.nonce);
+    try {
+      if (!this.browserBroker) throw new Error('浏览器伴侣回调未启用');
+      if (request.method === 'POST' && url.pathname === `${COMPANION_API_PREFIX}/heartbeat`) {
+        const body = parseBody(raw);
+        send(200, {
+          success: true,
+          companion: this.browserBroker.heartbeat(body),
+          providerOrigins: this.service.listBrowserOrigins?.() || [],
+        });
+        return;
+      }
+      if (request.method === 'POST' && url.pathname === `${COMPANION_API_PREFIX}/session`) {
+        const body = parseBody(raw);
+        const accepted = this.browserBroker.noteSession(body.clientId, body.origin, body.browser);
+        send(accepted ? 200 : 400, { success: accepted });
+        return;
+      }
+      if (request.method === 'POST' && url.pathname === `${COMPANION_API_PREFIX}/open-hub`) {
+        this.open();
+        send(200, { success: true });
+        return;
+      }
+      if (request.method === 'GET' && url.pathname === `${COMPANION_API_PREFIX}/job`) {
+        const sessions = url.searchParams.has('sessionsKnown') || url.searchParams.has('session')
+          ? url.searchParams.getAll('session')
+          : undefined;
+        const pollController = new AbortController();
+        const abortPoll = () => pollController.abort();
+        const closePoll = () => {
+          if (!response.writableEnded) abortPoll();
+        };
+        request.once('aborted', abortPoll);
+        response.once('close', closePoll);
+        let job;
+        try {
+          job = await this.browserBroker.nextJob({
+            clientId: url.searchParams.get('clientId'),
+            instanceId: url.searchParams.get('instanceId'),
+            browser: url.searchParams.get('browser'),
+            version: url.searchParams.get('version'),
+            protocolVersion: url.searchParams.get('protocolVersion'),
+            capabilities: url.searchParams.getAll('capability'),
+            sessions,
+          }, 25_000, { signal: pollController.signal });
+        } finally {
+          request.off('aborted', abortPoll);
+          response.off('close', closePoll);
+        }
+        if (pollController.signal.aborted || response.destroyed) return;
+        send(job ? 200 : 204, job ? { success: true, job } : null);
+        return;
+      }
+      if (request.method === 'POST' && resultMatch) {
+        const body = parseBody(raw);
+        const { clientId, instanceId, browser, claimToken, ...result } = body;
+        const accepted = this.browserBroker.complete(
+          decodeURIComponent(resultMatch[1]),
+          result,
+          { clientId, instanceId, browser, claimToken },
+        );
+        send(accepted ? 200 : 404, { success: accepted });
+        return;
+      }
+      send(404, { success: false, message: 'Not found' });
+    } catch (error) {
+      if (!response.destroyed && !response.writableEnded) {
+        send(error?.message === '请求 JSON 无效' ? 400 : 500, { success: false, message: error?.message || '浏览器伴侣请求失败' });
+      }
+    }
+  }
+
+  #companionResponse(response, status, payload, requestNonce) {
+    const body = payload == null ? Buffer.alloc(0) : Buffer.from(JSON.stringify(payload));
+    response.writeHead(status, {
+      ...(payload == null ? {} : { 'content-type': 'application/json; charset=utf-8' }),
+      'content-length': body.length,
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+      ...this.companionAuthenticator.signResponse(requestNonce, status, body),
+    });
+    response.end(body);
   }
 
   open() {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { BrowserCallbackBroker } from '../src/browser-callback-broker.mjs';
+import { BrowserCallbackBroker, normalizeBrowserJobRequest } from '../src/browser-callback-broker.mjs';
 import {
   BROWSER_CALLBACK_TIMEOUT_MS,
   COMPANION_PROTOCOL_VERSION,
@@ -14,6 +14,17 @@ const claim = (job, values = {}) => ({
   instanceId: '',
   claimToken: job.claimToken,
   ...values,
+});
+
+test('browser job normalization rejects credentials and cross-origin request paths', () => {
+  assert.throws(
+    () => normalizeBrowserJobRequest('query-json', { baseUrl: 'https://user:password@example.com', requestPath: '/usage' }),
+    /有效的 HTTPS Origin/,
+  );
+  assert.throws(
+    () => normalizeBrowserJobRequest('query-json', { baseUrl: 'https://example.com', requestPath: '//other.example/usage' }),
+    /保持 HTTPS 同源/,
+  );
 });
 
 test('browser callback broker delivers a query and resolves its callback', async () => {
