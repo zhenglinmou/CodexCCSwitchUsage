@@ -4,7 +4,7 @@
 
 This document is the operational guide for developing, testing, running, packaging, upgrading, and rolling back CodexCCSwitchUsage on this computer.
 
-The current v3 source metadata is application version `3.0.1`, injector version `95`, and browser-companion version `0.1.28`. Read `package.json` and `browser-companion\manifest.json` when starting a later release; the values below describe the current checkout and are not a substitute for those files.
+The current v3 source metadata is application version `3.0.2`, injector version `95`, and browser-companion version `0.1.28`. Read `package.json` and `browser-companion\manifest.json` when starting a later release; the values below describe the current checkout and are not a substitute for those files.
 
 ## 1. Source of truth and generated copies
 

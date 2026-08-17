@@ -141,7 +141,7 @@ function Assert-CompanionZip {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [IO.Compression.ZipFile]::OpenRead($Path)
     try {
-        $entries = @($zip.Entries | ForEach-Object FullName)
+        $entries = @($zip.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
         $required = @(
             'browser-companion/manifest.json',
             'browser-companion/background.js',
@@ -150,7 +150,10 @@ function Assert-CompanionZip {
             'browser-companion/README.md'
         )
         $missing = @($required | Where-Object { $_ -notin $entries })
-        if ($missing.Count) { throw ('Browser companion ZIP is missing: ' + ($missing -join ', ')) }
+        if ($missing.Count) {
+            $sample = @($entries | Select-Object -First 12) -join ', '
+            throw ('Browser companion ZIP is missing: ' + ($missing -join ', ') + ". Entries: $sample")
+        }
     } finally {
         $zip.Dispose()
     }
@@ -225,7 +228,11 @@ $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('codexccswitch-release-' + [gu
 try {
     [IO.Directory]::CreateDirectory($tempRoot) | Out-Null
     $zipWork = Join-Path $tempRoot 'browser-companion.zip'
-    Compress-Archive -LiteralPath $companionRoot -DestinationPath $zipWork -CompressionLevel Optimal
+    $zipStage = Join-Path $tempRoot 'zip-stage'
+    [IO.Directory]::CreateDirectory($zipStage) | Out-Null
+    $zipCompanionRoot = Join-Path $zipStage 'browser-companion'
+    Copy-Item -LiteralPath $companionRoot -Destination $zipCompanionRoot -Recurse -Force
+    Compress-Archive -Path (Join-Path $zipStage '*') -DestinationPath $zipWork -CompressionLevel Optimal
     Assert-CompanionZip -Path $zipWork
     Copy-Item -LiteralPath $zipWork -Destination $zipPath -Force
 

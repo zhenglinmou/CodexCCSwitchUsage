@@ -147,7 +147,11 @@ test('GitHub releases always package and explain the browser companion', () => {
   const userGuide = read('docs/V3.md');
 
   assert.equal(packageJson.scripts['release:github'].includes('scripts/publish-release.ps1'), true);
-  assert.match(publish, /Compress-Archive/);
+  assert.match(publish, /\$zipStage = Join-Path \$tempRoot 'zip-stage'/);
+  assert.match(publish, /\$zipCompanionRoot = Join-Path \$zipStage 'browser-companion'/);
+  assert.match(publish, /Copy-Item -LiteralPath \$companionRoot -Destination \$zipCompanionRoot -Recurse -Force/);
+  assert.match(publish, /Compress-Archive -Path \(Join-Path \$zipStage '\*'\)/);
+  assert.match(publish, /\.FullName\.Replace\('\\', '\/'\)/);
   assert.match(publish, /--pack-extension-key=/);
   assert.match(publish, /CreateSigningKey/);
   assert.match(publish, /\[switch\]\$AllowUnsigned/);

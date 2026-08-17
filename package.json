@@ -1,6 +1,6 @@
 {
   "name": "codex-ccswitch-usage",
-  "version": "3.0.1",
+  "version": "3.0.2",
   "bundledNodeVersion": "22.22.1",
   "private": true,
   "type": "module",
