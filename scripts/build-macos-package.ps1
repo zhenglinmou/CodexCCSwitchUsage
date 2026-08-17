@@ -20,7 +20,7 @@ if ($signedBuild -and (-not $CodeSignIdentity -or -not $NotaryProfile)) {
 }
 if ($signedBuild -and -not $isMacPlatform) { throw 'Developer ID signing and notarization must run on macOS.' }
 if (-not $signedBuild -and -not $AllowUnsigned) {
-    throw 'A Developer ID identity and notarytool Keychain profile are required. Pass -AllowUnsigned only for private test artifacts.'
+    throw 'A Developer ID identity and notarytool Keychain profile are required. Pass -AllowUnsigned only for intentionally labeled unsigned artifacts.'
 }
 if (-not $NodeVersion) { $NodeVersion = [string]$manifest.bundledNodeVersion }
 if ($NodeVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'package.json bundledNodeVersion must be an exact semantic version.' }

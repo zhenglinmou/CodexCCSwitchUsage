@@ -4,7 +4,7 @@
 
 This document is the operational guide for developing, testing, running, packaging, upgrading, and rolling back CodexCCSwitchUsage on this computer.
 
-The current v3 source metadata is application version `3.0.0`, injector version `95`, and browser-companion version `0.1.28`. Read `package.json` and `browser-companion\manifest.json` when starting a later release; the values below describe the current checkout and are not a substitute for those files.
+The current v3 source metadata is application version `3.0.1`, injector version `95`, and browser-companion version `0.1.28`. Read `package.json` and `browser-companion\manifest.json` when starting a later release; the values below describe the current checkout and are not a substitute for those files.
 
 ## 1. Source of truth and generated copies
 
@@ -382,13 +382,15 @@ dist\CodexCCSwitchUsage-Setup-<version>.exe
 
 ### GitHub Release assets are mandatory
 
-Every v3 GitHub Release must publish five artifacts from the same versioned tag:
+Every v3 GitHub Release must publish five artifacts from the same versioned tag. The preferred trusted release set is:
 
 1. `CodexCCSwitchUsage-Setup-<version>.exe`, with a valid Authenticode signature;
 2. `CodexCCSwitchUsage-macos-arm64-<version>.zip`, Developer ID signed and Apple-notarized;
 3. `CodexCCSwitchUsage-macos-x64-<version>.zip`, Developer ID signed and Apple-notarized;
 4. `CCSwitch-Browser-Companion-<companion-version>.zip`;
 5. `CCSwitch-Browser-Companion-<companion-version>.crx`, signed with the persistent browser-companion private key.
+
+When the maintainer explicitly authorizes a public unsigned release because platform certificates are unavailable, build both platform packages with `-AllowUnsigned` and publish with `scripts\publish-release.ps1 -AllowUnsigned`. That mode keeps the five-asset requirement but uses an unsigned Windows EXE plus `CodexCCSwitchUsage-macos-<arch>-<version>.tar.gz` packages. The release title and generated installation section must clearly identify the unsigned status, SmartScreen/Gatekeeper warnings, and SHA-256 verification steps. End users never configure the maintainer signing variables.
 
 The release body must explain that the companion is required only when All API Hub needs an existing browser login, Cookie, or WAF query. It must also give the ZIP loading steps and state that a signed, non-store CRX can still be blocked by Chrome or Edge. Never upload the private `.pem` key.
 
@@ -401,6 +403,8 @@ npm run release:github -- `
 ```
 
 `scripts\publish-release.ps1` refuses to publish when the remote tag, valid Windows Authenticode signature, hash-bound macOS notarization records, release notes, ZIP contents, signed CRX3 package, or private CRX signing key are missing. It appends installation instructions and all five SHA-256 values to the release body, then creates or updates the GitHub Release. Use `-DryRun` to validate without changing GitHub. The CRX signing key defaults to `%LOCALAPPDATA%\CodexCCSwitchUsage\signing\ccswitch-browser-companion.pem`; it is outside the repository and must be backed up securely.
+
+The sole exception is the explicit `-AllowUnsigned` publication mode described above. It relaxes only the Windows Authenticode and macOS Developer ID/notarization checks, switches macOS assets to `.tar.gz`, and injects the unsigned warning. The browser companion CRX remains signed with its persistent private key, all hashes are still verified, and omitting `-AllowUnsigned` preserves the strict gate.
 
 ## 7. Install or upgrade the stable EXE
 
@@ -446,7 +450,7 @@ winget install `
   --accept-package-agreements
 ```
 
-Formal builds require `CODEXCCSWITCH_SIGNING_THUMBPRINT` to identify a CurrentUser code-signing certificate with a private key. `scripts\build-exe.ps1 -AllowUnsigned` exists only for private local smoke artifacts and must never be published. Formal macOS builds run on macOS with `CODEXCCSWITCH_MACOS_SIGNING_IDENTITY` and `CODEXCCSWITCH_MACOS_NOTARY_PROFILE`; their release ZIP is created with macOS `ditto` so signing metadata and the stapled ticket survive distribution. The explicit `-AllowUnsigned` macOS mode only creates a reproducible private `tar.gz` and is likewise non-release.
+Trusted builds require `CODEXCCSWITCH_SIGNING_THUMBPRINT` to identify a CurrentUser code-signing certificate with a private key. Trusted macOS builds run on macOS with `CODEXCCSWITCH_MACOS_SIGNING_IDENTITY` and `CODEXCCSWITCH_MACOS_NOTARY_PROFILE`; their release ZIP is created with macOS `ditto` so signing metadata and the stapled ticket survive distribution. These variables belong only on maintainer build machines and are never required from users. `-AllowUnsigned` is an explicit maintainer override for intentionally labeled unsigned artifacts; use it for local smoke builds or for a public unsigned Release only after that publication mode is specifically authorized.
 
 ## 9. Uninstall rules
 

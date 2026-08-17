@@ -11,6 +11,7 @@ param(
     [string]$BrowserExecutable = '',
     [string]$SigningKey = (Join-Path $env:LOCALAPPDATA 'CodexCCSwitchUsage\signing\ccswitch-browser-companion.pem'),
     [switch]$CreateSigningKey,
+    [switch]$AllowUnsigned,
     [switch]$DryRun
 )
 
@@ -194,18 +195,21 @@ if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
     throw "Build the versioned installer before publishing: $installer"
 }
 $installerSignature = Get-AuthenticodeSignature -LiteralPath $installer
-if ([string]$installerSignature.Status -ne 'Valid') {
+if (-not $AllowUnsigned -and [string]$installerSignature.Status -ne 'Valid') {
     throw "The Windows installer must have a valid Authenticode signature before release publishing: $($installerSignature.StatusMessage)"
 }
-$macArm64Package = Assert-WorkspaceChild (Join-Path $dist "CodexCCSwitchUsage-macos-arm64-$version.zip")
-$macX64Package = Assert-WorkspaceChild (Join-Path $dist "CodexCCSwitchUsage-macos-x64-$version.zip")
+$macPackageExtension = if ($AllowUnsigned) { 'tar.gz' } else { 'zip' }
+$macArm64Package = Assert-WorkspaceChild (Join-Path $dist "CodexCCSwitchUsage-macos-arm64-$version.$macPackageExtension")
+$macX64Package = Assert-WorkspaceChild (Join-Path $dist "CodexCCSwitchUsage-macos-x64-$version.$macPackageExtension")
 foreach ($macPackage in @($macArm64Package, $macX64Package)) {
     if (-not (Test-Path -LiteralPath $macPackage -PathType Leaf)) {
         throw "Build the macOS package before publishing: $macPackage"
     }
 }
-Assert-NotarizedMacPackage -Path $macArm64Package -Architecture 'arm64'
-Assert-NotarizedMacPackage -Path $macX64Package -Architecture 'x64'
+if (-not $AllowUnsigned) {
+    Assert-NotarizedMacPackage -Path $macArm64Package -Architecture 'arm64'
+    Assert-NotarizedMacPackage -Path $macX64Package -Architecture 'x64'
+}
 if (-not (Test-Path -LiteralPath $companionRoot -PathType Container)) {
     throw "Browser companion source is missing: $companionRoot"
 }
@@ -259,9 +263,18 @@ try {
     $crxHash = Get-FileSha256 -Path $crxPath
     $companionSectionPath = Join-Path $root 'docs\RELEASE_BROWSER_COMPANION_SECTION.md'
     $companionSection = [IO.File]::ReadAllText($companionSectionPath, $utf8)
+    $releaseMode = if ($AllowUnsigned) { 'UNSIGNED' } else { 'SIGNED' }
+    $trustNoticePath = Join-Path $root "docs\RELEASE_TRUST_$releaseMode.md"
+    $macPackageStatusPath = Join-Path $root "docs\RELEASE_MACOS_$releaseMode.md"
+    $trustNotice = ([IO.File]::ReadAllText($trustNoticePath, $utf8)).Trim()
+    $macPackageStatus = ([IO.File]::ReadAllText($macPackageStatusPath, $utf8)).Trim()
     $replacements = @{
         '{{COMPANION_VERSION}}' = $companionVersion
         '{{APP_VERSION}}' = $version
+        '{{RELEASE_TRUST_NOTICE}}' = $trustNotice
+        '{{MACOS_ARM64_FILENAME}}' = [IO.Path]::GetFileName($macArm64Package)
+        '{{MACOS_X64_FILENAME}}' = [IO.Path]::GetFileName($macX64Package)
+        '{{MACOS_PACKAGE_STATUS}}' = $macPackageStatus
         '{{INSTALLER_SHA256}}' = $installerHash
         '{{MACOS_ARM64_SHA256}}' = $macArm64Hash
         '{{MACOS_X64_SHA256}}' = $macX64Hash
@@ -274,6 +287,9 @@ try {
     if ($companionSection -notmatch '<!-- browser-companion-required:start -->' -or $companionSection -notmatch '<!-- browser-companion-required:end -->') {
         throw 'Browser companion release template is missing its required markers.'
     }
+    if ($companionSection -match '\{\{[A-Z0-9_]+\}\}') {
+        throw 'Release template contains an unresolved placeholder.'
+    }
     $renderedNotes = Join-Path $tempRoot 'release-notes.md'
     $renderedNotesContent = $notes + "`r`n`r`n" + $companionSection.Trim() + "`r`n"
     [IO.File]::WriteAllText($renderedNotes, $renderedNotesContent, $utf8)
@@ -282,10 +298,13 @@ try {
     }
 
     $assets = @($installer, $macArm64Package, $macX64Package, $zipPath, $crxPath)
+    $releaseTitle = if ($AllowUnsigned) { "$Tag (unsigned)" } else { $Tag }
     if ($DryRun) {
         [pscustomobject]@{
             dryRun = $true
+            unsigned = [bool]$AllowUnsigned
             tag = $Tag
+            title = $releaseTitle
             repository = $repositoryName
             installer = $installer
             macosArm64 = $macArm64Package
@@ -319,9 +338,9 @@ try {
     }
     if ($releaseExists) {
         Invoke-CheckedNative -FilePath $gh -Arguments (@('release', 'upload', $Tag) + $assets + @('--repo', $repositoryName, '--clobber')) -Description 'GitHub Release asset upload'
-        Invoke-CheckedNative -FilePath $gh -Arguments @('release', 'edit', $Tag, '--repo', $repositoryName, '--notes-file', $renderedNotes) -Description 'GitHub Release notes update'
+        Invoke-CheckedNative -FilePath $gh -Arguments @('release', 'edit', $Tag, '--repo', $repositoryName, '--title', $releaseTitle, '--notes-file', $renderedNotes) -Description 'GitHub Release notes update'
     } else {
-        Invoke-CheckedNative -FilePath $gh -Arguments (@('release', 'create', $Tag) + $assets + @('--repo', $repositoryName, '--verify-tag', '--title', $Tag, '--notes-file', $renderedNotes)) -Description 'GitHub Release creation'
+        Invoke-CheckedNative -FilePath $gh -Arguments (@('release', 'create', $Tag) + $assets + @('--repo', $repositoryName, '--verify-tag', '--title', $releaseTitle, '--notes-file', $renderedNotes)) -Description 'GitHub Release creation'
     }
 
     $release = (& $gh release view $Tag --repo $repositoryName --json url,assets,body | ConvertFrom-Json)
@@ -348,7 +367,9 @@ try {
 
     [pscustomobject]@{
         published = $true
+        unsigned = [bool]$AllowUnsigned
         tag = $Tag
+        title = $releaseTitle
         repository = $repositoryName
         release = $release.url
         installer = $installer

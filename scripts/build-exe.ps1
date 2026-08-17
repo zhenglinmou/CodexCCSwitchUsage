@@ -19,7 +19,7 @@ if ($expectedNodeVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'package.json bund
 $CertificateThumbprint = ([string]$CertificateThumbprint -replace '\s', '').ToUpperInvariant()
 $signingEnabled = [bool]$CertificateThumbprint
 if (-not $signingEnabled -and -not $AllowUnsigned) {
-    throw 'A code-signing certificate thumbprint is required. Set CODEXCCSWITCH_SIGNING_THUMBPRINT or pass -AllowUnsigned only for private test artifacts.'
+    throw 'A code-signing certificate thumbprint is required. Set CODEXCCSWITCH_SIGNING_THUMBPRINT or pass -AllowUnsigned only for intentionally labeled unsigned artifacts.'
 }
 if ($signingEnabled -and $CertificateThumbprint -notmatch '^[0-9A-F]{40}$') { throw 'The code-signing certificate thumbprint must be 40 hexadecimal characters.' }
 try { $timestampUri = [Uri]$TimestampUrl } catch { throw 'TimestampUrl is invalid.' }

@@ -140,6 +140,9 @@ test('GitHub releases always package and explain the browser companion', () => {
   const publish = read('scripts/publish-release.ps1');
   const template = read('docs/RELEASE_NOTES_TEMPLATE.md');
   const companionSection = read('docs/RELEASE_BROWSER_COMPANION_SECTION.md');
+  const signedTrust = read('docs/RELEASE_TRUST_SIGNED.md');
+  const unsignedTrust = read('docs/RELEASE_TRUST_UNSIGNED.md');
+  const unsignedMac = read('docs/RELEASE_MACOS_UNSIGNED.md');
   const development = read('DEVELOPMENT.md');
   const userGuide = read('docs/V3.md');
 
@@ -147,8 +150,15 @@ test('GitHub releases always package and explain the browser companion', () => {
   assert.match(publish, /Compress-Archive/);
   assert.match(publish, /--pack-extension-key=/);
   assert.match(publish, /CreateSigningKey/);
+  assert.match(publish, /\[switch\]\$AllowUnsigned/);
   assert.match(publish, /Get-AuthenticodeSignature/);
+  assert.match(publish, /if \(-not \$AllowUnsigned -and \[string\]\$installerSignature\.Status -ne 'Valid'\)/);
   assert.match(publish, /Assert-NotarizedMacPackage/);
+  assert.match(publish, /\$macPackageExtension = if \(\$AllowUnsigned\) \{ 'tar\.gz' \} else \{ 'zip' \}/);
+  assert.match(publish, /if \(-not \$AllowUnsigned\) \{[\s\S]*Assert-NotarizedMacPackage/);
+  assert.match(publish, /\$releaseTitle = if \(\$AllowUnsigned\)/);
+  assert.match(publish, /unsigned = \[bool\]\$AllowUnsigned/);
+  assert.match(publish, /Release template contains an unresolved placeholder/);
   assert.match(publish, /CRX3/);
   assert.match(publish, /Security\.Cryptography\.SHA256/);
   assert.doesNotMatch(publish, /Get-FileHash/);
@@ -162,6 +172,15 @@ test('GitHub releases always package and explain the browser companion', () => {
   assert.match(publish, /RELEASE_BROWSER_COMPANION_SECTION/);
   assert.match(companionSection, /浏览器伴侣/);
   assert.match(companionSection, /browser-companion-required:start/);
+  assert.match(companionSection, /\{\{RELEASE_TRUST_NOTICE\}\}/);
+  assert.match(companionSection, /\{\{MACOS_ARM64_FILENAME\}\}/);
+  assert.match(companionSection, /\{\{MACOS_X64_FILENAME\}\}/);
+  assert.match(companionSection, /\{\{MACOS_PACKAGE_STATUS\}\}/);
+  assert.match(signedTrust, /Authenticode/);
+  assert.match(unsignedTrust, /未签名/);
+  assert.match(unsignedTrust, /CODEXCCSWITCH_SIGNING_THUMBPRINT/);
+  assert.match(unsignedTrust, /普通用户不需要配置/);
+  assert.match(unsignedMac, /Gatekeeper/);
   assert.match(template, /scripts\/publish-release\.ps1/);
   assert.match(development, /release:github/);
   assert.match(userGuide, /CCSwitch-Browser-Companion/);
@@ -194,9 +213,9 @@ test('macOS release packages include both native architectures and writable app-
   assert.match(stopHost, /--all-instances/);
   assert.match(plist, /@VERSION@/);
   assert.match(plist, /@ARCH@/);
-  assert.match(publish, /CodexCCSwitchUsage-macos-arm64-\$version\.zip/);
-  assert.match(publish, /CodexCCSwitchUsage-macos-x64-\$version\.zip/);
-  assert.doesNotMatch(publish, /CodexCCSwitchUsage-macos-(?:arm64|x64)-\$version\.tar\.gz/);
+  assert.match(publish, /CodexCCSwitchUsage-macos-arm64-\$version\.\$macPackageExtension/);
+  assert.match(publish, /CodexCCSwitchUsage-macos-x64-\$version\.\$macPackageExtension/);
+  assert.match(publish, /'tar\.gz'/);
   assert.match(publish, /MACOS_ARM64_SHA256/);
   assert.match(publish, /MACOS_X64_SHA256/);
 });

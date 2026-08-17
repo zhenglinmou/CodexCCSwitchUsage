@@ -1,4 +1,6 @@
 <!-- browser-companion-required:start -->
+{{RELEASE_TRUST_NOTICE}}
+
 ## 浏览器伴侣
 
 **何时需要：** 当 All API Hub 明确提示需要复用浏览器登录态、Cookie 或 WAF 查询时，必须安装浏览器伴侣；可直接通过 API 查询余额的供应商不需要它。
@@ -12,10 +14,10 @@
 
 macOS 发布包按处理器架构分别提供：
 
-- `CodexCCSwitchUsage-macos-arm64-{{APP_VERSION}}.zip`：Apple Silicon。
-- `CodexCCSwitchUsage-macos-x64-{{APP_VERSION}}.zip`：Intel Mac。
+- `{{MACOS_ARM64_FILENAME}}`：Apple Silicon。
+- `{{MACOS_X64_FILENAME}}`：Intel Mac。
 
-解压后打开 `CodexCCSwitchUsage-macOS-<架构>.app`。正式发布包经过 Developer ID 签名、Apple 公证和 stapling；使用前需先让 Codex 以随机的 `127.0.0.1` CDP 端口启动，伴侣启动器会从根进程参数自动发现端口。运行时状态写入 `~/Library/Application Support/CodexCCSwitchUsage/runtime`，不会写入 `/Applications` 内的 app bundle。
+解压后打开 `CodexCCSwitchUsage-macOS-<架构>.app`。{{MACOS_PACKAGE_STATUS}} 使用前需先让 Codex 以随机的 `127.0.0.1` CDP 端口启动，伴侣启动器会从根进程参数自动发现端口。运行时状态写入 `~/Library/Application Support/CodexCCSwitchUsage/runtime`，不会写入 `/Applications` 内的 app bundle。
 
 ## 校验值
 
