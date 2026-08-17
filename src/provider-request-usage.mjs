@@ -21,6 +21,8 @@ const OPENAI_CODEX_SESSION_TEMPLATE_ID = 'openai-codex-session';
 const OPENAI_CODEX_SESSION_SOURCE = 'openai_codex_session';
 const CODEX_SESSION_FILE_LIMIT = 5_000;
 const CODEX_SESSION_INDEX_MAX_BYTES = 8_000_000;
+const CODEX_SESSION_COLD_SCAN_MAX_BYTES = 128 * 1024 * 1024;
+const CODEX_SESSION_INDEX_WRITE_DELAY_MS = 5_000;
 const CODEX_SESSION_APPEND_BOUNDARY_BYTES = 4_096;
 const CODEX_AUTH_MAX_BYTES = 1_000_000;
 const CODEX_SESSION_MAX_LINE_BYTES = 1_000_000;
@@ -83,6 +85,10 @@ function nonNegativeNumber(value) {
 
 function cleanText(value, maximum = 160) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maximum);
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw signal.reason || new Error('操作已取消');
 }
 
 function hostnameMatches(hostname, domain) {
@@ -322,7 +328,8 @@ async function* boundedUtf8Lines(input, maximumBytes = CODEX_SESSION_MAX_LINE_BY
   if (line) yield line.endsWith('\r') ? line.slice(0, -1) : line;
 }
 
-export async function listCodexSessionFiles(root, output, maximum) {
+export async function listCodexSessionFiles(root, output, maximum, signal = null) {
+  throwIfAborted(signal);
   if (!root) return false;
   if (output.length >= maximum) return true;
   let entries;
@@ -334,6 +341,7 @@ export async function listCodexSessionFiles(root, output, maximum) {
   let truncated = false;
   entries.sort((left, right) => right.name.localeCompare(left.name, 'en-US'));
   for (let index = 0; index < entries.length; index += 1) {
+    throwIfAborted(signal);
     if (output.length >= maximum) {
       truncated = true;
       break;
@@ -341,7 +349,7 @@ export async function listCodexSessionFiles(root, output, maximum) {
     const entry = entries[index];
     const filename = path.join(root, entry.name);
     if (entry.isDirectory()) {
-      truncated = (await listCodexSessionFiles(filename, output, maximum)) || truncated;
+      truncated = (await listCodexSessionFiles(filename, output, maximum, signal)) || truncated;
     } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.jsonl')) {
       try {
         const stat = await fs.promises.stat(filename);
@@ -399,6 +407,8 @@ export class CodexSessionUsageReader {
     this.maximumFiles = Math.max(1, Math.min(20_000, Number(options.maximumFiles) || CODEX_SESSION_FILE_LIMIT));
     this.maximumCachedFiles = Math.max(1, Math.min(5_000, Number(options.maximumCachedFiles) || 512));
     this.maximumItemsPerFile = Math.max(MAX_REQUEST_USAGE_LIMIT, Math.min(512, Number(options.maximumItemsPerFile) || 64));
+    this.maximumColdScanBytes = Math.max(1, Math.min(512 * 1024 * 1024, Number(options.maximumColdScanBytes) || CODEX_SESSION_COLD_SCAN_MAX_BYTES));
+    this.indexWriteDelayMs = Math.max(100, Math.min(60_000, Number(options.indexWriteDelayMs) || CODEX_SESSION_INDEX_WRITE_DELAY_MS));
     this.indexPath = String(options.indexPath || '');
     this.fileCache = new Map();
     this.fileScans = new Map();
@@ -406,12 +416,15 @@ export class CodexSessionUsageReader {
     this.persistedIndex = new Map();
     this.indexLoadPromise = null;
     this.indexWritePromise = Promise.resolve();
+    this.indexWriteTimer = null;
+    this.indexPersisted = false;
     this.indexRevision = 0;
     this.indexAccountId = '';
     this.accountBoundaryMs = 0;
   }
 
   async query(provider, options = {}) {
+    throwIfAborted(options.signal);
     const configuredAccountId = codexSessionAccountId(provider);
     const currentAccount = this.#currentAccount();
     const currentAccountId = currentAccount.accountId;
@@ -425,8 +438,8 @@ export class CodexSessionUsageReader {
     this.#applyAccountScope(currentAccountId, currentAccount.observedAtMs);
     const sessionFiles = [];
     const archivedFiles = [];
-    const sessionsTruncated = await listCodexSessionFiles(path.join(this.codexHome, 'sessions'), sessionFiles, this.maximumFiles);
-    const archivedSessionsTruncated = await listCodexSessionFiles(path.join(this.codexHome, 'archived_sessions'), archivedFiles, this.maximumFiles);
+    const sessionsTruncated = await listCodexSessionFiles(path.join(this.codexHome, 'sessions'), sessionFiles, this.maximumFiles, options.signal);
+    const archivedSessionsTruncated = await listCodexSessionFiles(path.join(this.codexHome, 'archived_sessions'), archivedFiles, this.maximumFiles, options.signal);
     const combinedFiles = [...sessionFiles, ...archivedFiles]
       .sort((left, right) => right.mtimeMs - left.mtimeMs || right.birthtimeMs - left.birthtimeMs || right.filename.localeCompare(left.filename));
     const combinedTruncated = combinedFiles.length > this.maximumFiles;
@@ -448,11 +461,22 @@ export class CodexSessionUsageReader {
     const items = [];
     let officialSessionCount = 0;
     let totalRecords = 0;
+    let coldScanBytes = 0;
+    let scanBudgetExceeded = false;
     let complete = !sessionsTruncated && !archivedSessionsTruncated && !combinedTruncated;
     for (let index = 0; index < files.length; index += 1) {
+      throwIfAborted(options.signal);
       const file = files[index];
       if (file.mtimeMs < this.accountBoundaryMs) continue;
+      const pendingScanBytes = this.#pendingScanBytes(file);
+      if (pendingScanBytes > 0 && coldScanBytes + pendingScanBytes > this.maximumColdScanBytes) {
+        scanBudgetExceeded = true;
+        complete = false;
+        break;
+      }
+      coldScanBytes += pendingScanBytes;
       const result = await this.#scanFile(file);
+      throwIfAborted(options.signal);
       if (!result.official || result.scopeEligible !== true) continue;
       const scopedItems = result.items.filter(item => Date.parse(item.createdAt) >= this.accountBoundaryMs);
       if (!scopedItems.length) continue;
@@ -478,13 +502,24 @@ export class CodexSessionUsageReader {
       const timeDifference = Date.parse(right.createdAt) - Date.parse(left.createdAt);
       return timeDifference || right.id.localeCompare(left.id);
     });
-    await this.#writeIndex();
+    if (!this.indexPersisted) await this.#persistInitialIndex();
+    else this.#scheduleIndexWrite();
     return {
       items: items.slice(0, limit),
       totalRecords,
       officialSessionCount,
       complete,
+      scanBudgetExceeded,
     };
+  }
+
+  async close() {
+    if (this.indexWriteTimer) {
+      clearTimeout(this.indexWriteTimer);
+      this.indexWriteTimer = null;
+    }
+    const persisted = await this.#writeIndex();
+    if (persisted) this.indexPersisted = true;
   }
 
   #currentAccount() {
@@ -509,6 +544,7 @@ export class CodexSessionUsageReader {
     this.persistedIndex.clear();
     this.indexAccountId = accountId;
     this.accountBoundaryMs = Math.max(0, Math.trunc(Number(observedAtMs) || Date.now()));
+    this.indexPersisted = false;
     this.indexDirty = true;
     this.indexRevision += 1;
   }
@@ -552,6 +588,20 @@ export class CodexSessionUsageReader {
       });
     this.fileScans.set(file.filename, { signature, promise });
     return promise;
+  }
+
+  #pendingScanBytes(file) {
+    const signature = `${file.size}:${file.mtimeMs}:${file.birthtimeMs}`;
+    const cached = this.fileCache.get(file.filename) || this.persistedIndex.get(file.filename);
+    if (cached?.signature === signature) return 0;
+    if (
+      cached
+      && cached.size < file.size
+      && Number(cached.birthtimeMs) === Number(file.birthtimeMs)
+      && cached.state?.canAppend === true
+      && this.#appendBoundaryMatches(file.filename, cached)
+    ) return Math.max(0, file.size - cached.size);
+    return Math.max(0, file.size);
   }
 
   async #scanFileUncached(filename, targetSize, previous = null) {
@@ -719,13 +769,14 @@ export class CodexSessionUsageReader {
         this.persistedIndex = index.files;
         this.indexAccountId = index.accountId;
         this.accountBoundaryMs = index.boundaryMs;
+        this.indexPersisted = index.persisted;
       });
     }
     await this.indexLoadPromise;
   }
 
   async #readIndex() {
-    const empty = () => ({ files: new Map(), accountId: '', boundaryMs: 0 });
+    const empty = () => ({ files: new Map(), accountId: '', boundaryMs: 0, persisted: false });
     if (!this.indexPath) return empty();
     try {
       if ((await fs.promises.stat(this.indexPath)).size > CODEX_SESSION_INDEX_MAX_BYTES) return empty();
@@ -742,17 +793,35 @@ export class CodexSessionUsageReader {
           : [];
         return [[filename, { ...entry, result: { ...entry.result, items } }]];
       }));
-      return { files, accountId, boundaryMs };
+      return { files, accountId, boundaryMs, persisted: true };
     } catch {
       return empty();
     }
   }
 
+  async #persistInitialIndex() {
+    if (this.indexWriteTimer) {
+      clearTimeout(this.indexWriteTimer);
+      this.indexWriteTimer = null;
+    }
+    const persisted = await this.#writeIndex();
+    if (persisted) this.indexPersisted = true;
+  }
+
+  #scheduleIndexWrite() {
+    if (!this.indexPath || !this.indexDirty || this.indexWriteTimer) return;
+    this.indexWriteTimer = setTimeout(() => {
+      this.indexWriteTimer = null;
+      void this.#writeIndex();
+    }, this.indexWriteDelayMs);
+    this.indexWriteTimer.unref?.();
+  }
+
   async #writeIndex() {
-    if (!this.indexPath) return;
+    if (!this.indexPath) return true;
     const previous = this.indexWritePromise;
     const operation = previous.catch(() => {}).then(async () => {
-      if (!this.indexDirty) return;
+      if (!this.indexDirty) return true;
       const revision = this.indexRevision;
       try {
         const candidates = [...this.persistedIndex.entries()]
@@ -773,12 +842,14 @@ export class CodexSessionUsageReader {
           files,
         }), { encoding: 'utf8' });
         if (this.indexRevision === revision) this.indexDirty = false;
+        return true;
       } catch {
+        return false;
       }
     });
     this.indexWritePromise = operation;
     try {
-      await operation;
+      return await operation;
     } finally {
       if (this.indexWritePromise === operation) this.indexWritePromise = Promise.resolve();
     }
@@ -1211,6 +1282,10 @@ export class ProviderRequestUsageEngine {
     this.statusCache.clear();
   }
 
+  async close() {
+    await this.codexSessionUsageReader?.close?.();
+  }
+
   async query(provider, options = {}) {
     const config = providerBackend(provider, options.requestUsageTemplateId);
     const limit = normalizeRequestUsageLimit(options.limit);
@@ -1237,8 +1312,10 @@ export class ProviderRequestUsageEngine {
       try {
         const sessionReader = this.codexSessionUsageReader
           || (this.codexSessionUsageReader = new CodexSessionUsageReader(this.codexSessionUsageOptions));
-        const sessionResult = await sessionReader.query(provider, { limit });
-        const warning = 'Token 来自 Codex 官方会话；ChatGPT 套餐不提供逐请求货币金额';
+        const sessionResult = await sessionReader.query(provider, { limit, signal: options.signal });
+        const warning = sessionResult.scanBudgetExceeded
+          ? 'Token 来自 Codex 官方会话；本次会话索引达到本地扫描上限，仅显示已完成扫描的最新记录；ChatGPT 套餐不提供逐请求货币金额'
+          : 'Token 来自 Codex 官方会话；ChatGPT 套餐不提供逐请求货币金额';
         return {
           ...base,
           success: true,
@@ -1262,6 +1339,7 @@ export class ProviderRequestUsageEngine {
           items: sessionResult.items,
         };
       } catch (error) {
+        throwIfAborted(options.signal);
         return failureResult(provider, config, limit, this.now, error, {
           supported: true,
           errorType: error?.code === 'ACCOUNT_SCOPE' ? 'account_scope' : 'local',

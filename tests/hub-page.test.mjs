@@ -159,10 +159,21 @@ test('Hub refreshes relative age labels while provider state is otherwise idle',
   const page = buildHubPage({ apiBase: '/api/test-token', nonce: 'test-nonce' });
   const companionLoad = page.slice(page.indexOf('async function loadCompanionStatus()'), page.indexOf('function cancelOperationMonitor()'));
 
-  assert.match(companionLoad, /Date\.now\(\)-lastRenderedAt>=60000/);
-  assert.match(companionLoad, /if\(shouldRender\)\{renderKey=nextRenderKey;render\(\)\}/);
+  assert.match(companionLoad, /const ageRefreshDue=Date\.now\(\)-lastRenderedAt>=60000/);
+  assert.match(companionLoad, /else if\(ageRefreshDue\)refreshRelativeAges\(\)/);
+  assert.match(page, /function refreshRelativeAges\(\)/);
+  assert.match(page, /\.cell-source \.cell-secondary/);
   assert.match(page, /title:'Hub 状态持久化'/);
   assert.match(page, /state\.cacheError\?\'error\':\'ok\'/);
+});
+
+test('Hub coalesces rapid search input into one animation-frame render', () => {
+  const page = buildHubPage({ apiBase: '/api/test-token', nonce: 'test-nonce' });
+
+  assert.match(page, /let searchRenderFrame=0/);
+  assert.match(page, /function scheduleSearchRender\(\)/);
+  assert.match(page, /requestAnimationFrame\(\(\)=>\{searchRenderFrame=0;render\(\)\}\)/);
+  assert.match(page, /searchInput\.addEventListener\('input',\(\)=>\{query=searchInput\.value;scheduleSearchRender\(\)\}\)/);
 });
 
 test('Hub resumes operation monitoring when loaded during an active refresh', () => {

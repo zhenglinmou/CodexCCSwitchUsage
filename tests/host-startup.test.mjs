@@ -17,7 +17,7 @@ test('host starts Balance Hub before its first one-shot main-page injection', ()
   assert.ok(loop.indexOf('requestCurrentProviderRefresh(false, true)') > targetSync, 'current CCSwitch provider may start its configured timer after injection');
 });
 
-test('v2 current-provider quota is sourced only from Balance Hub', () => {
+test('v3 current-provider quota is sourced only from Balance Hub', () => {
   const source = hostSource();
   const refresh = source.slice(source.indexOf('async function refreshCurrentProvider('), source.indexOf('async function syncTargets('));
 
@@ -106,7 +106,7 @@ test('a failed injector audit never accelerates maintenance beyond the one-secon
 
   assert.match(delay, /const injectorAuditDelay = targetAuditPending\s*\? PAGE_ACTION_POLL_MS\s*: until\(lastInjectorAuditAt, INJECTOR_AUDIT_MS\)/);
   assert.match(delay, /controlWatcher \? injectorAuditDelay : WATCHER_RETRY_MS/);
-  assert.match(delay, /pageActionPollDelay,\s*injectorAuditDelay,/);
+  assert.match(delay, /PAGE_ACTION_POLL_MS,\s*injectorAuditDelay,/);
 });
 
 test('failed one-shot installs use keyed bounded backoff without delaying page-action snapshots', () => {
@@ -130,7 +130,7 @@ test('database changes refresh a remote recent-request snapshot instead of leavi
 
   assert.match(source, /function shouldRefreshRemoteRecentRequests\(\)/);
   assert.match(source, /requestRecentRequestsRefresh\(\)/);
-  assert.match(watcher, /syncRecentRequests\(\);[\s\S]*shouldRefreshRemoteRecentRequests\(\)[\s\S]*scheduleRemoteRecentRequestsRefresh\(\)/);
+  assert.match(watcher, /recentRequestInterest\.active\(\) \? syncRecentRequests\(\) : false;[\s\S]*shouldRefreshRemoteRecentRequests\(\)[\s\S]*scheduleRemoteRecentRequestsRefresh\(\)/);
 });
 
 test('database-triggered remote recent-request refreshes are debounced', () => {
@@ -190,35 +190,32 @@ test('host schedules only the current CCSwitch provider and leaves Hub providers
   assert.match(source, /const CURRENT_PROVIDER_REFRESH_MS = 300_000;/);
   assert.match(source, /const WATCHER_RETRY_MS = 1_000;/);
   assert.match(source, /const PAGE_ACTION_POLL_MS = 1_000;/);
-  assert.match(source, /const PAGE_ACTION_IDLE_POLL_MS = 2_500;/);
   assert.match(source, /const DATABASE_AUDIT_MS = 60_000;/);
   assert.match(source, /const STATUS_HEARTBEAT_MS = 300_000;/);
   assert.match(loop, /repository\.getChangeToken\(\)/);
   assert.match(loop, /databaseAuditDue/);
   assert.match(loop, /requestTargetSync\(\{ audit: auditDue \|\| providersChanged \|\| recentRequestsChanged \}\)/);
-  assert.doesNotMatch(source, /provider\.usage\?\.autoQueryInterval/);
+  assert.match(source, /currentProviderRefreshIntervalMs\(provider/);
   assert.match(source, /hubService\.refreshProvider\(provider\.id\)/);
   assert.match(loop, /providersChanged \? requestCurrentProviderRefresh\(false, true\)/);
   assert.match(source, /action\.action === 'refresh'[\s\S]*requestCurrentProviderRefresh\(true, true\)/);
   assert.doesNotMatch(source, /hubService\.refreshAll\(\)|refreshBrowserProviders|observeBrowserCompanion/);
 });
 
-test('host keeps only the bounded page-title action poll for responsive composer actions', () => {
+test('host keeps the bounded one-second page-title action poll for responsive composer actions', () => {
   const source = hostSource();
 
   assert.match(source, /const PAGE_ACTION_POLL_MS = 1_000/);
-  assert.match(source, /const PAGE_ACTION_IDLE_POLL_MS = 2_500/);
   assert.match(source, /decodePageActionQueue|recentActionSignatures/);
   assert.doesNotMatch(source, /actionEndpoint|onAction:\s*handlePageAction/);
 });
 
-test('host backs off page-action polling while a mounted page is idle', () => {
+test('host keeps page-action polling at one second while a mounted page is idle', () => {
   const source = hostSource();
   const delay = source.slice(source.indexOf('function nextMaintenanceDelay('), source.indexOf('async function loop('));
 
-  assert.match(delay, /const pageActionPollDelay =/);
-  assert.match(delay, /PAGE_ACTION_IDLE_POLL_MS/);
-  assert.match(delay, /pageActionPollDelay/);
+  assert.match(delay, /PAGE_ACTION_POLL_MS/);
+  assert.doesNotMatch(delay, /PAGE_ACTION_IDLE_POLL_MS/);
 });
 
 test('current-provider scheduling resumes from the cached query timestamp after a host reload', () => {
@@ -246,6 +243,7 @@ test('database change tokens advance only after a successful provider sync', () 
   const watcher = source.slice(source.indexOf('function startDatabaseWatcher()'), source.indexOf('function startControlWatcher()'));
 
   assert.match(watcher, /const nextDatabaseChangeToken = repository\.getChangeToken\(\)/);
+  assert.match(watcher, /if \(nextDatabaseChangeToken === databaseChangeToken\)/);
   assert.match(watcher, /const syncResult = syncHubProviders\(\)/);
   assert.match(watcher, /if \(!syncResult\.succeeded\)/);
   assert.match(watcher, /databaseChangeToken = nextDatabaseChangeToken/);
@@ -282,10 +280,34 @@ test('database watcher coalesces file bursts with a low-latency debounce', () =>
   assert.ok(Number(debounce[1]) >= 75 && Number(debounce[1]) <= 150, 'debounce should coalesce WAL bursts without visible delay');
   assert.match(watcher, /if \(databaseWatchTimer\) clearTimeout\(databaseWatchTimer\)/);
   assert.match(watcher, /const syncResult = syncHubProviders\(\)/);
-  assert.match(watcher, /const recentRequestsChanged = syncRecentRequests\(\)/);
+  assert.match(watcher, /recentRequestInterest\.active\(\) \? syncRecentRequests\(\) : false/);
   assert.match(watcher, /if \(syncResult\.changed\) requestCurrentProviderRefresh\(false, true\)/);
   assert.match(watcher, /else if \(recentRequestsChanged\) requestTargetSync\(\{ audit: true \}\)/);
   assert.match(watcher, /}, DATABASE_WATCH_DEBOUNCE_MS\);/);
+});
+
+test('remote recent-request refreshes require an interested mounted target', () => {
+  const source = hostSource();
+  const predicate = source.slice(source.indexOf('function shouldRefreshRemoteRecentRequests('), source.indexOf('function scheduleRemoteRecentRequestsRefresh('));
+  const targetSync = source.slice(source.indexOf('async function syncTargets('), source.indexOf('function requestTargetSync('));
+
+  assert.match(predicate, /recentRequestInterest\.active\(\)/);
+  assert.match(targetSync, /requests-open/);
+  assert.match(targetSync, /requests-close/);
+  assert.match(targetSync, /recentRequestInterest\.retain\(targetIds\)/);
+});
+
+test('recent-request work stays dormant without interest and active work is cancelled on close', () => {
+  const source = hostSource();
+  const currentRefresh = source.slice(source.indexOf('async function refreshCurrentProvider('), source.indexOf('function requestCurrentProviderRefresh('));
+  const loop = source.slice(source.indexOf('async function loop()'), source.indexOf('function shutdown('));
+  const targetSync = source.slice(source.indexOf('async function syncTargets('), source.indexOf('function requestTargetSync('));
+
+  assert.match(currentRefresh, /if \(recentRequestInterest\.active\(\)\) syncRecentRequests\(provider\)/);
+  assert.doesNotMatch(loop, /\n\s*syncRecentRequests\(\);/);
+  assert.match(source, /let recentRequestsRefreshController = null/);
+  assert.match(source, /hubService\.queryRequestUsage\(provider\.id, \{ limit: RECENT_REQUEST_LIMIT, signal: controller\.signal \}\)/);
+  assert.match(targetSync, /action\.action === 'requests-close'[\s\S]*cancelRecentRequestsRefresh\(\)/);
 });
 
 test('request-log changes push a bounded local history without refreshing provider balances', () => {

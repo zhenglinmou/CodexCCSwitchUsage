@@ -6,6 +6,7 @@ import { ProviderRepository } from './provider-repository.mjs';
 import { ProviderRequestUsageEngine } from './provider-request-usage.mjs';
 import { ProviderTemplateStore } from './provider-templates.mjs';
 import { HubServer } from './hub-server.mjs';
+import { currentProviderRefreshIntervalMs, RecentRequestInterestTracker } from './host-scheduling.mjs';
 import { ProviderQueryEngine } from './hub-provider-adapters.mjs';
 import { hubItemToUsagePayload, HubService, safeHubMessage } from './hub-service.mjs';
 import { buildInjectorScript, INJECTOR_VERSION, UPDATE_GLOBAL } from './injector-script.mjs';
@@ -20,7 +21,6 @@ const DATABASE_WATCH_DEBOUNCE_MS = 100;
 const CURRENT_PROVIDER_REFRESH_MS = 300_000;
 const WATCHER_RETRY_MS = 1_000;
 const PAGE_ACTION_POLL_MS = 1_000;
-const PAGE_ACTION_IDLE_POLL_MS = 2_500;
 const DATABASE_AUDIT_MS = 60_000;
 const INJECTOR_AUDIT_MS = 300_000;
 const STATUS_HEARTBEAT_MS = 300_000;
@@ -204,7 +204,9 @@ let recentRequestsFetchedAt = '';
 let recentRequestsMessage = '';
 let recentRequestsRefreshPromise = null;
 let recentRequestsRefreshPending = false;
+let recentRequestsRefreshController = null;
 let remoteRecentRequestsRefreshTimer = null;
+const recentRequestInterest = new RecentRequestInterestTracker();
 let codexProcessMonitor = null;
 let lastUsageCacheError = '';
 let lastStatusSignature = '';
@@ -394,12 +396,30 @@ function syncRecentRequests(providerOverride = undefined, options = {}) {
 }
 
 function shouldRefreshRemoteRecentRequests() {
-  return Boolean(recentRequestProviderId && REMOTE_RECENT_REQUEST_SOURCES.has(recentRequestsSource));
+  return Boolean(
+    recentRequestInterest.active()
+    && recentRequestProviderId
+    && REMOTE_RECENT_REQUEST_SOURCES.has(recentRequestsSource)
+  );
+}
+
+function cancelRemoteRecentRequestsRefresh() {
+  if (!remoteRecentRequestsRefreshTimer) return;
+  clearTimeout(remoteRecentRequestsRefreshTimer);
+  remoteRecentRequestsRefreshTimer = null;
+}
+
+function cancelRecentRequestsRefresh() {
+  cancelRemoteRecentRequestsRefresh();
+  recentRequestsRefreshPending = false;
+  if (recentRequestsRefreshController && !recentRequestsRefreshController.signal.aborted) {
+    recentRequestsRefreshController.abort(new Error('最近请求面板已关闭'));
+  }
 }
 
 function scheduleRemoteRecentRequestsRefresh() {
   if (!shouldRefreshRemoteRecentRequests() || stopped) return;
-  if (remoteRecentRequestsRefreshTimer) clearTimeout(remoteRecentRequestsRefreshTimer);
+  cancelRemoteRecentRequestsRefresh();
   remoteRecentRequestsRefreshTimer = setTimeout(() => {
     remoteRecentRequestsRefreshTimer = null;
     requestRecentRequestsRefresh();
@@ -443,10 +463,12 @@ async function refreshRecentRequests() {
   });
   requestTargetSync({ audit: true });
 
+  const controller = new AbortController();
+  recentRequestsRefreshController = controller;
   try {
     const syncResult = syncHubProviders();
     if (!syncResult.succeeded) throw syncResult.error;
-    const result = await hubService.queryRequestUsage(provider.id, { limit: RECENT_REQUEST_LIMIT });
+    const result = await hubService.queryRequestUsage(provider.id, { limit: RECENT_REQUEST_LIMIT, signal: controller.signal });
     const currentProvider = repository.getCurrent();
     if (!currentProvider || String(currentProvider.id) !== String(provider.id)) return;
     updateRecentRequestsState(provider, result?.items, {
@@ -457,6 +479,7 @@ async function refreshRecentRequests() {
       message: String(result?.message || ''),
     });
   } catch (error) {
+    if (controller.signal.aborted) return;
     try {
       const fallbackRows = repository.getRecentRequests(provider.id, RECENT_REQUEST_LIMIT);
       updateRecentRequestsState(provider, fallbackRows, {
@@ -479,6 +502,7 @@ async function refreshRecentRequests() {
       });
     }
   } finally {
+    if (recentRequestsRefreshController === controller) recentRequestsRefreshController = null;
     if (String(provider.id) === recentRequestProviderId && recentRequestsLoading) {
       updateRecentRequestsState(provider, recentRequests, {
         source: recentRequestsSource,
@@ -546,7 +570,7 @@ async function refreshCurrentProvider(force = false) {
   }
 
   if (!provider) {
-    syncRecentRequests(null);
+    if (recentRequestInterest.active()) syncRecentRequests(null);
     lastProviderId = '';
     lastProviderSignature = '';
     lastPayload = payloadWithRecentRequests({ status: 'error', providerName: 'CCSwitch', message: '没有找到当前 Codex 供应商' });
@@ -555,12 +579,12 @@ async function refreshCurrentProvider(force = false) {
     return true;
   }
 
-  syncRecentRequests(provider);
+  if (recentRequestInterest.active()) syncRecentRequests(provider);
 
   const providerChanged = provider.id !== lastProviderId;
   const providerSignature = providerRefreshSignature(provider);
   const providerConfigurationChanged = providerSignature !== lastProviderSignature;
-  const intervalMs = CURRENT_PROVIDER_REFRESH_MS;
+  const intervalMs = currentProviderRefreshIntervalMs(provider, CURRENT_PROVIDER_REFRESH_MS);
   const elapsedMs = Date.now() - lastQueryAt;
   const due = elapsedMs >= intervalMs;
   if (!force && !providerChanged && !providerConfigurationChanged && !due) {
@@ -664,12 +688,12 @@ async function ensureHubServer(force = false) {
   }
 }
 
-function actionSignature(action) {
-  return action ? `${action.action}:${action.token}:${action.requestedAt}` : '';
+function actionSignature(action, targetId = '') {
+  return action ? `${targetId}:${action.action}:${action.token}:${action.requestedAt}` : '';
 }
 
-function acceptAction(action) {
-  const signature = actionSignature(action);
+function acceptAction(action, targetId = '') {
+  const signature = actionSignature(action, targetId);
   if (!signature || recentActionSignatures.has(signature)) return false;
   recentActionSignatures.add(signature);
   recentActionSignatureOrder.push(signature);
@@ -685,12 +709,15 @@ async function syncTargets({ audit = true } = {}) {
   if (targets.length === 0) {
     mountedPages = 0;
     mountedTargetIds = new Set();
+    recentRequestInterest.clear();
+    cancelRecentRequestsRefresh();
     throw new Error('没有找到 Codex 主页面');
   }
 
   const targetActions = targets.map(target => ({ target, actions: decodePageActionQueue(target.title) }));
   const markedActions = targetActions.filter(item => item.actions.length > 0);
   const targetIds = new Set(targets.map(target => target.id));
+  if (!recentRequestInterest.retain(targetIds)) cancelRecentRequestsRefresh();
   const targetSignature = [...targetIds].sort().join('|');
   const targetIdentityChanged = targetIds.size !== mountedTargetIds.size
     || [...targetIds].some(id => !mountedTargetIds.has(id));
@@ -716,15 +743,20 @@ async function syncTargets({ audit = true } = {}) {
     markedActions.forEach((item, index) => {
       if (acknowledgements[index]?.status !== 'fulfilled' || acknowledgements[index].value !== true) return;
       for (const action of item.actions) {
-        if (!acceptAction(action)) continue;
+        if (!acceptAction(action, item.target.id)) continue;
         actionAccepted = true;
         if (action.action === 'refresh') {
           refreshRequested = true;
           requestCurrentProviderRefresh(true, true);
         }
-        if (action.action === 'refresh-requests') {
+        if (action.action === 'refresh-requests' || action.action === 'requests-open') {
+          recentRequestInterest.open(item.target.id);
           recentRequestsRequested = true;
           requestRecentRequestsRefresh();
+        }
+        if (action.action === 'requests-close') {
+          recentRequestInterest.close(item.target.id);
+          if (!recentRequestInterest.active()) cancelRecentRequestsRefresh();
         }
         if (action.action === 'open-hub') openHubFromAction();
       }
@@ -816,6 +848,10 @@ function startDatabaseWatcher() {
       databaseWatchTimer = setTimeout(() => {
         databaseWatchTimer = null;
         const nextDatabaseChangeToken = repository.getChangeToken();
+        if (nextDatabaseChangeToken === databaseChangeToken) {
+          lastDatabaseAuditAt = Date.now();
+          return;
+        }
         const syncResult = syncHubProviders();
         if (!syncResult.succeeded) {
           lastDatabaseAuditAt = Date.now() - DATABASE_AUDIT_MS + WATCHER_RETRY_MS;
@@ -825,7 +861,7 @@ function startDatabaseWatcher() {
         }
         databaseChangeToken = nextDatabaseChangeToken;
         lastDatabaseAuditAt = Date.now();
-        const recentRequestsChanged = syncRecentRequests();
+        const recentRequestsChanged = recentRequestInterest.active() ? syncRecentRequests() : false;
         if (shouldRefreshRemoteRecentRequests()) scheduleRemoteRecentRequestsRefresh();
         if (syncResult.changed) requestCurrentProviderRefresh(false, true);
         else if (recentRequestsChanged) requestTargetSync({ audit: true });
@@ -870,13 +906,10 @@ function nextMaintenanceDelay() {
   const injectorAuditDelay = targetAuditPending
     ? PAGE_ACTION_POLL_MS
     : until(lastInjectorAuditAt, INJECTOR_AUDIT_MS);
-  const pageActionPollDelay = targetAuditPending || currentProviderQueryActive || mountedPages === 0
-    ? PAGE_ACTION_POLL_MS
-    : PAGE_ACTION_IDLE_POLL_MS;
   return Math.min(
     databaseWatcher ? until(lastDatabaseAuditAt, DATABASE_AUDIT_MS) : WATCHER_RETRY_MS,
     controlWatcher ? injectorAuditDelay : WATCHER_RETRY_MS,
-    pageActionPollDelay,
+    PAGE_ACTION_POLL_MS,
     injectorAuditDelay,
     until(lastStatusWriteAt, STATUS_HEARTBEAT_MS),
   );
@@ -887,7 +920,6 @@ async function loop() {
   if (!hubReady && /\bEADDRINUSE\b/i.test(String(lastHubError || ''))) {
     throw new Error('Balance Hub 端口已被占用；拒绝启动第二个插件宿主');
   }
-  syncRecentRequests();
   await requestTargetSync({ audit: true });
   startDatabaseWatcher();
   startControlWatcher();
@@ -908,7 +940,7 @@ async function loop() {
           databaseChangeToken = currentDatabaseChangeToken;
           lastDatabaseAuditAt = now;
           providersChanged = syncResult.changed;
-          recentRequestsChanged = syncRecentRequests();
+          recentRequestsChanged = recentRequestInterest.active() ? syncRecentRequests() : false;
           if (shouldRefreshRemoteRecentRequests()) scheduleRemoteRecentRequestsRefresh();
         } else {
           lastDatabaseAuditAt = now - DATABASE_AUDIT_MS + WATCHER_RETRY_MS;
@@ -947,10 +979,13 @@ function shutdown(reason = null) {
   closeCdpHttpClient();
   mountedPages = 0;
   mountedTargetIds = new Set();
-  const auxiliaryShutdown = Promise.allSettled([hubServer.close()]);
+  const auxiliaryShutdown = Promise.allSettled([
+    hubServer.close(),
+    providerRequestUsageEngine.close(),
+  ]);
   browserBroker.close();
   if (databaseWatchTimer) clearTimeout(databaseWatchTimer);
-  if (remoteRecentRequestsRefreshTimer) clearTimeout(remoteRecentRequestsRefreshTimer);
+  cancelRecentRequestsRefresh();
   if (currentProviderRefreshTimer) clearTimeout(currentProviderRefreshTimer);
   repository.close();
   try { fs.rmSync(pidPath, { force: true }); } catch {}

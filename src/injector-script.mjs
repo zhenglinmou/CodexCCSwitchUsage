@@ -264,7 +264,7 @@ export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = glob
 }
 
 export { PAGE_ACTION_SENTINEL };
-export const INJECTOR_VERSION = 94;
+export const INJECTOR_VERSION = 95;
 
 function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, formatRequestTime, calculatePopoverPlacement, selectResponsiveUsageMode, calculateResponsiveMeasurements, calculateExpandedNativeTriggerMaxWidth, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, enqueuePageActionTitle, pageActionSentinel, version) {
   const VERSION = version;
@@ -844,10 +844,12 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
 
   function closePopover(returnFocus = false, renderNow = true) {
     const trigger = state.popoverTrigger;
+    const closingRequests = state.popoverOpen && state.popoverMode === 'requests';
     cancelPopoverPositionBurst();
     state.popoverOpen = false;
     state.popoverMode = '';
     state.popoverTrigger = null;
+    if (closingRequests) publishPageAction('requests-close');
     if (renderNow) render();
     else syncPopoverVisibility();
     if (returnFocus && trigger?.isConnected) trigger.focus?.({ preventScroll: true });
@@ -880,7 +882,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
   function requestRecentRequests(instance) {
     hideUsageTooltip();
     state.requestRefreshToken += 1;
-    publishPageAction('refresh-requests');
+    publishPageAction('requests-open');
     state.requestLoading = true;
     if (state.requestLoadingTimer) clearTimeout(state.requestLoadingTimer);
     const requestToken = state.requestRefreshToken;
@@ -896,6 +898,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
 
   function requestRefresh(instance, togglePopover = false) {
     hideUsageTooltip();
+    const closingRequests = state.popoverOpen && state.popoverMode === 'requests';
     state.refreshToken += 1;
     state.refreshRequestedAt = Date.now();
     publishPageAction('refresh');
@@ -915,6 +918,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       state.popoverMode = state.popoverOpen ? 'balance' : '';
       state.popoverTrigger = state.popoverOpen ? (instance?.root?.__codexUsageRefreshButton || null) : null;
     }
+    if (closingRequests) publishPageAction('requests-close');
     render(null, togglePopover);
     if (togglePopover && state.popoverOpen) focusPopover();
   }
@@ -1673,12 +1677,14 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
   state.getRefreshToken = () => state.refreshToken;
   state.getRefreshRequest = () => ({ token: state.refreshToken, requestedAt: state.refreshRequestedAt });
   state.setPopoverOpen = open => {
+    const closingRequests = !open && state.popoverOpen && state.popoverMode === 'requests';
     state.popoverOpen = Boolean(open);
     state.popoverMode = state.popoverOpen ? (state.popoverMode || 'balance') : '';
     if (!state.popoverOpen) {
       state.popoverTrigger = null;
       cancelPopoverPositionBurst();
     }
+    if (closingRequests) publishPageAction('requests-close');
     if (!state.popoverAnchor) state.popoverAnchor = { root: state.root, shadow: state.shadow };
     render();
     return state.popoverOpen;

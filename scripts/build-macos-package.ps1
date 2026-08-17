@@ -89,7 +89,7 @@ function Copy-SourcePayload([string]$Destination) {
         'src\hub-provider-adapters.mjs', 'src\usage-normalization.mjs', 'src\provider-request-usage.mjs',
         'src\provider-templates.mjs', 'src\hub-service.mjs', 'src\hub-page.mjs',
         'src\hub-preferences.mjs', 'src\hub-server.mjs', 'src\companion-auth.mjs',
-        'src\secure-files.mjs', 'src\keyed-backoff.mjs', 'src\page-action-channel.mjs',
+        'src\secure-files.mjs', 'src\keyed-backoff.mjs', 'src\page-action-channel.mjs', 'src\host-scheduling.mjs',
         'src\process-lifecycle.mjs', 'src\target-session.mjs', 'src\host.mjs',
         'scripts\launch.mjs', 'scripts\stop-host.mjs',
         'browser-companion\manifest.json', 'browser-companion\background.js',

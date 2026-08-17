@@ -54,6 +54,6 @@ test('macOS build uses a persistent verified download cache and an explicit payl
     assert.ok(source.includes(`'${required}'`), `${required} is missing from the macOS allowlist`);
   }
   for (const legacy of ['src\\usage-client.mjs', 'src\\evaluator.mjs', 'src\\evaluator-worker.mjs']) {
-    assert.equal(source.includes(`'${legacy}'`), false, `${legacy} must not ship in the v2 macOS payload`);
+    assert.equal(source.includes(`'${legacy}'`), false, `${legacy} must not ship in the v3 macOS payload`);
   }
 });

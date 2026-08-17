@@ -28,11 +28,14 @@ import {
 function memoryStorage(initial = {}) {
   const data = { ...initial };
   const writes = [];
+  const reads = [];
   return {
     data,
+    reads,
     writes,
     async get(keys) {
       const names = Array.isArray(keys) ? keys : [keys];
+      reads.push([...names]);
       return Object.fromEntries(names.filter(name => name in data).map(name => [name, data[name]]));
     },
     async set(values) {
@@ -41,6 +44,45 @@ function memoryStorage(initial = {}) {
     },
   };
 }
+
+test('browser session stores reuse cached reads until an explicit storage invalidation', async () => {
+  const storage = memoryStorage({
+    validatedSessionOrigins: ['https://anyrouter.top'],
+    sessionUserIds: { 'https://anyrouter.top': '42' },
+  });
+  const hints = new SessionHintStore(storage);
+  const identities = new SessionIdentityStore(storage);
+
+  assert.deepEqual(await hints.list(), ['https://anyrouter.top']);
+  assert.deepEqual(await hints.list(), ['https://anyrouter.top']);
+  assert.equal(await identities.get('https://anyrouter.top'), '42');
+  assert.equal(await identities.get('https://anyrouter.top'), '42');
+  assert.equal(storage.reads.filter(keys => keys.includes('validatedSessionOrigins')).length, 1);
+  assert.equal(storage.reads.filter(keys => keys.includes('sessionUserIds')).length, 1);
+
+  storage.data.validatedSessionOrigins = ['https://relay.example'];
+  storage.data.sessionUserIds = { 'https://relay.example': '7' };
+  hints.invalidate();
+  identities.invalidate();
+  assert.deepEqual(await hints.list(), ['https://relay.example']);
+  assert.equal(await identities.get('https://relay.example'), '7');
+  assert.equal(storage.reads.filter(keys => keys.includes('validatedSessionOrigins')).length, 2);
+  assert.equal(storage.reads.filter(keys => keys.includes('sessionUserIds')).length, 2);
+});
+
+test('browser session origin replacement reuses the loaded snapshot and skips unchanged writes', async () => {
+  const storage = memoryStorage({ validatedSessionOrigins: ['https://anyrouter.top'] });
+  const hints = new SessionHintStore(storage);
+
+  await hints.list();
+  assert.deepEqual(await hints.replace(['https://anyrouter.top/path']), ['https://anyrouter.top']);
+  assert.equal(storage.reads.length, 1);
+  assert.equal(storage.writes.length, 0);
+
+  assert.deepEqual(await hints.replace(['https://relay.example/path']), ['https://relay.example']);
+  assert.equal(storage.reads.length, 1);
+  assert.deepEqual(storage.writes, [{ validatedSessionOrigins: ['https://relay.example'] }]);
+});
 
 function delay(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -446,7 +488,7 @@ test('browser companion migrates copied client identity into a browser-scoped id
   const source = fs.readFileSync(new URL('../browser-companion/background.js', import.meta.url), 'utf8');
   const configSource = source.slice(source.indexOf('async function config()'), source.indexOf('function updateStatus('));
 
-  assert.match(configSource, /'clientBrowser'/);
+  assert.match(source, /CONFIG_STORAGE_KEYS[\s\S]*'clientBrowser'/);
   assert.match(configSource, /stored\.clientBrowser[^\n]*currentBrowser/);
   assert.match(configSource, /crypto\.randomUUID\(\)/);
   assert.match(configSource, /chrome\.storage\.local\.set\(\{ clientId, clientBrowser: currentBrowser \}\)/);
@@ -556,6 +598,7 @@ test('each polling iteration reuses one config and persists lastError only when 
   const poll = source.slice(source.indexOf('async function pollOnce('), source.indexOf('async function startPolling('));
   const polling = source.slice(source.indexOf('async function startPolling('), source.indexOf('async function wake('));
   const status = source.slice(source.indexOf('function updateStatus('), source.indexOf('function sameOrigins('));
+  const configSource = source.slice(source.indexOf('async function config()'), source.indexOf('function updateStatus('));
 
   assert.match(poll, /async function pollOnce\(current\)/);
   assert.doesNotMatch(poll, /\bconfig\(\)/);
@@ -566,6 +609,24 @@ test('each polling iteration reuses one config and persists lastError only when 
   assert.match(source, /lastErrorValue = String\(stored\.lastError \|\| ''\)/);
   assert.doesNotMatch(source, /if \(lastErrorValue === undefined\) lastErrorValue = String\(stored\.lastError/);
   assert.doesNotMatch(source, /chrome\.storage\.local\.set\(\{\s*lastError:/);
+  assert.match(configSource, /if \(configCache\) return configCache/);
+  assert.match(configSource, /if \(configPromise\) return configPromise/);
+  assert.match(source, /chrome\.storage\.onChanged\.addListener/);
+});
+
+test('cookie and tab events reuse cached watched origins until relevant storage changes', () => {
+  const source = fs.readFileSync(new URL('../browser-companion/background.js', import.meta.url), 'utf8');
+  const watched = source.slice(source.indexOf('async function watchedSessionOrigins()'), source.indexOf('async function requestHub('));
+  const heartbeat = source.slice(source.indexOf('async function performHeartbeat('), source.indexOf('const heartbeatControl'));
+
+  assert.match(watched, /if \(watchedOriginsCache\) return watchedOriginsCache/);
+  assert.match(watched, /if \(watchedOriginsPromise\) return watchedOriginsPromise/);
+  assert.match(source, /const providerWebsiteOrigins = new SessionHintStore\(chrome\.storage\.local, PROVIDER_ORIGINS_KEY\)/);
+  assert.match(source, /const pendingWebsiteOrigins = new SessionHintStore\(chrome\.storage\.local, PENDING_ORIGINS_KEY\)/);
+  assert.match(heartbeat, /providerWebsiteOrigins\.replace\(result\.providerOrigins\)/);
+  assert.doesNotMatch(heartbeat, /chrome\.storage\.local\.get/);
+  assert.match(source, /WATCHED_ORIGIN_KEYS/);
+  assert.match(source, /invalidateWatchedOrigins\(\)/);
 });
 
 test('event heartbeats are 350ms trailing single-flight while startup and wake stay immediate and awaitable', () => {

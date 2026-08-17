@@ -141,7 +141,7 @@ test('GitHub releases always package and explain the browser companion', () => {
   const template = read('docs/RELEASE_NOTES_TEMPLATE.md');
   const companionSection = read('docs/RELEASE_BROWSER_COMPANION_SECTION.md');
   const development = read('DEVELOPMENT.md');
-  const userGuide = read('docs/V2.md');
+  const userGuide = read('docs/V3.md');
 
   assert.equal(packageJson.scripts['release:github'].includes('scripts/publish-release.ps1'), true);
   assert.match(publish, /Compress-Archive/);

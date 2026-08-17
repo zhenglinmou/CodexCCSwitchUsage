@@ -3,6 +3,8 @@ const RESPONSE_DOMAIN = 'CCSWITCH-COMPANION-RESPONSE-V1';
 const MAXIMUM_SKEW_MS = 60_000;
 
 const encoder = new TextEncoder();
+let cachedSecret = '';
+let cachedKeyPromise = null;
 
 function bytes(value) {
   return encoder.encode(String(value || ''));
@@ -29,8 +31,27 @@ async function sha256(value) {
 }
 
 async function key(secret) {
-  if (!/^[A-Za-z0-9_-]{32,128}$/.test(String(secret || ''))) throw new Error('Hub 连接码格式无效');
-  return crypto.subtle.importKey('raw', bytes(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+  const value = String(secret || '');
+  if (!/^[A-Za-z0-9_-]{32,128}$/.test(value)) throw new Error('Hub 连接码格式无效');
+  if (value === cachedSecret && cachedKeyPromise) return cachedKeyPromise;
+  const operation = crypto.subtle.importKey(
+    'raw',
+    bytes(value),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign', 'verify'],
+  );
+  cachedSecret = value;
+  cachedKeyPromise = operation;
+  try {
+    return await operation;
+  } catch (error) {
+    if (cachedKeyPromise === operation) {
+      cachedSecret = '';
+      cachedKeyPromise = null;
+    }
+    throw error;
+  }
 }
 
 async function requestCanonical(method, target, timestamp, nonce, body) {

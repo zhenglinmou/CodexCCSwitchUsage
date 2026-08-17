@@ -961,7 +961,7 @@ export class ProviderQueryEngine {
     this.whamDirectBackoffMs = Math.max(1, Number(options.whamDirectBackoffMs) || WHAM_DIRECT_BACKOFF_MS);
     this.whamResultCacheMs = Math.max(1, Number(options.whamResultCacheMs) || WHAM_RESULT_CACHE_MS);
     this.providerQueryTimeoutMs = Math.max(1, Number(options.providerQueryTimeoutMs) || PROVIDER_QUERY_TIMEOUT_MS);
-    this.whamDirectRetryAt = 0;
+    this.whamDirectRetryAt = new Map();
     this.whamInFlight = new Map();
     this.whamRecent = new Map();
     this.inFlightQueries = new Map();
@@ -1680,7 +1680,7 @@ export class ProviderQueryEngine {
           source: site.accountSource,
           loginRequired: true,
           sessionSyncRequired: true,
-          message: '余额伴侣版本不支持同站多账号隔离，请在 Chrome 和 Edge 中重新加载当前 v2 余额伴侣',
+          message: '余额伴侣版本不支持同站多账号隔离，请在 Chrome 和 Edge 中重新加载当前 v3 余额伴侣',
         },
       };
     }
@@ -1973,6 +1973,9 @@ export class ProviderQueryEngine {
   }
 
   async #queryWham(accessToken, accountId, signal) {
+    const accountBackoffKey = crypto.createHash('sha256')
+      .update(String(accountId))
+      .digest('base64url');
     const cacheKey = crypto.createHash('sha256')
       .update(String(accountId))
       .update('\0')
@@ -1982,7 +1985,7 @@ export class ProviderQueryEngine {
     if (cached && this.now() - cached.createdAt < this.whamResultCacheMs) return cached.result;
     if (this.whamInFlight.has(cacheKey)) return this.whamInFlight.get(cacheKey);
 
-    const operation = this.#queryWhamUncached(accessToken, accountId, signal);
+    const operation = this.#queryWhamUncached(accessToken, accountId, accountBackoffKey, signal);
     this.whamInFlight.set(cacheKey, operation);
     try {
       const result = await operation;
@@ -1996,10 +1999,14 @@ export class ProviderQueryEngine {
       for (const [key, item] of this.whamRecent) {
         if (item.createdAt <= cutoff) this.whamRecent.delete(key);
       }
+      const now = this.now();
+      for (const [key, retryAt] of this.whamDirectRetryAt) {
+        if (retryAt <= now) this.whamDirectRetryAt.delete(key);
+      }
     }
   }
 
-  async #queryWhamUncached(accessToken, accountId, signal) {
+  async #queryWhamUncached(accessToken, accountId, accountBackoffKey, signal) {
     const headers = {
       Authorization: `Bearer ${accessToken}`,
       'ChatGPT-Account-Id': accountId,
@@ -2008,7 +2015,8 @@ export class ProviderQueryEngine {
     };
     const browserAvailable = typeof this.browserBroker?.queryJson === 'function'
       && (typeof this.browserBroker.isConnected !== 'function' || this.browserBroker.isConnected());
-    const directReady = !browserAvailable || this.now() >= this.whamDirectRetryAt;
+    const directRetryAt = this.whamDirectRetryAt.get(accountBackoffKey) || 0;
+    const directReady = !browserAvailable || this.now() >= directRetryAt;
 
     const directController = new AbortController();
     const directPromise = directReady
@@ -2056,7 +2064,7 @@ export class ProviderQueryEngine {
     const finishWithBrowser = browser => {
       if (!browser.result) return null;
       if (browser.definitive) {
-        if (directReady) this.whamDirectRetryAt = this.now() + this.whamDirectBackoffMs;
+        if (directReady) this.whamDirectRetryAt.set(accountBackoffKey, this.now() + this.whamDirectBackoffMs);
         directController.abort(new Error('OpenAI WHAM 浏览器请求已先完成'));
       }
       return browser.result;
@@ -2076,7 +2084,7 @@ export class ProviderQueryEngine {
     if (first.kind === 'direct') {
       clearTimeout(delayTimer);
       if (first.definitive) {
-        this.whamDirectRetryAt = 0;
+        this.whamDirectRetryAt.delete(accountBackoffKey);
         return first.result;
       }
       const browser = await startBrowser();
@@ -2092,7 +2100,7 @@ export class ProviderQueryEngine {
       if (winner.definitive) return finishWithBrowser(winner);
       const direct = await directPromise;
       if (direct.definitive) {
-        this.whamDirectRetryAt = 0;
+        this.whamDirectRetryAt.delete(accountBackoffKey);
         return direct.result;
       }
       const browserResult = finishWithBrowser(winner);
@@ -2103,7 +2111,7 @@ export class ProviderQueryEngine {
 
     if (winner.definitive) {
       browserController.abort(new Error('OpenAI WHAM 直连请求已先完成'));
-      this.whamDirectRetryAt = 0;
+      this.whamDirectRetryAt.delete(accountBackoffKey);
       return winner.result;
     }
     const browserResult = finishWithBrowser(await browser);

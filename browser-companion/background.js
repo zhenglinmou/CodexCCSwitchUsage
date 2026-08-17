@@ -35,14 +35,28 @@ const POLL_BATCH_SIZE = 120;
 const MAX_COMPANION_RESULT_REQUEST_BYTES = 2_000_000;
 const PROVIDER_ORIGINS_KEY = 'providerWebsiteOrigins';
 const PENDING_ORIGINS_KEY = 'pendingWebsiteOrigins';
+const CONFIG_STORAGE_KEYS = [
+  'companionToken', 'hubToken', 'pairingUpgradeRequired', 'clientId', 'clientBrowser', 'lastError',
+];
+const CONFIG_INVALIDATION_KEYS = new Set([
+  'companionToken', 'hubToken', 'pairingUpgradeRequired', 'clientId', 'clientBrowser',
+]);
+const WATCHED_ORIGIN_KEYS = new Set(['validatedSessionOrigins', PROVIDER_ORIGINS_KEY]);
 const manifest = chrome.runtime.getManifest();
 const sessionHints = new SessionHintStore(chrome.storage.local);
 const sessionIdentities = new SessionIdentityStore(chrome.storage.local);
+const providerWebsiteOrigins = new SessionHintStore(chrome.storage.local, PROVIDER_ORIGINS_KEY);
+const pendingWebsiteOrigins = new SessionHintStore(chrome.storage.local, PENDING_ORIGINS_KEY);
 const instanceId = crypto.randomUUID();
 let polling = false;
 let lastErrorValue;
 let statusUpdateChain = Promise.resolve();
-let originUpdateChain = Promise.resolve();
+let configCache = null;
+let configPromise = null;
+let configGeneration = 0;
+let watchedOriginsCache = null;
+let watchedOriginsPromise = null;
+let watchedOriginsGeneration = 0;
 
 function delay(milliseconds) {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -66,35 +80,46 @@ function browserName() {
 }
 
 async function config() {
-  const stored = await chrome.storage.local.get([
-    'companionToken', 'hubToken', 'pairingUpgradeRequired', 'clientId', 'clientBrowser', 'lastError',
-  ]);
-  const legacyPairingRequired = !stored.companionToken
-    && Boolean(stored.hubToken || stored.pairingUpgradeRequired);
-  if (stored.hubToken && !stored.companionToken) {
-    await chrome.storage.local.set({ pairingUpgradeRequired: true });
+  if (configCache) return configCache;
+  if (configPromise) return configPromise;
+  const generation = configGeneration;
+  const operation = (async () => {
+    const stored = await chrome.storage.local.get(CONFIG_STORAGE_KEYS);
+    const legacyPairingRequired = !stored.companionToken
+      && Boolean(stored.hubToken || stored.pairingUpgradeRequired);
+    if (stored.hubToken && !stored.companionToken) {
+      await chrome.storage.local.set({ pairingUpgradeRequired: true });
+    }
+    const obsoleteKeys = [];
+    if (stored.hubToken) obsoleteKeys.push('hubToken');
+    if (stored.companionToken && stored.pairingUpgradeRequired) obsoleteKeys.push('pairingUpgradeRequired');
+    if (obsoleteKeys.length) await chrome.storage.local.remove(obsoleteKeys);
+    const currentBrowser = browserName();
+    let clientId = stored.clientId;
+    if (
+      !/^[A-Za-z0-9_-]{8,128}$/.test(String(clientId || ''))
+      || String(stored.clientBrowser || '') !== currentBrowser
+    ) {
+      clientId = crypto.randomUUID();
+      await chrome.storage.local.set({ clientId, clientBrowser: currentBrowser });
+    }
+    lastErrorValue = String(stored.lastError || '');
+    const resolved = {
+      token: String(stored.companionToken || '').trim(),
+      legacyPairingRequired,
+      clientId,
+      browser: currentBrowser,
+      lastError: lastErrorValue,
+    };
+    if (generation === configGeneration) configCache = resolved;
+    return resolved;
+  })();
+  configPromise = operation;
+  try {
+    return await operation;
+  } finally {
+    if (configPromise === operation) configPromise = null;
   }
-  const obsoleteKeys = [];
-  if (stored.hubToken) obsoleteKeys.push('hubToken');
-  if (stored.companionToken && stored.pairingUpgradeRequired) obsoleteKeys.push('pairingUpgradeRequired');
-  if (obsoleteKeys.length) await chrome.storage.local.remove(obsoleteKeys);
-  const currentBrowser = browserName();
-  let clientId = stored.clientId;
-  if (
-    !/^[A-Za-z0-9_-]{8,128}$/.test(String(clientId || ''))
-    || String(stored.clientBrowser || '') !== currentBrowser
-  ) {
-    clientId = crypto.randomUUID();
-    await chrome.storage.local.set({ clientId, clientBrowser: currentBrowser });
-  }
-  lastErrorValue = String(stored.lastError || '');
-  return {
-    token: String(stored.companionToken || '').trim(),
-    legacyPairingRequired,
-    clientId,
-    browser: currentBrowser,
-    lastError: lastErrorValue,
-  };
 }
 
 function updateStatus({ lastHeartbeatAt, lastError } = {}) {
@@ -110,52 +135,47 @@ function updateStatus({ lastHeartbeatAt, lastError } = {}) {
     if (hasLastError && nextLastError !== lastErrorValue) update.lastError = nextLastError;
     if (!Object.keys(update).length) return false;
     await chrome.storage.local.set(update);
-    if (Object.hasOwn(update, 'lastError')) lastErrorValue = nextLastError;
+    if (Object.hasOwn(update, 'lastError')) {
+      lastErrorValue = nextLastError;
+      if (configCache) configCache = { ...configCache, lastError: nextLastError };
+    }
     return true;
   });
   return statusUpdateChain;
 }
 
-function sameOrigins(left, right) {
-  return left.length === right.length && left.every((origin, index) => origin === right[index]);
-}
-
-function replaceStoredOrigins(key, values) {
-  const normalized = normalizeSessionOrigins(values);
-  originUpdateChain = originUpdateChain.catch(() => {}).then(async () => {
-    const stored = await chrome.storage.local.get([key]);
-    const current = normalizeSessionOrigins(stored?.[key]);
-    if (!sameOrigins(current, normalized) || !Array.isArray(stored?.[key])) {
-      await chrome.storage.local.set({ [key]: normalized });
-    }
-    return normalized;
-  });
-  return originUpdateChain;
-}
-
 function rememberPendingWebsiteOrigin(origin) {
-  originUpdateChain = originUpdateChain.catch(() => {}).then(async () => {
-    const stored = await chrome.storage.local.get([PENDING_ORIGINS_KEY]);
-    const current = normalizeSessionOrigins(stored?.[PENDING_ORIGINS_KEY]);
-    const next = normalizeSessionOrigins([...current, origin]);
-    if (!sameOrigins(current, next) || !Array.isArray(stored?.[PENDING_ORIGINS_KEY])) {
-      await chrome.storage.local.set({ [PENDING_ORIGINS_KEY]: next });
-    }
-    return next;
-  });
-  return originUpdateChain;
+  return pendingWebsiteOrigins.remember(origin);
 }
 
 async function watchedSessionOrigins() {
-  const [hints, stored] = await Promise.all([
+  if (watchedOriginsCache) return watchedOriginsCache;
+  if (watchedOriginsPromise) return watchedOriginsPromise;
+  const generation = watchedOriginsGeneration;
+  const operation = Promise.all([
     sessionHints.list(),
-    chrome.storage.local.get([PROVIDER_ORIGINS_KEY]),
-  ]);
-  return normalizeSessionOrigins([
-    ...SESSION_ORIGINS,
-    ...hints,
-    ...(stored?.[PROVIDER_ORIGINS_KEY] || []),
-  ]);
+    providerWebsiteOrigins.list(),
+  ]).then(([hints, providerOrigins]) => {
+    const origins = normalizeSessionOrigins([
+      ...SESSION_ORIGINS,
+      ...hints,
+      ...providerOrigins,
+    ]);
+    if (generation === watchedOriginsGeneration) watchedOriginsCache = origins;
+    return origins;
+  });
+  watchedOriginsPromise = operation;
+  try {
+    return await operation;
+  } finally {
+    if (watchedOriginsPromise === operation) watchedOriginsPromise = null;
+  }
+}
+
+function invalidateWatchedOrigins() {
+  watchedOriginsGeneration += 1;
+  watchedOriginsCache = null;
+  watchedOriginsPromise = null;
 }
 
 async function requestHub(token, path, options = {}, timeoutMs = HUB_REQUEST_TIMEOUT_MS) {
@@ -236,8 +256,8 @@ async function performHeartbeat(current) {
   };
   const result = await post(resolved.token, '/heartbeat', payload);
   const providerOrigins = Array.isArray(result?.providerOrigins)
-    ? await replaceStoredOrigins(PROVIDER_ORIGINS_KEY, result.providerOrigins)
-    : normalizeSessionOrigins((await chrome.storage.local.get([PROVIDER_ORIGINS_KEY]))?.[PROVIDER_ORIGINS_KEY]);
+    ? await providerWebsiteOrigins.replace(result.providerOrigins)
+    : await providerWebsiteOrigins.list();
   await updateStatus({ lastHeartbeatAt: new Date().toISOString(), lastError: '' });
   return { connected: true, configured: true, companion: result.companion, providerOrigins };
 }
@@ -684,6 +704,20 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.runtime.onStartup.addListener(() => startPolling());
 chrome.alarms.onAlarm.addListener(alarm => {
   if (alarm.name === POLL_ALARM) startPolling();
+});
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local') return;
+  const keys = Object.keys(changes);
+  if (keys.some(key => CONFIG_INVALIDATION_KEYS.has(key))) {
+    configGeneration += 1;
+    configCache = null;
+    configPromise = null;
+  }
+  if (changes.validatedSessionOrigins) sessionHints.invalidate();
+  if (changes.sessionUserIds) sessionIdentities.invalidate();
+  if (changes[PROVIDER_ORIGINS_KEY]) providerWebsiteOrigins.invalidate();
+  if (changes[PENDING_ORIGINS_KEY]) pendingWebsiteOrigins.invalidate();
+  if (keys.some(key => WATCHED_ORIGIN_KEYS.has(key))) invalidateWatchedOrigins();
 });
 chrome.cookies.onChanged.addListener(change => {
   const domain = String(change.cookie?.domain || '').replace(/^\./, '');

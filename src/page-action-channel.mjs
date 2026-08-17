@@ -1,7 +1,8 @@
 export const PAGE_ACTION_SENTINEL = '\u2063\u2063';
 const ZERO = '\u200b';
 const ONE = '\u200c';
-const ACTIONS = new Set(['refresh', 'refresh-requests', 'open-hub']);
+const ACTIONS = new Set(['refresh', 'refresh-requests', 'requests-open', 'requests-close', 'open-hub']);
+const ACTION_SLOT_COUNT = 3;
 const QUEUE_PREFIX = 'q1;';
 const MAX_MARKER_LENGTH = 1_024;
 
@@ -31,6 +32,11 @@ function normalizeAction(value) {
   return { action, token, requestedAt };
 }
 
+function actionSlot(action) {
+  if (['refresh-requests', 'requests-open', 'requests-close'].includes(action)) return 'requests';
+  return action;
+}
+
 export function encodePageActionMarker(value) {
   const action = normalizeAction(value);
   if (!action) return '';
@@ -42,7 +48,7 @@ export function encodePageActionQueue(values) {
   for (const value of Array.isArray(values) ? values : [values]) {
     const action = normalizeAction(value);
     if (!action) return '';
-    const existingIndex = actions.findIndex(item => item.action === action.action);
+    const existingIndex = actions.findIndex(item => actionSlot(item.action) === actionSlot(action.action));
     if (existingIndex >= 0) actions[existingIndex] = action;
     else actions.push(action);
   }
@@ -61,14 +67,14 @@ export function decodePageActionQueue(title) {
   const decoded = invisibleToBytes(marker);
   if (!decoded) return [];
   const entries = decoded.startsWith(QUEUE_PREFIX) ? decoded.slice(QUEUE_PREFIX.length).split(';') : [decoded];
-  if (!entries.length || entries.length > ACTIONS.size) return [];
+  if (!entries.length || entries.length > ACTION_SLOT_COUNT) return [];
   const actions = [];
   for (const entry of entries) {
     const [action, token, requestedAt, extra] = entry.split('|');
     const normalized = extra === undefined
       ? normalizeAction({ action, token: Number(token), requestedAt: Number(requestedAt) })
       : null;
-    if (!normalized || actions.some(item => item.action === normalized.action)) return [];
+    if (!normalized || actions.some(item => actionSlot(item.action) === actionSlot(normalized.action))) return [];
     actions.push(normalized);
   }
   return actions;
@@ -93,9 +99,10 @@ export function enqueuePageActionTitle(title, value, sentinel) {
     const action = String(candidate?.action || '');
     const token = Number(candidate?.token);
     const requestedAt = Number(candidate?.requestedAt);
-    if (!['refresh', 'refresh-requests', 'open-hub'].includes(action) || !Number.isSafeInteger(token) || token < 0 || !Number.isFinite(requestedAt) || requestedAt <= 0) return null;
+    if (!['refresh', 'refresh-requests', 'requests-open', 'requests-close', 'open-hub'].includes(action) || !Number.isSafeInteger(token) || token < 0 || !Number.isFinite(requestedAt) || requestedAt <= 0) return null;
     return { action, token, requestedAt };
   };
+  const slot = action => ['refresh-requests', 'requests-open', 'requests-close'].includes(action) ? 'requests' : action;
   const next = normalize(value);
   if (!next) return currentTitle;
 
@@ -125,13 +132,13 @@ export function enqueuePageActionTitle(title, value, sentinel) {
         for (const entry of entries.slice(0, 3)) {
           const [action, token, requestedAt, extra] = entry.split('|');
           const existing = extra === undefined ? normalize({ action, token: Number(token), requestedAt: Number(requestedAt) }) : null;
-          if (existing && !actions.some(item => item.action === existing.action)) actions.push(existing);
+          if (existing && !actions.some(item => slot(item.action) === slot(existing.action))) actions.push(existing);
         }
       }
     }
   }
 
-  const existingIndex = actions.findIndex(item => item.action === next.action);
+  const existingIndex = actions.findIndex(item => slot(item.action) === slot(next.action));
   if (existingIndex >= 0) actions[existingIndex] = next;
   else actions.push(next);
   const payload = `q1;${actions.map(action => `${action.action}|${action.token}|${action.requestedAt}`).join(';')}`;

@@ -1,6 +1,6 @@
 # 逐请求用量接口
 
-这是 v2 Balance Hub 的逐请求接口层。当前 Codex footer 的“最近请求”弹层在打开和手动刷新时调用本接口，展示当前供应商最新 10 条 Codex 调用。
+这是 v3 Balance Hub 的逐请求接口层。当前 Codex footer 的“最近请求”弹层在打开和手动刷新时调用本接口，展示当前供应商最新 10 条 Codex 调用。
 
 查询策略是“官方或第三方真实记录优先，CCSwitch 本地估算兜底”：第三方逐请求日志可用时返回供应商真实 `quota` 和换算金额；OpenAI Official 从 Codex 官方本机会话事件返回准确 Token，但不虚构 ChatGPT 订阅不存在的单次扣费金额；其他来源不支持、鉴权失败、WAF/网络异常或返回无效数据时，自动返回 CCSwitch `proxy_request_logs` 中的最近请求。
 

@@ -325,6 +325,10 @@ function abortableOperation(operation, signal) {
   });
 }
 
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw signal.reason || new Error('操作已取消');
+}
+
 function selectedTemplateOption(selection, type) {
   if (!selection || selection[`${type}Source`] !== 'manual') return '';
   return String(selection[`${type}TemplateId`] || '');
@@ -628,7 +632,7 @@ export class HubService {
         message: configurationChanged
           ? '供应商配置已变更，等待重新查询'
           : obsoleteSource
-          ? '等待 v2 独立余额中心重新查询'
+          ? '等待 v3 独立余额中心重新查询'
           : restoredBrowserFailure
             ? (websiteLoginRequired
               ? '显示上次成功余额；请点击“去官网认证”，完成后手动刷新'
@@ -1112,6 +1116,7 @@ export class HubService {
   }
 
   async queryRequestUsage(providerSelector, options = {}) {
+    throwIfAborted(options.signal);
     const provider = this.findProvider(providerSelector);
     if (!provider) {
       return {
@@ -1161,6 +1166,7 @@ export class HubService {
           ...(accountBinding ? { accountBinding } : {}),
           ...(requestUsageTemplateOption ? { requestUsageTemplateId: requestUsageTemplateOption } : {}),
         });
+        throwIfAborted(options.signal);
         if (requestProvider.id !== provider.id) {
           remoteResult = {
             ...remoteResult,
@@ -1169,6 +1175,7 @@ export class HubService {
           };
         }
       } catch (error) {
+        throwIfAborted(options.signal);
         remoteResult = {
           success: false,
           supported: true,
@@ -1199,6 +1206,7 @@ export class HubService {
       ...remoteResult,
       message: remoteResult?.message ? safeMessage(remoteResult.message, secrets) : '',
     };
+    throwIfAborted(options.signal);
     if (typeof this.repository?.getRecentRequests !== 'function') return remoteResult;
     try {
       const rows = getLocalRequestRows ? getLocalRequestRows(limit) : this.repository.getRecentRequests(provider.id, limit);

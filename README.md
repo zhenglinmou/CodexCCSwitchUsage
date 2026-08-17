@@ -1,6 +1,6 @@
 # Codex CCSwitch Usage
 
-一个 Windows/macOS 本地扩展：读取 CCSwitch 的 Codex 供应商信息，并把用量嵌入 Codex 输入栏。当前以 v2 Balance Hub 为主。
+一个 Windows/macOS 本地扩展：读取 CCSwitch 的 Codex 供应商信息，并把用量嵌入 Codex 输入栏。当前以 v3 Balance Hub 为主。
 
 ## 先看效果
 
@@ -25,22 +25,22 @@
 
 | 版本 | 分支 | 适用场景 | 用量来源 | All API Hub | 浏览器伴侣 |
 |---|---|---|---|---|---|
-| [v2.0.21](./docs/V2.md) | `v2` | 统一查看和管理全部 Codex / GPT 供应商 | v2 内置适配器与统一 Balance Hub | 支持 | 支持 |
+| [v3.0.0](./docs/V3.md) | `v3` | 统一查看和管理全部 Codex / GPT 供应商 | v3 内置适配器与统一 Balance Hub | 支持 | 支持 |
 
-- 使用 v2：阅读 [v2 用户文档](./docs/V2.md)；开发与热更新流程见 [v2 开发文档](./DEVELOPMENT.md)。
+- 使用 v3：阅读 [v3 用户文档](./docs/V3.md)；开发与热更新流程见 [v3 开发文档](./DEVELOPMENT.md)。
 - 旧版基本弃用，仅保留历史兼容；资料见 [旧版文档](./docs/V1.md)。
 - 隐私、安全边界与漏洞报告方式见 [隐私与安全政策](./SECURITY.md)。
 
 ## 分支策略
 
-- `v2`：当前 Balance Hub 版本的维护分支。
-- `main`：仓库默认分支，当前已快进到 v2 内容。
+- `v3`：当前 Balance Hub 版本的发布与维护分支。
+- `main`：仓库默认分支，保留上一稳定版本内容。
 
 源码模式支持 Windows 和 macOS；正式 Release 提供 Authenticode 签名的 Windows 安装包，以及 Developer ID 签名并经 Apple 公证的 Apple Silicon / Intel `.app` 压缩包。项目保持 CCSwitch 数据库只读，不修改 Codex 的 `app.asar`、MSIX 文件或 Codex 配置。
 
 ## macOS 源码运行
 
-macOS 支持源码模式；普通用户可从 v2 GitHub Release 下载对应架构且已公证的 `.app` 压缩包。源码运行要求 Node.js 22 或更高版本、已安装 CCSwitch，并让 Codex 以随机的本机回环 CDP 端口启动。若应用名为 `Codex`，可以使用：
+macOS 支持源码模式；普通用户可从 v3 GitHub Release 下载对应架构且已公证的 `.app` 压缩包。源码运行要求 Node.js 22 或更高版本、已安装 CCSwitch，并让 Codex 以随机的本机回环 CDP 端口启动。若应用名为 `Codex`，可以使用：
 
 ```bash
 CDP_PORT=$((49152 + RANDOM % 16384))

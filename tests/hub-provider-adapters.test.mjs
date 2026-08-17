@@ -1802,7 +1802,7 @@ test('OpenAI session fallback uses the browser logged into the configured accoun
   assert.deepEqual(sessionCalls.map(call => call.clientRef).sort(), ['chrome-openai', 'edge-openai']);
 });
 
-test('OpenAI WHAM failures use one fast probe and temporarily bypass repeated direct attempts', async () => {
+test('OpenAI WHAM direct backoff is isolated by account', async () => {
   let now = 1_000;
   let directCalls = 0;
   let browserCalls = 0;
@@ -1842,15 +1842,20 @@ test('OpenAI WHAM failures use one fast probe and temporarily bypass repeated di
 
   assert.equal(first.source, 'openai_wham_browser');
   assert.equal(second.source, 'openai_wham_browser');
-  assert.equal(directCalls, 1, 'the active backoff must skip the second direct probe');
+  assert.equal(directCalls, 2, 'one account backoff must not suppress another account probe');
   assert.equal(browserCalls, 2);
 
-  now += 100;
-  const third = await engine.query(provider('three', 'account-three'));
-
+  const third = await engine.query(provider('one-retry', 'account-one'));
   assert.equal(third.source, 'openai_wham_browser');
-  assert.equal(directCalls, 2, 'direct probing must resume after the backoff expires');
+  assert.equal(directCalls, 2, 'the same account must skip direct probing during its backoff');
   assert.equal(browserCalls, 3);
+
+  now += 100;
+  const fourth = await engine.query(provider('one-resumed', 'account-one'));
+
+  assert.equal(fourth.source, 'openai_wham_browser');
+  assert.equal(directCalls, 3, 'direct probing must resume for the account after its backoff expires');
+  assert.equal(browserCalls, 4);
 });
 
 test('OpenAI WHAM direct probing is time-bounded when a browser fallback is available', async () => {

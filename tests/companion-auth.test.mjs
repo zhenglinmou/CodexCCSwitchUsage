@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import test from 'node:test';
 import { buildCompanionAuth, verifyCompanionResponse } from '../browser-companion/auth.js';
 import { CompanionAuthenticator, signCompanionRequest } from '../src/companion-auth.mjs';
@@ -72,4 +73,13 @@ test('browser verifies that a Hub response is bound to its request, status, and 
   await assert.rejects(verifyCompanionResponse(TOKEN, {
     requestNonce, status: 200, body: '{"success":false}', headers, now,
   }), /签名验证失败/);
+});
+
+test('browser companion reuses only the non-extractable imported HMAC key', () => {
+  const source = fs.readFileSync(new URL('../browser-companion/auth.js', import.meta.url), 'utf8');
+
+  assert.match(source, /let cachedSecret = ''/);
+  assert.match(source, /let cachedKeyPromise = null/);
+  assert.match(source, /if \(value === cachedSecret && cachedKeyPromise\) return cachedKeyPromise/);
+  assert.match(source, /crypto\.subtle\.importKey\(\s*'raw',\s*bytes\(value\),\s*\{ name: 'HMAC', hash: 'SHA-256' \},\s*false/);
 });

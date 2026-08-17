@@ -1,6 +1,6 @@
 # CCSwitch `usage_script` 返回格式说明
 
-> 本文是 v1 脚本兼容文档。v2 Balance Hub 不执行 CCSwitch 中的 `usage_script`；v2 的数据流和内置适配器说明见 [docs/V2.md](./docs/V2.md)。
+> 本文是 v1 脚本兼容文档。v3 Balance Hub 不执行 CCSwitch 中的 `usage_script`；v3 的数据流和内置适配器说明见 [docs/V3.md](./docs/V3.md)。
 
 本文说明 CCSwitch 自定义用量查询脚本应如何编写，以及 CodexCCSwitchUsage 实际接受什么样的返回数据。
 

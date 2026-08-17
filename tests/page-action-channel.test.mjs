@@ -49,6 +49,24 @@ test('balance, request-log, and Hub actions share one bounded queue', () => {
   assert.ok(title.length - 'Codex'.length < 1_024);
 });
 
+test('request popover open and close replace one request-interest queue slot', () => {
+  const open = { action: 'requests-open', token: 4, requestedAt: 1_784_100_000_004 };
+  const close = { action: 'requests-close', token: 5, requestedAt: 1_784_100_000_005 };
+  const title = [
+    { action: 'refresh', token: 1, requestedAt: 1_784_100_000_001 },
+    open,
+    { action: 'open-hub', token: 3, requestedAt: 1_784_100_000_003 },
+    close,
+  ].reduce((value, action) => enqueuePageActionTitle(value, action, PAGE_ACTION_SENTINEL), 'Codex');
+
+  assert.deepEqual(decodePageActionQueue(title), [
+    { action: 'refresh', token: 1, requestedAt: 1_784_100_000_001 },
+    close,
+    { action: 'open-hub', token: 3, requestedAt: 1_784_100_000_003 },
+  ]);
+  assert.ok(title.length - 'Codex'.length <= 1_024);
+});
+
 test('repeated actions coalesce to the latest token without dropping the other action type', () => {
   const queued = encodePageActionQueue([
     { action: 'refresh', token: 1, requestedAt: 100 },

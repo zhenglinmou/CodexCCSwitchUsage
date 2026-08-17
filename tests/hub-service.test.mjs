@@ -44,7 +44,7 @@ test('provider fingerprints include built-in balance and request template select
   );
 });
 
-test('provider fingerprints ignore the legacy usage script payload in v2', () => {
+test('provider fingerprints ignore the legacy usage script payload in v3', () => {
   const base = provider('legacy', '未识别中转');
   const first = providerConfigurationFingerprint({
     ...base,
@@ -254,6 +254,39 @@ test('request usage prefers exact provider logs without reading CCSwitch fallbac
   const { getLocalRequestRows, ...staticRequestOptions } = requestOptions;
   assert.equal(typeof getLocalRequestRows, 'function');
   assert.deepEqual(staticRequestOptions, { limit: 10, appType: 'codex', strictAppType: true });
+  assert.equal(localReads, 0);
+});
+
+test('request usage propagates caller cancellation without reading fallback rows', async () => {
+  const item = provider('cancelled-requests', 'agentrouter');
+  let localReads = 0;
+  let started;
+  const queryStarted = new Promise(resolve => { started = resolve; });
+  const service = new HubService({
+    getAll: () => [item],
+    getRecentRequests() {
+      localReads += 1;
+      return [];
+    },
+  }, { async query() { return {}; } }, {
+    requestUsageEngine: {
+      async query(_provider, options) {
+        started();
+        await new Promise((_resolve, reject) => {
+          const abort = () => reject(options.signal.reason || new Error('cancelled'));
+          if (options.signal.aborted) abort();
+          else options.signal.addEventListener('abort', abort, { once: true });
+        });
+      },
+    },
+  });
+  const controller = new AbortController();
+  const query = service.queryRequestUsage(item.id, { limit: 10, signal: controller.signal });
+  await queryStarted;
+
+  controller.abort(new Error('recent requests closed'));
+
+  await assert.rejects(query, /recent requests closed/);
   assert.equal(localReads, 0);
 });
 

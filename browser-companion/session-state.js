@@ -257,11 +257,23 @@ export class SessionHintStore {
     this.storage = storage;
     this.key = key;
     this.updateChain = Promise.resolve();
+    this.cache = null;
+    this.readPromise = null;
+    this.generation = 0;
   }
 
   async list() {
-    const stored = await this.storage.get([this.key]);
-    return normalizeSessionOrigins(stored?.[this.key]);
+    return [...(await this.#readSnapshot()).value];
+  }
+
+  invalidate() {
+    this.generation += 1;
+    this.cache = null;
+    this.readPromise = null;
+  }
+
+  replace(origins) {
+    return this.#update(() => origins);
   }
 
   remember(origin) {
@@ -283,16 +295,39 @@ export class SessionHintStore {
 
   #update(transform) {
     this.updateChain = this.updateChain.catch(() => {}).then(async () => {
-      const stored = await this.storage.get([this.key]);
-      const raw = stored?.[this.key];
-      const current = normalizeSessionOrigins(raw);
+      const snapshot = await this.#readSnapshot();
+      const current = snapshot.value;
       const next = normalizeSessionOrigins(transform(current));
       const unchanged = current.length === next.length && current.every((value, index) => value === next[index]);
-      if (unchanged && hasCanonicalSessionOrigins(raw, current)) return current;
+      if (unchanged && snapshot.canonical) return [...current];
+      const generation = this.generation;
       await this.storage.set({ [this.key]: next });
-      return next;
+      if (generation === this.generation) this.cache = { value: next, canonical: true };
+      return [...next];
     });
     return this.updateChain;
+  }
+
+  async #readSnapshot() {
+    if (this.cache) return this.cache;
+    if (this.readPromise) return this.readPromise;
+    const generation = this.generation;
+    const operation = this.storage.get([this.key]).then(stored => {
+      const raw = stored?.[this.key];
+      const value = normalizeSessionOrigins(raw);
+      const snapshot = {
+        value,
+        canonical: hasCanonicalSessionOrigins(raw, value),
+      };
+      if (generation === this.generation) this.cache = snapshot;
+      return snapshot;
+    });
+    this.readPromise = operation;
+    try {
+      return await operation;
+    } finally {
+      if (this.readPromise === operation) this.readPromise = null;
+    }
   }
 }
 
@@ -301,13 +336,21 @@ export class SessionIdentityStore {
     this.storage = storage;
     this.key = key;
     this.updateChain = Promise.resolve();
+    this.cache = null;
+    this.readPromise = null;
+    this.generation = 0;
   }
 
   async get(origin) {
     const normalized = normalizeSessionOrigin(origin);
     if (!normalized) return '';
-    const stored = await this.storage.get([this.key]);
-    return normalizeSessionUserIds(stored?.[this.key])[normalized] || '';
+    return (await this.#readSnapshot()).value[normalized] || '';
+  }
+
+  invalidate() {
+    this.generation += 1;
+    this.cache = null;
+    this.readPromise = null;
   }
 
   remember(origin, userId) {
@@ -329,19 +372,39 @@ export class SessionIdentityStore {
 
   #update(transform) {
     this.updateChain = this.updateChain.catch(() => {}).then(async () => {
-      const stored = await this.storage.get([this.key]);
-      const raw = stored?.[this.key];
-      const current = normalizeSessionUserIds(raw);
+      const snapshot = await this.#readSnapshot();
+      const current = snapshot.value;
       const next = normalizeSessionUserIds(transform(current));
       const currentKeys = Object.keys(current);
       const nextKeys = Object.keys(next);
       const unchanged = currentKeys.length === nextKeys.length
         && currentKeys.every(origin => current[origin] === next[origin]);
-      if (unchanged && hasCanonicalSessionUserIds(raw, current)) return current;
+      if (unchanged && snapshot.canonical) return { ...current };
+      const generation = this.generation;
       await this.storage.set({ [this.key]: next });
-      return next;
+      if (generation === this.generation) this.cache = { value: next, canonical: true };
+      return { ...next };
     });
     return this.updateChain;
+  }
+
+  async #readSnapshot() {
+    if (this.cache) return this.cache;
+    if (this.readPromise) return this.readPromise;
+    const generation = this.generation;
+    const operation = this.storage.get([this.key]).then(stored => {
+      const raw = stored?.[this.key];
+      const value = normalizeSessionUserIds(raw);
+      const snapshot = { value, canonical: hasCanonicalSessionUserIds(raw, value) };
+      if (generation === this.generation) this.cache = snapshot;
+      return snapshot;
+    });
+    this.readPromise = operation;
+    try {
+      return await operation;
+    } finally {
+      if (this.readPromise === operation) this.readPromise = null;
+    }
   }
 }
 

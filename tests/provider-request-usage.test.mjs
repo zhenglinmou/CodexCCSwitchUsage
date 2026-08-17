@@ -279,6 +279,81 @@ test('OpenAI Official session query selects newest files before applying the fil
   assert.equal(result.complete, false, 'the bounded file list must report that older sessions were omitted');
 });
 
+test('OpenAI Official cold session scans stop at a total byte budget', async t => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-byte-budget-'));
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  writeCodexAuth(codexHome, 'byte-budget-account');
+  const writeSession = (id, timestamp, padding) => {
+    const filename = path.join(codexHome, 'sessions', `${id}.jsonl`);
+    writeJsonLines(filename, [
+      { timestamp, type: 'session_meta', payload: { id, model_provider: 'openai' } },
+      { timestamp, type: 'turn_context', payload: { model: 'gpt-5.6-sol', padding } },
+      { timestamp, type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { total_tokens: 1 }, last_token_usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 } } } },
+    ]);
+    fs.utimesSync(filename, new Date(timestamp), new Date(timestamp));
+    return filename;
+  };
+  const newest = writeSession('newest', '2026-08-05T00:00:00.000Z', 'x'.repeat(2_000));
+  writeSession('older', '2026-08-04T00:00:00.000Z', 'y'.repeat(2_000));
+  const reader = new CodexSessionUsageReader({
+    codexHome,
+    maximumColdScanBytes: fs.statSync(newest).size + 64,
+  });
+
+  const result = await reader.query({
+    id: 'openai-byte-budget', name: 'OpenAI Official', websiteUrl: 'https://chatgpt.com/codex',
+    auth: { tokens: { account_id: 'byte-budget-account' } },
+  }, { limit: 10 });
+
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].id.startsWith('newest:'), true);
+  assert.equal(result.complete, false);
+  assert.equal(result.scanBudgetExceeded, true);
+
+  const engine = new ProviderRequestUsageEngine({
+    codexSessionUsageReader: {
+      async query() {
+        return { ...result, scanBudgetExceeded: true };
+      },
+    },
+  });
+  const engineResult = await engine.query({
+    id: 'openai-byte-budget', name: 'OpenAI Official', websiteUrl: 'https://chatgpt.com/codex',
+    auth: { tokens: { account_id: 'byte-budget-account' } },
+  }, { limit: 10 });
+  assert.equal(engineResult.officialIndexComplete, false);
+  assert.match(engineResult.message, /达到本地扫描上限/);
+});
+
+test('OpenAI Official session queries propagate caller cancellation before scanning', async t => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-cancel-'));
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  writeCodexAuth(codexHome, 'cancel-account');
+  const controller = new AbortController();
+  controller.abort(new Error('recent requests closed'));
+  const reader = new CodexSessionUsageReader({ codexHome });
+
+  await assert.rejects(reader.query({
+    id: 'openai-cancel', name: 'OpenAI Official', websiteUrl: 'https://chatgpt.com/codex',
+    auth: { tokens: { account_id: 'cancel-account' } },
+  }, { limit: 10, signal: controller.signal }), /recent requests closed/);
+
+  let receivedSignal = null;
+  const engine = new ProviderRequestUsageEngine({
+    codexSessionUsageReader: {
+      async query(_provider, options) {
+        receivedSignal = options.signal;
+        throw options.signal.reason;
+      },
+    },
+  });
+  await assert.rejects(engine.query({
+    id: 'openai-cancel', name: 'OpenAI Official', websiteUrl: 'https://chatgpt.com/codex',
+    auth: { tokens: { account_id: 'cancel-account' } },
+  }, { limit: 10, signal: controller.signal }), /recent requests closed/);
+  assert.strictEqual(receivedSignal, controller.signal);
+});
+
 test('OpenAI Official session index resets at an account switch and excludes prior-account events', async t => {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-account-switch-'));
   t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
@@ -408,11 +483,45 @@ test('Codex session reader defers index loading until its first query', async t 
   assert.equal(result.items[0].id, 'active-session:0:1');
 });
 
-test('Codex session index persistence uses an awaited asynchronous file write', () => {
+test('Codex session index persistence awaits the cold snapshot and coalesces later writes', () => {
   const source = fs.readFileSync(new URL('../src/provider-request-usage.mjs', import.meta.url), 'utf8');
 
-  assert.match(source, /await this\.\#writeIndex\(\);/);
+  assert.match(source, /await this\.\#persistInitialIndex\(\);/);
+  assert.match(source, /this\.\#scheduleIndexWrite\(\);/);
   assert.match(source, /await secureAtomicWriteFile\(this\.indexPath/);
+});
+
+test('Codex session index flush persists one coalesced append snapshot', async t => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-flush-index-'));
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  writeCodexAuth(codexHome, 'flush-index-account');
+  const filename = path.join(codexHome, 'sessions', 'active.jsonl');
+  writeJsonLines(filename, [
+    { timestamp: '2026-08-01T00:00:00.000Z', type: 'session_meta', payload: { id: 'active', model_provider: 'openai' } },
+    { timestamp: '2026-08-01T00:00:01.000Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { total_tokens: 1 }, last_token_usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 } } } },
+  ]);
+  const indexPath = path.join(codexHome, 'runtime', 'codex-session-index.json');
+  const reader = new CodexSessionUsageReader({ codexHome, indexPath, indexWriteDelayMs: 60_000 });
+  const provider = {
+    id: 'openai-flush', name: 'OpenAI Official', websiteUrl: 'https://chatgpt.com/codex',
+    auth: { tokens: { account_id: 'flush-index-account' } },
+  };
+
+  await reader.query(provider, { limit: 10 });
+  const firstPersisted = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+  fs.appendFileSync(filename, `${JSON.stringify({
+    timestamp: '2026-08-01T00:00:02.000Z', type: 'event_msg', payload: {
+      type: 'token_count', info: { total_token_usage: { total_tokens: 2 }, last_token_usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 } },
+    },
+  })}\n`, 'utf8');
+  const live = await reader.query(provider, { limit: 10 });
+  const beforeFlush = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+
+  assert.equal(live.totalRecords, 2);
+  assert.deepEqual(beforeFlush, firstPersisted);
+  await reader.close();
+  const afterFlush = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+  assert.equal(afterFlush.files[0].entry.result.recordCount, 2);
 });
 
 test('OpenAI Official session index parses only appended JSONL records', async t => {
