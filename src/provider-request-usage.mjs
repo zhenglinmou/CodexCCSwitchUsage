@@ -36,7 +36,13 @@ const NEW_API_LOG_ADAPTERS = Object.freeze([
     origin: 'https://anyrouter.top',
     browserFallback: true,
   },
-  { id: 'agentrouter', label: 'AgentRouter', domains: ['agentrouter.org'] },
+  {
+    id: 'agentrouter',
+    label: 'AgentRouter',
+    domains: ['agentrouter.org'],
+    browserFallback: true,
+    accountLogScope: true,
+  },
   { id: 'chy', label: 'CHY 公益站', domains: ['chybenzun.top'] },
   { id: 'freely', label: 'freely', domains: ['free.lyclaude.site'] },
   { id: 'jianzhile', label: '简直了', domains: ['jianzhile.vip'] },
@@ -1067,18 +1073,91 @@ function correlateAccountLogRows(accountRows, localRows, appType = '', options =
   };
 }
 
-function accountLogRequestPath(localRows) {
+function normalizedNewApiKey(value) {
+  return String(value || '').trim().replace(/^sk-/i, '');
+}
+
+function maskedNewApiKeyMatches(value, apiKey) {
+  const candidate = normalizedNewApiKey(value);
+  const expected = normalizedNewApiKey(apiKey);
+  if (!candidate || !expected) return false;
+  if (!candidate.includes('*')) return candidate === expected;
+  const firstMask = candidate.indexOf('*');
+  const lastMask = candidate.lastIndexOf('*');
+  const prefix = candidate.slice(0, firstMask);
+  const suffix = candidate.slice(lastMask + 1);
+  return prefix.length >= 2
+    && suffix.length >= 2
+    && expected.startsWith(prefix)
+    && expected.endsWith(suffix);
+}
+
+function parseAccountTokenOwnership(payload, apiKey, providerName) {
+  const data = payload?.data;
+  const items = Array.isArray(data)
+    ? data
+    : Array.isArray(data?.items)
+      ? data.items
+      : Array.isArray(data?.data)
+        ? data.data
+        : null;
+  if (payload?.success !== true || !items) {
+    throw new Error(redactedMessage(payload?.message || `${providerName} API Key 列表响应格式无效`));
+  }
+  const matched = items.find(item => maskedNewApiKeyMatches(item?.key, apiKey));
+  if (!matched) return null;
+  const tokenName = cleanText(matched?.name || matched?.token_name, 160);
+  return {
+    tokenId: integerOrNull(matched?.id),
+    tokenName,
+  };
+}
+
+function parseAccountLogStat(payload, providerName) {
+  const data = payload?.data;
+  if (
+    payload?.success !== true
+    || !data
+    || typeof data !== 'object'
+    || Array.isArray(data)
+  ) {
+    throw new Error(redactedMessage(payload?.message || `${providerName}账户日志统计响应格式无效`));
+  }
+  const quota = finiteNumber(data.quota);
+  const rpm = finiteNumber(data.rpm);
+  const tpm = finiteNumber(data.tpm);
+  if (quota == null || rpm == null || tpm == null) {
+    throw new Error(`${providerName}账户日志统计缺少 quota/rpm/tpm`);
+  }
+  return { quota, rpm, tpm };
+}
+
+function accountLogFilters(localRows, tokenName = '') {
   const query = new URLSearchParams({
-    p: '1',
-    page_size: String(ACCOUNT_LOG_PAGE_SIZE),
     type: '0',
+    token_name: String(tokenName || ''),
+    model_name: '',
   });
   const timestamps = localRows.map(localRequestTimestamp).filter(value => value != null);
   if (timestamps.length > 0) {
     query.set('start_timestamp', String(Math.max(1, Math.floor(Math.min(...timestamps)) - 5)));
     query.set('end_timestamp', String(Math.ceil(Math.max(...timestamps)) + 5));
   }
-  return `/api/log/self/?${query.toString()}`;
+  query.set('group', '');
+  return query;
+}
+
+function accountLogRequestPath(localRows, options = {}) {
+  const query = accountLogFilters(localRows, options.tokenName);
+  query.set('p', '1');
+  query.set('page_size', String(ACCOUNT_LOG_PAGE_SIZE));
+  const suffix = options.providerAdapterId === 'agentrouter' ? '' : '/';
+  return `/api/log/self${suffix}?${query.toString()}`;
+}
+
+function accountLogStatRequestPath(localRows, tokenName = '') {
+  const query = accountLogFilters(localRows, tokenName);
+  return `/api/log/self/stat?${query.toString()}`;
 }
 
 function parseCacheCreationTokens(other) {
@@ -1529,9 +1608,57 @@ export class ProviderRequestUsageEngine {
     }
     if (clients.length === 0) return accountScopeFailure();
 
-    const requestPath = accountLogRequestPath(correlatableLocalRows);
     for (const client of clients) {
       try {
+        let scopedToken = null;
+        let accountStat = null;
+        if (config.adapterId === 'agentrouter') {
+          const ownershipRaw = await this.browserBroker.queryJsonOnClient(
+            client.clientRef || client.clientId,
+            {
+              baseUrl: config.origin,
+              requestPath: '/api/token/?p=1&size=100',
+              headers: { Accept: 'application/json' },
+              userHeader: 'New-Api-User',
+              navigateRequest: false,
+            },
+            { signal },
+          );
+          if (ownershipRaw?.identityMissing === true || Number(ownershipRaw?.status) !== 200) continue;
+          const ownership = parseAccountTokenOwnership(
+            parseBrowserJson(ownershipRaw?.text),
+            provider.apiKey,
+            providerLabel(provider),
+          );
+          // AgentRouter's self-log is account-wide. Require the browser's
+          // token list to prove the current API Key before reading it, and
+          // pass the verified token name back to the server-side filter.
+          if (!ownership?.tokenName) continue;
+          scopedToken = ownership;
+          try {
+            const statRaw = await this.browserBroker.queryJsonOnClient(
+              client.clientRef || client.clientId,
+              {
+                baseUrl: config.origin,
+                requestPath: accountLogStatRequestPath(correlatableLocalRows, scopedToken.tokenName),
+                headers: { Accept: 'application/json' },
+                userHeader: 'New-Api-User',
+                navigateRequest: false,
+              },
+              { signal },
+            );
+            if (statRaw?.identityMissing !== true && Number(statRaw?.status) === 200) {
+              accountStat = parseAccountLogStat(parseBrowserJson(statRaw?.text), providerLabel(provider));
+            }
+          } catch {
+            // The stat endpoint is supplementary; the filtered detail rows
+            // remain authoritative for the recent-request list.
+          }
+        }
+        const requestPath = accountLogRequestPath(correlatableLocalRows, {
+          providerAdapterId: config.adapterId,
+          tokenName: scopedToken?.tokenName,
+        });
         const raw = await this.browserBroker.queryJsonOnClient(
           client.clientRef || client.clientId,
           {
@@ -1570,6 +1697,9 @@ export class ProviderRequestUsageEngine {
           correlationIdentity: correlation.identityType,
           localCorrelationMatches: correlation.matchCount,
           accountBrowser: cleanText(client.browser, 40),
+          ...(scopedToken?.tokenName ? { accountTokenName: scopedToken.tokenName } : {}),
+          ...(scopedToken?.tokenId != null ? { accountTokenId: scopedToken.tokenId } : {}),
+          ...(accountStat ? { accountStat } : {}),
           ...(!billing.available ? { message: billing.warning, degraded: true } : {}),
           items,
         };

@@ -9,6 +9,7 @@ import {
   calculateResponsiveMeasurements,
   classifyComposerMutations,
   createInjectorEventController,
+  findComposerSurface,
   findMutationObserverTarget,
   findUsageTooltipTarget,
   getUsageFreshness,
@@ -113,6 +114,29 @@ test('every programmatic popover close synchronizes trigger and dialog ARIA stat
   assert.doesNotMatch(responsive, /state\.popoverOpen = false/);
 });
 
+test('composer surface discovery skips inner utility classes that mention composer', () => {
+  const surface = { name: 'surface containing the editor and footer' };
+  const inputWrapper = { className: 'in-[[data-composer-body]]:h-full p-[var(--composer-editor-padding,0px)]' };
+  const editor = {
+    closest(selector) {
+      // A combined selector would stop at this nearer input-only wrapper.
+      return selector.includes('[class*="composer"]') ? inputWrapper : surface;
+    },
+  };
+
+  assert.equal(findComposerSurface(editor), surface);
+});
+
+test('composer surface discovery retains the legacy fallback and handles absent surfaces', () => {
+  const legacySurface = { className: 'composer-container' };
+  const editor = {
+    closest: selector => selector === '[class*="composer"]' ? legacySurface : null,
+  };
+  assert.equal(findComposerSurface(editor), legacySurface);
+  assert.equal(findComposerSurface({ closest: () => null }), null);
+  assert.equal(findComposerSurface(null), null);
+});
+
 test('composer footer detection accepts the embedded-editor grid and rejects its wrapper', () => {
   const editor = {};
   const actionPart = {
@@ -166,7 +190,8 @@ test('composer discovery supports the Codex 26.730 responsive layout attributes'
   );
 
   assert.match(discovery, /\[contenteditable="true"\]\[data-codex-composer="true"\]/);
-  assert.match(discovery, /\[data-composer-surface-variant\]/);
+  assert.match(script, /\[data-composer-surface-variant\]/);
+  assert.match(discovery, /findComposerSurface\(editor\)/);
   assert.match(discovery, /\[data-composer-footer-responsive\]/);
   assert.match(discovery, /hasAttribute\('data-composer-footer-responsive'\)/);
 });

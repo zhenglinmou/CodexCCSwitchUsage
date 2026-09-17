@@ -186,6 +186,14 @@ export function updateElementAttribute(element, name, value) {
   return true;
 }
 
+export function findComposerSurface(editor) {
+  // Utility classes inside the editor can mention composer CSS variables/selectors.
+  // Prefer the actual surface marker before the legacy class-name fallback.
+  return editor?.closest?.('.composer-surface-chrome, [data-composer-surface], [data-composer-surface-variant]')
+    || editor?.closest?.('[class*="composer"]')
+    || null;
+}
+
 export function isComposerFooterCandidate(element, editor, rect, editorRect) {
   const children = Array.from(element?.children || []);
   if (!editor || children.length < 3 || !rect || !editorRect) return false;
@@ -264,9 +272,9 @@ export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = glob
 }
 
 export { PAGE_ACTION_SENTINEL };
-export const INJECTOR_VERSION = 95;
+export const INJECTOR_VERSION = 96;
 
-function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, formatRequestTime, calculatePopoverPlacement, selectResponsiveUsageMode, calculateResponsiveMeasurements, calculateExpandedNativeTriggerMaxWidth, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, enqueuePageActionTitle, pageActionSentinel, version) {
+function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, formatRequestTime, calculatePopoverPlacement, selectResponsiveUsageMode, calculateResponsiveMeasurements, calculateExpandedNativeTriggerMaxWidth, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, findComposerSurface, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, enqueuePageActionTitle, pageActionSentinel, version) {
   const VERSION = version;
   const GLOBAL = '__CODEX_CCSWITCH_USAGE__';
   const ROOT_ID = 'codex-ccswitch-usage-root';
@@ -439,7 +447,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     for (const editor of editors) {
       const editorRect = editor.getBoundingClientRect();
       if (!editor.isConnected || editorRect.width <= 0 || editorRect.height <= 0) continue;
-      const surface = editor.closest('.composer-surface-chrome, [data-composer-surface], [data-composer-surface-variant], [class*="composer"]');
+      const surface = findComposerSurface(editor);
       if (!surface) continue;
       const footer = findComposerFooter(surface, editor);
       if (footer && !footers.includes(footer)) footers.push(footer);
@@ -1754,7 +1762,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
 }
 
 export function buildInjectorScript() {
-  return `(${installCodexUsageExtension.toString()})(${findUsageTooltipTarget.toString()},${isUsageTooltipBoundaryCrossing.toString()},${getUsageFreshness.toString()},${formatUsageAge.toString()},${formatRequestTime.toString()},${calculatePopoverPlacement.toString()},${selectResponsiveUsageMode.toString()},${calculateResponsiveMeasurements.toString()},${calculateExpandedNativeTriggerMaxWidth.toString()},${stabilizeResponsiveUsageMode.toString()},${findMutationObserverTarget.toString()},${classifyComposerMutations.toString()},${createInjectorEventController.toString()},${updateElementAttribute.toString()},${isComposerFooterCandidate.toString()},${isNativeFlowCacheValid.toString()},${resolveNativeFlowPlacement.toString()},${enqueuePageActionTitle.toString()},${JSON.stringify(PAGE_ACTION_SENTINEL)},${INJECTOR_VERSION})`;
+  return `(${installCodexUsageExtension.toString()})(${findUsageTooltipTarget.toString()},${isUsageTooltipBoundaryCrossing.toString()},${getUsageFreshness.toString()},${formatUsageAge.toString()},${formatRequestTime.toString()},${calculatePopoverPlacement.toString()},${selectResponsiveUsageMode.toString()},${calculateResponsiveMeasurements.toString()},${calculateExpandedNativeTriggerMaxWidth.toString()},${stabilizeResponsiveUsageMode.toString()},${findMutationObserverTarget.toString()},${classifyComposerMutations.toString()},${createInjectorEventController.toString()},${updateElementAttribute.toString()},${findComposerSurface.toString()},${isComposerFooterCandidate.toString()},${isNativeFlowCacheValid.toString()},${resolveNativeFlowPlacement.toString()},${enqueuePageActionTitle.toString()},${JSON.stringify(PAGE_ACTION_SENTINEL)},${INJECTOR_VERSION})`;
 }
 
 export const UPDATE_GLOBAL = '__CODEX_CCSWITCH_USAGE__';

@@ -1027,6 +1027,89 @@ test('empty Token logs auto-detect safely correlated browser account logs on any
   assert.match(browserCalls[0].request.requestPath, /page_size=100/);
 });
 
+test('AgentRouter scopes official self logs to the verified token and reads the official stat endpoint', async () => {
+  const browserCalls = [];
+  const engine = new ProviderRequestUsageEngine({
+    fetchImpl: async url => new Response(JSON.stringify(String(url).endsWith('/api/status')
+      ? statusPayload()
+      : logPayload([])), { status: 200 }),
+    browserBroker: {
+      isConnected: () => true,
+      listQueryClients: () => [{ clientRef: 'edge-agentrouter', browser: 'Edge', hasSession: true }],
+      async queryJsonOnClient(clientRef, request) {
+        browserCalls.push({ clientRef, request });
+        if (request.requestPath.startsWith('/api/token/')) {
+          return {
+            status: 200,
+            text: JSON.stringify({
+              success: true,
+              data: [{ id: 7, name: 'lemon', key: 'sk-agent************router' }],
+            }),
+          };
+        }
+        if (request.requestPath.startsWith('/api/log/self/stat')) {
+          return {
+            status: 200,
+            text: JSON.stringify({ success: true, data: { quota: 13455, rpm: 0, tpm: 0 } }),
+          };
+        }
+        return {
+          status: 200,
+          text: JSON.stringify(accountLogPayload([
+            {
+              id: 12, token_id: 7, token_name: 'lemon', created_at: 1_700_000_099, type: 2,
+              model_name: 'gpt-5.6-sol', quota: 90_000, prompt_tokens: 5_000, completion_tokens: 50,
+              other: JSON.stringify({ request_path: '/v1/responses' }),
+            },
+            {
+              id: 11, token_id: 7, token_name: 'lemon', created_at: 1_700_000_090, type: 2,
+              model_name: 'gpt-5.6-sol', quota: 80_000, prompt_tokens: 4_000, completion_tokens: 40,
+              other: JSON.stringify({ request_path: '/v1/responses' }),
+            },
+          ])),
+        };
+      },
+    },
+  });
+
+  const result = await engine.query({
+    id: 'agentrouter-owned',
+    name: 'agentrouter',
+    apiBaseUrl: 'https://agentrouter.org/v1',
+    apiKey: 'sk-agentrouter',
+  }, {
+    requestUsageTemplateId: 'new-api-token-log',
+    appType: 'codex',
+    strictAppType: true,
+    getLocalRequestRows: () => [
+      {
+        createdAt: '2023-11-14T22:14:59.000Z', model: 'gpt-5.6-sol', requestModel: 'gpt-5.6-sol',
+        inputTokens: 5_000, outputTokens: 50, statusCode: 200,
+      },
+      {
+        createdAt: '2023-11-14T22:14:50.000Z', model: 'gpt-5.6-sol', requestModel: 'gpt-5.6-sol',
+        inputTokens: 4_000, outputTokens: 40, statusCode: 200,
+      },
+    ],
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.source, 'provider_account_log');
+  assert.equal(result.accountTokenName, 'lemon');
+  assert.equal(result.accountTokenId, 7);
+  assert.deepEqual(result.accountStat, { quota: 13455, rpm: 0, tpm: 0 });
+  assert.equal(result.items[0].totalCost, 0.18);
+  assert.deepEqual(browserCalls.map(call => call.request.requestPath.startsWith('/api/token/')
+    ? 'token'
+    : call.request.requestPath.startsWith('/api/log/self/stat')
+      ? 'stat'
+      : 'self'), ['token', 'stat', 'self']);
+  assert.ok(browserCalls.every(call => call.request.headers.Authorization === undefined));
+  assert.match(browserCalls[1].request.requestPath, /token_name=lemon/);
+  assert.match(browserCalls[2].request.requestPath, /token_name=lemon/);
+  assert.match(browserCalls[2].request.requestPath, /page_size=100/);
+});
+
 test('account-log correlation accepts provider completion counts that exclude reasoning output', async () => {
   const engine = new ProviderRequestUsageEngine({
     fetchImpl: async url => new Response(JSON.stringify(String(url).endsWith('/api/status')
