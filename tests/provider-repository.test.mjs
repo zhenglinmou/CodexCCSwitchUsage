@@ -1,6 +1,127 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { parseProviderRow, ProviderRepository } from '../src/provider-repository.mjs';
+
+function liveStateRepository(t) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-provider-live-state-'));
+  const databasePath = path.join(directory, 'cc-switch.db');
+  const database = new DatabaseSync(databasePath);
+  database.exec(`
+    CREATE TABLE providers (
+      id TEXT, app_type TEXT, name TEXT, website_url TEXT, is_current INTEGER,
+      sort_index INTEGER, settings_config TEXT DEFAULT '{}', meta TEXT DEFAULT '{}',
+      PRIMARY KEY (id, app_type)
+    );
+    INSERT INTO providers (id, app_type, name, is_current, sort_index) VALUES
+      ('tyz', 'codex', '允熙官方 -tyz-外网', 1, 0),
+      ('zlm', 'codex', '允熙官方-zlm-外网', 0, 1),
+      ('claude-only', 'claude', 'Claude', 1, 0);
+  `);
+  const repository = new ProviderRepository(databasePath);
+  t.after(() => {
+    repository.close();
+    database.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  let revision = 0;
+  const writeState = value => {
+    fs.writeFileSync(repository.liveStatePath, typeof value === 'string' ? value : JSON.stringify(value));
+    const timestamp = new Date(Date.now() + ++revision * 1_000);
+    fs.utimesSync(repository.liveStatePath, timestamp, timestamp);
+  };
+  return { repository, database, writeState };
+}
+
+function proxyLiveState(id, overrides = {}) {
+  return { version: 1, apps: { codex: { mode: 'proxy', attached: true, proxy_route: id, ...overrides } } };
+}
+
+test('CCSwitch proxy live route overrides the stale SQLite selection across repository views', t => {
+  const { repository, database, writeState } = liveStateRepository(t);
+  assert.equal(repository.getCurrent().id, 'tyz');
+  const legacyAll = repository.getAll();
+  assert.equal(repository.getById('tyz').isCurrent, true);
+  assert.equal(repository.getByName('允熙官方-zlm-外网').isCurrent, false);
+
+  writeState(proxyLiveState('zlm', { contract: { key: 'never-expose-contract-key' } }));
+  const current = repository.getCurrent();
+  assert.equal(current.id, 'zlm');
+  assert.equal(current.isCurrent, true);
+  assert.notEqual(repository.getAll(), legacyAll);
+  assert.deepEqual(repository.getAll().filter(item => item.isCurrent).map(item => item.id), ['zlm']);
+  assert.equal(repository.getById('tyz').isCurrent, false);
+  assert.equal(repository.getById('zlm').isCurrent, true);
+  assert.equal(repository.getByName('允熙官方 -tyz-外网').isCurrent, false);
+  assert.equal(repository.getByName('允熙官方-zlm-外网').isCurrent, true);
+  assert.doesNotMatch(JSON.stringify(current), /never-expose-contract-key/);
+  assert.deepEqual(database.prepare("SELECT id FROM providers WHERE app_type = 'codex' AND is_current = 1").all().map(row => row.id), ['tyz']);
+});
+
+test('live-route-only switches invalidate change tokens and cached current flags without changing SQLite', t => {
+  const { repository, writeState } = liveStateRepository(t);
+  const databaseStat = fs.statSync(repository.databasePath);
+  writeState(proxyLiveState('zlm'));
+  const token = repository.getChangeToken();
+  const snapshot = repository.getAll();
+  const current = repository.getCurrent();
+  assert.equal(repository.getAll(), snapshot);
+  assert.equal(repository.getCurrent(), current);
+  writeState(proxyLiveState('zlm', { contract: { version: 1, key: 'changed-contract' } }));
+  assert.notEqual(repository.getChangeToken(), token);
+  assert.equal(repository.getAll(), snapshot, 'unrelated live-state edits must not rebuild Hub providers');
+  assert.equal(repository.getCurrent(), current);
+
+  const nextToken = repository.getChangeToken();
+  writeState(proxyLiveState('tyz'));
+  assert.notEqual(repository.getChangeToken(), nextToken);
+  assert.notEqual(repository.getAll(), snapshot);
+  assert.equal(repository.getCurrent().id, 'tyz');
+  assert.deepEqual(repository.getAll().filter(item => item.isCurrent).map(item => item.id), ['tyz']);
+  assert.equal(fs.statSync(repository.databasePath).mtimeMs, databaseStat.mtimeMs);
+
+  writeState(proxyLiveState('zlm'));
+  assert.equal(repository.getCurrent().id, 'zlm');
+  fs.rmSync(repository.liveStatePath);
+  assert.equal(repository.getCurrent().id, 'tyz');
+  assert.deepEqual(repository.getAll().filter(item => item.isCurrent).map(item => item.id), ['tyz']);
+});
+
+test('missing, unsupported, detached, invalid and non-Codex live routes retain the legacy selection', t => {
+  const { repository, writeState } = liveStateRepository(t);
+  const cases = [
+    proxyLiveState('zlm', { mode: 'direct' }),
+    proxyLiveState('zlm', { attached: false }),
+    { ...proxyLiveState('zlm'), version: 2 },
+    { version: 1, apps: { claude: proxyLiveState('zlm').apps.codex } },
+    proxyLiveState('missing-provider'),
+    proxyLiveState('claude-only'),
+    proxyLiveState({ id: 'zlm' }),
+    proxyLiveState('zlm\n'),
+    '{"version":',
+    ' '.repeat(65_537),
+  ];
+  for (const state of cases) {
+    writeState(proxyLiveState('zlm'));
+    assert.equal(repository.getCurrent().id, 'zlm');
+    writeState(state);
+    assert.equal(repository.getCurrent().id, 'tyz');
+    assert.deepEqual(repository.getAll().filter(item => item.isCurrent).map(item => item.id), ['tyz']);
+  }
+});
+
+test('repository reopening retains the live route and read-only database access', t => {
+  const { repository, database, writeState } = liveStateRepository(t);
+  writeState(proxyLiveState('zlm'));
+  assert.equal(repository.getCurrent().id, 'zlm');
+  repository.close();
+  database.prepare("UPDATE providers SET name = 'Updated zlm' WHERE id = 'zlm'").run();
+  assert.equal(repository.getCurrent().name, 'Updated zlm');
+  assert.throws(() => repository.database.exec("UPDATE providers SET is_current = 0"), /readonly/i);
+});
 
 test('provider rows bound public identifiers, URLs, and API keys', () => {
   const item = parseProviderRow({

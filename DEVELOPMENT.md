@@ -4,7 +4,7 @@
 
 This document is the operational guide for developing, testing, running, packaging, upgrading, and rolling back CodexCCSwitchUsage on this computer.
 
-The current v3 source metadata is application version `3.0.3`, injector version `96`, and browser-companion version `0.1.28`. Read `package.json` and `browser-companion\manifest.json` when starting a later release; the values below describe the current checkout and are not a substitute for those files.
+The current v3 source metadata is application version `3.0.4`, injector version `96`, and browser-companion version `0.1.28`. Read `package.json` and `browser-companion\manifest.json` when starting a later release; the values below describe the current checkout and are not a substitute for those files.
 
 ## 1. Source of truth and generated copies
 
@@ -172,6 +172,8 @@ Expected fields include:
 ```
 
 ### Host background performance baseline
+
+CCSwitch v4 proxy-mode selection comes from the adjacent `live-state.json` file (`version: 1`, `apps.codex.mode: "proxy"`, `attached: true`, and `proxy_route`). The repository resolves that ID only against Codex providers and uses it consistently for the footer and Hub current-provider flags. Direct mode, older installations, and absent/invalid live routes fall back to SQLite `is_current`. The host watches both SQLite and `live-state.json`, so a proxy-route switch triggers a refresh even when SQLite does not change. Live state is read-only, bounded, and cached by file identity; its proxy contract key is never retained or exposed.
 
 The injected refresh, recent-request, and Hub buttons maintain a bounded invisible pending-action queue in `document.title`. The queue retains one latest action in each of three slots: quota refresh, recent-request open/close, and Hub open. Rapid actions therefore coalesce without overwriting an unrelated command. The host reads the short-lived `/json/list` HTTP snapshot every 1,000 ms and acknowledges the exact batch through an isolated one-shot CDP operation before dispatching every action in it. Marker acknowledgement never updates the quota payload, never waits for provider network I/O, and does not require a second target snapshot. Refreshes are coalesced as one active request plus at most one trailing request; only the final queued result is injected, while Hub actions remain responsive during the query. A newer title batch cannot be cleared by acknowledgement of an older click. This title channel carries no provider data or credential and avoids a persistent CDP WebSocket. The HTTP snapshots reuse one bounded keep-alive socket to avoid a new loopback TCP handshake every second; the agent is destroyed during host shutdown. Full injector audits remain limited to 300,000 ms and are deferred while the current-provider query is active.
 

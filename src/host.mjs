@@ -841,9 +841,10 @@ function startDatabaseWatcher() {
   try {
     const databaseDirectory = path.dirname(args.database);
     const databaseName = path.basename(args.database).toLowerCase();
+    const liveStateName = path.basename(repository.liveStatePath).toLowerCase();
     databaseWatcher = fs.watch(databaseDirectory, (_eventType, filename) => {
       const changedName = String(filename || '').toLowerCase();
-      if (changedName && !changedName.startsWith(databaseName)) return;
+      if (changedName && !changedName.startsWith(databaseName) && changedName !== liveStateName) return;
       if (databaseWatchTimer) clearTimeout(databaseWatchTimer);
       databaseWatchTimer = setTimeout(() => {
         databaseWatchTimer = null;

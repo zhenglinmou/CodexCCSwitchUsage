@@ -6,6 +6,7 @@ import { getDefaultDatabasePath } from './platform.mjs';
 const MAX_CODEX_PROVIDERS = 512;
 const MAX_PROVIDER_CONFIG_CHARS = 65_536;
 const MAX_CREDENTIAL_MATCH_ROWS = 64;
+const MAX_LIVE_STATE_BYTES = 65_536;
 const PROVIDER_SELECT_COLUMNS = `
   substr(id, 1, 160) AS id,
   substr(name, 1, 160) AS name,
@@ -86,6 +87,33 @@ function providerRowSignature(row) {
   ]);
 }
 
+function withLiveCurrentProvider(row, liveRow) {
+  return row && liveRow ? { ...row, is_current: Number(row.id === liveRow.id) } : row;
+}
+
+function readLiveProviderId(filename) {
+  let descriptor;
+  try {
+    descriptor = fs.openSync(filename, 'r');
+    const stats = fs.fstatSync(descriptor);
+    if (!stats.isFile() || stats.size <= 0 || stats.size > MAX_LIVE_STATE_BYTES) return null;
+    const buffer = Buffer.alloc(MAX_LIVE_STATE_BYTES + 1);
+    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+    if (bytesRead > MAX_LIVE_STATE_BYTES) return null;
+    const state = JSON.parse(buffer.subarray(0, bytesRead).toString('utf8'));
+    const codex = state?.apps?.codex;
+    // CCSwitch v4 keeps the direct selection in SQLite while proxy switches
+    // update this separate live route. Never read or retain its contract key.
+    if (state?.version !== 1 || codex?.mode !== 'proxy' || codex.attached !== true) return null;
+    const id = codex.proxy_route;
+    return typeof id === 'string' && id.length > 0 && id.length <= 160 && !/[\u0000-\u0020\u007f]/.test(id)
+      ? id
+      : null;
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
+}
+
 function fileIdentity(stats) {
   return `${stats.dev || 0}:${stats.ino || 0}:${stats.birthtimeMs || 0}`;
 }
@@ -140,6 +168,7 @@ export function parseRequestLogRow(row) {
 export class ProviderRepository {
   constructor(databasePath = getDefaultDatabasePath(), options = {}) {
     this.databasePath = databasePath;
+    this.liveStatePath = path.join(path.dirname(databasePath), 'live-state.json');
     this.databaseFactory = options.databaseFactory || (filename => new DatabaseSync(filename, { readOnly: true }));
     this.statSync = options.statSync || fs.statSync;
     this.database = null;
@@ -152,6 +181,7 @@ export class ProviderRepository {
     this.recentRequestsStatement = null;
     this.credentialAppTypesStatement = null;
     this.currentCache = null;
+    this.liveStateCache = null;
     this.byNameCache = new Map();
     this.byIdCache = new Map();
     this.allCache = null;
@@ -168,7 +198,8 @@ export class ProviderRepository {
         LIMIT 1
       `);
     }
-    const row = this.currentStatement.get();
+    const liveRow = this.getLiveCurrentRow(db);
+    const row = liveRow ? withLiveCurrentProvider(liveRow, liveRow) : this.currentStatement.get();
     const signature = providerRowSignature(row);
     if (this.currentCache?.signature === signature) return this.currentCache.value;
     const value = parseProviderRow(row);
@@ -186,7 +217,7 @@ export class ProviderRepository {
         LIMIT 1
       `);
     }
-    const row = this.byNameStatement.get(name);
+    const row = withLiveCurrentProvider(this.byNameStatement.get(name), this.getLiveCurrentRow(db));
     const signature = providerRowSignature(row);
     const cached = this.byNameCache.get(name);
     if (cached?.signature === signature) return cached.value;
@@ -197,6 +228,18 @@ export class ProviderRepository {
 
   getById(id) {
     const db = this.ensureDatabase();
+    this.ensureByIdStatement(db);
+    const key = String(id);
+    const row = withLiveCurrentProvider(this.byIdStatement.get(key), this.getLiveCurrentRow(db));
+    const signature = providerRowSignature(row);
+    const cached = this.byIdCache.get(key);
+    if (cached?.signature === signature) return cached.value;
+    const value = parseProviderRow(row);
+    this.byIdCache.set(key, { signature, value });
+    return value;
+  }
+
+  ensureByIdStatement(db) {
     if (!this.byIdStatement) {
       this.byIdStatement = db.prepare(`
         SELECT ${PROVIDER_SELECT_COLUMNS}
@@ -205,14 +248,27 @@ export class ProviderRepository {
         LIMIT 1
       `);
     }
-    const key = String(id);
-    const row = this.byIdStatement.get(key);
-    const signature = providerRowSignature(row);
-    const cached = this.byIdCache.get(key);
-    if (cached?.signature === signature) return cached.value;
-    const value = parseProviderRow(row);
-    this.byIdCache.set(key, { signature, value });
-    return value;
+  }
+
+  getLiveCurrentRow(db) {
+    const changeToken = fileChangeIdentity(this.liveStatePath, this.statSync);
+    if (this.liveStateCache?.changeToken !== changeToken) {
+      if (changeToken === 'missing') {
+        this.liveStateCache = { changeToken, id: null };
+        return null;
+      }
+      try {
+        this.liveStateCache = { changeToken, id: readLiveProviderId(this.liveStatePath) };
+      } catch {
+        // Retry a transient read failure rather than caching an invalid route.
+        this.liveStateCache = null;
+        return null;
+      }
+    }
+    const id = this.liveStateCache?.id;
+    if (!id) return null;
+    this.ensureByIdStatement(db);
+    return this.byIdStatement.get(id) || null;
   }
 
   getAll() {
@@ -230,9 +286,11 @@ export class ProviderRepository {
     if (rows.length > MAX_CODEX_PROVIDERS) {
       throw new Error(`CCSwitch Codex 供应商数量超过安全上限 ${MAX_CODEX_PROVIDERS}`);
     }
-    const signature = JSON.stringify(rows.map(providerRowSignature));
+    const liveRow = this.getLiveCurrentRow(db);
+    const currentRows = liveRow ? rows.map(row => withLiveCurrentProvider(row, liveRow)) : rows;
+    const signature = JSON.stringify(currentRows.map(providerRowSignature));
     if (this.allCache?.signature === signature) return this.allCache.value;
-    const value = rows.map(parseProviderRow).filter(Boolean);
+    const value = currentRows.map(parseProviderRow).filter(Boolean);
     this.allCache = { signature, value };
     return value;
   }
@@ -299,7 +357,7 @@ export class ProviderRepository {
   }
 
   getChangeToken() {
-    return [this.databasePath, `${this.databasePath}-wal`, `${this.databasePath}-shm`]
+    return [this.databasePath, `${this.databasePath}-wal`, `${this.databasePath}-shm`, this.liveStatePath]
       .map(filename => fileChangeIdentity(filename, this.statSync))
       .join('|');
   }
@@ -330,6 +388,7 @@ export class ProviderRepository {
     this.recentRequestsStatement = null;
     this.credentialAppTypesStatement = null;
     this.currentCache = null;
+    this.liveStateCache = null;
     this.byNameCache.clear();
     this.byIdCache.clear();
     this.allCache = null;
