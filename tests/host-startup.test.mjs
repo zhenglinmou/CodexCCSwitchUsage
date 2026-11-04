@@ -243,8 +243,7 @@ test('database change tokens advance only after a successful provider sync', () 
   const watcher = source.slice(source.indexOf('function startDatabaseWatcher()'), source.indexOf('function startControlWatcher()'));
 
   assert.match(watcher, /const nextDatabaseChangeToken = repository\.getChangeToken\(\)/);
-  assert.match(watcher, /path\.basename\(repository\.liveStatePath\)/);
-  assert.match(watcher, /changedName !== liveStateName/);
+  assert.match(watcher, /repository\.liveStatePath,[\s\S]*repository\.settingsPath/);
   assert.match(watcher, /if \(nextDatabaseChangeToken === databaseChangeToken\)/);
   assert.match(watcher, /const syncResult = syncHubProviders\(\)/);
   assert.match(watcher, /if \(!syncResult\.succeeded\)/);

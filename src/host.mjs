@@ -851,42 +851,61 @@ function syncHubProviders() {
 
 function startDatabaseWatcher() {
   if (databaseWatcher) return;
-  try {
-    const databaseDirectory = path.dirname(args.database);
-    const databaseName = path.basename(args.database).toLowerCase();
-    const liveStateName = path.basename(repository.liveStatePath).toLowerCase();
-    databaseWatcher = fs.watch(databaseDirectory, (_eventType, filename) => {
-      const changedName = String(filename || '').toLowerCase();
-      if (changedName && !changedName.startsWith(databaseName) && changedName !== liveStateName) return;
-      if (databaseWatchTimer) clearTimeout(databaseWatchTimer);
-      databaseWatchTimer = setTimeout(() => {
-        databaseWatchTimer = null;
-        const nextDatabaseChangeToken = repository.getChangeToken();
-        if (nextDatabaseChangeToken === databaseChangeToken) {
-          lastDatabaseAuditAt = Date.now();
-          return;
-        }
-        const syncResult = syncHubProviders();
-        if (!syncResult.succeeded) {
-          lastDatabaseAuditAt = Date.now() - DATABASE_AUDIT_MS + WATCHER_RETRY_MS;
-          writeStatus({ error: safeMessage(syncResult.error) });
-          wakeFallbackPoll();
-          return;
-        }
-        databaseChangeToken = nextDatabaseChangeToken;
+  const filesByDirectory = new Map();
+  for (const filename of [
+    repository.databasePath,
+    `${repository.databasePath}-wal`,
+    `${repository.databasePath}-shm`,
+    repository.liveStatePath,
+    repository.settingsPath,
+  ]) {
+    const directory = path.dirname(filename);
+    if (!filesByDirectory.has(directory)) filesByDirectory.set(directory, new Set());
+    filesByDirectory.get(directory).add(path.basename(filename).toLowerCase());
+  }
+  const watchers = [];
+  const group = { close: () => { for (const watcher of watchers) watcher.close(); } };
+  const scheduleDatabaseSync = () => {
+    if (databaseWatchTimer) clearTimeout(databaseWatchTimer);
+    databaseWatchTimer = setTimeout(() => {
+      databaseWatchTimer = null;
+      const nextDatabaseChangeToken = repository.getChangeToken();
+      if (nextDatabaseChangeToken === databaseChangeToken) {
         lastDatabaseAuditAt = Date.now();
-        const recentRequestsChanged = recentRequestInterest.active() ? syncRecentRequests() : false;
-        if (shouldRefreshRemoteRecentRequests()) scheduleRemoteRecentRequestsRefresh();
-        if (syncResult.changed) requestCurrentProviderRefresh(false, true);
-        else if (recentRequestsChanged) requestTargetSync({ audit: true });
-      }, DATABASE_WATCH_DEBOUNCE_MS);
-    });
-    databaseWatcher.on('error', () => {
-      databaseWatcher?.close();
-      databaseWatcher = null;
-      wakeFallbackPoll();
-    });
+        return;
+      }
+      const syncResult = syncHubProviders();
+      if (!syncResult.succeeded) {
+        lastDatabaseAuditAt = Date.now() - DATABASE_AUDIT_MS + WATCHER_RETRY_MS;
+        writeStatus({ error: safeMessage(syncResult.error) });
+        wakeFallbackPoll();
+        return;
+      }
+      databaseChangeToken = nextDatabaseChangeToken;
+      lastDatabaseAuditAt = Date.now();
+      const recentRequestsChanged = recentRequestInterest.active() ? syncRecentRequests() : false;
+      if (shouldRefreshRemoteRecentRequests()) scheduleRemoteRecentRequestsRefresh();
+      if (syncResult.changed) requestCurrentProviderRefresh(false, true);
+      else if (recentRequestsChanged) requestTargetSync({ audit: true });
+    }, DATABASE_WATCH_DEBOUNCE_MS);
+  };
+  try {
+    for (const [directory, filenames] of filesByDirectory) {
+      const watcher = fs.watch(directory, (_eventType, filename) => {
+        if (filename && !filenames.has(String(filename).toLowerCase())) return;
+        scheduleDatabaseSync();
+      });
+      watchers.push(watcher);
+      watcher.on('error', () => {
+        if (databaseWatcher !== group) return;
+        group.close();
+        databaseWatcher = null;
+        wakeFallbackPoll();
+      });
+    }
+    databaseWatcher = group;
   } catch {
+    group.close();
     databaseWatcher = null;
   }
 }

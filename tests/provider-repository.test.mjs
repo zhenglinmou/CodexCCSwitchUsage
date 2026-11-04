@@ -132,6 +132,61 @@ test('CCSwitch proxy live route overrides the stale SQLite selection across repo
   assert.deepEqual(database.prepare("SELECT id FROM providers WHERE app_type = 'codex' AND is_current = 1").all().map(row => row.id), ['tyz']);
 });
 
+test('the local CCSwitch selection takes priority in direct mode and only matches Codex rows', t => {
+  const { repository, writeState } = liveStateRepository(t);
+  const settings = path.join(path.dirname(repository.databasePath), 'settings.json');
+  const originalToken = repository.getChangeToken();
+  fs.writeFileSync(settings, JSON.stringify({ currentProviderCodex: 'zlm' }));
+  assert.notEqual(repository.getChangeToken(), originalToken);
+  assert.equal(repository.getCurrent().id, 'zlm');
+  assert.equal(repository.getById('tyz').isCurrent, false);
+  assert.equal(repository.getByName('允熙官方-zlm-外网').isCurrent, true);
+  assert.deepEqual(repository.getAll().filter(p => p.isCurrent).map(p => p.id), ['zlm']);
+
+  writeState(proxyLiveState('tyz'));
+  assert.equal(repository.getCurrent().id, 'tyz');
+  assert.equal(repository.getCurrent().isProxyRoute, true);
+  writeState(proxyLiveState('tyz', { attached: false }));
+  assert.equal(repository.getCurrent().id, 'zlm');
+  assert.equal(repository.getCurrent().isProxyRoute, undefined);
+
+  fs.writeFileSync(settings, JSON.stringify({ currentProviderCodex: 'claude-only' }));
+  assert.equal(repository.getCurrent().id, 'tyz');
+  assert.deepEqual(repository.getAll().filter(p => p.isCurrent).map(p => p.id), ['tyz']);
+});
+
+test('a relocated CCSwitch database still uses device settings and live routes from the default directory', t => {
+  const { repository: original, database } = liveStateRepository(t);
+  const root = path.dirname(original.databasePath);
+  const home = path.join(root, 'home');
+  const device = path.join(home, '.cc-switch');
+  const custom = path.join(home, 'data');
+  const roaming = path.join(root, 'roaming');
+  const applicationData = process.platform === 'win32' ? roaming
+    : process.platform === 'darwin' ? path.join(home, 'Library', 'Application Support') : roaming;
+  const store = path.join(applicationData, 'com.ccswitch.desktop', 'app_paths.json');
+  fs.mkdirSync(path.dirname(store), { recursive: true });
+  fs.mkdirSync(device, { recursive: true });
+  fs.mkdirSync(custom, { recursive: true });
+  const defaultDb = path.join(device, 'cc-switch.db');
+  const customDb = path.join(custom, 'cc-switch.db');
+  fs.copyFileSync(original.databasePath, defaultDb);
+  database.prepare("UPDATE providers SET name = 'relocated provider' WHERE id = 'zlm'").run();
+  fs.copyFileSync(original.databasePath, customDb);
+  fs.writeFileSync(store, JSON.stringify({ app_config_dir_override: '~/data' }));
+  fs.writeFileSync(path.join(device, 'live-state.json'), JSON.stringify(proxyLiveState('zlm')));
+  const env = { USERPROFILE: home, HOME: home, APPDATA: roaming, XDG_DATA_HOME: roaming };
+  const relocated = new ProviderRepository(defaultDb, { env, codexHome: '' });
+  try {
+    assert.equal(relocated.databasePath, customDb);
+    assert.equal(relocated.liveStatePath, path.join(device, 'live-state.json'));
+    assert.equal(relocated.getCurrent().name, 'relocated provider');
+    assert.deepEqual(relocated.getAll().filter(p => p.isCurrent).map(p => p.id), ['zlm']);
+  } finally {
+    relocated.close();
+  }
+});
+
 test('live-route-only switches invalidate change tokens and cached current flags without changing SQLite', t => {
   const { repository, writeState } = liveStateRepository(t);
   const databaseStat = fs.statSync(repository.databasePath);

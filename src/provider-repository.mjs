@@ -1,12 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { getCodexHomeDir, getDefaultDatabasePath } from './platform.mjs';
+import { getCodexHomeDir, getDefaultDatabasePath, getHomeDir } from './platform.mjs';
 
 const MAX_CODEX_PROVIDERS = 512;
 const MAX_PROVIDER_CONFIG_CHARS = 65_536;
 const MAX_CREDENTIAL_MATCH_ROWS = 64;
 const MAX_LIVE_STATE_BYTES = 65_536;
+const MAX_SETTINGS_BYTES = 262_144;
 const MAX_CODEX_AUTH_BYTES = 65_536;
 const PROVIDER_SELECT_COLUMNS = `
   substr(id, 1, 160) AS id,
@@ -103,33 +104,83 @@ function providerRowSignature(row) {
   ]);
 }
 
-function withLiveCurrentProvider(row, liveRow) {
-  if (!row || !liveRow) return row;
-  const current = Number(row.id === liveRow.id);
-  return { ...row, is_current: current, is_proxy_route: current || undefined };
+function withCurrentProvider(row, selection) {
+  if (!row || !selection) return row;
+  const current = Number(row.id === selection.row.id);
+  return { ...row, is_current: current, is_proxy_route: current && selection.isProxyRoute ? 1 : undefined };
 }
 
-function readLiveProviderId(filename) {
+function readBoundedJson(filename, maxBytes) {
   let descriptor;
   try {
     descriptor = fs.openSync(filename, 'r');
     const stats = fs.fstatSync(descriptor);
-    if (!stats.isFile() || stats.size <= 0 || stats.size > MAX_LIVE_STATE_BYTES) return null;
-    const buffer = Buffer.alloc(MAX_LIVE_STATE_BYTES + 1);
+    if (!stats.isFile() || stats.size <= 0 || stats.size > maxBytes) return null;
+    const buffer = Buffer.alloc(maxBytes + 1);
     const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
-    if (bytesRead > MAX_LIVE_STATE_BYTES) return null;
-    const state = JSON.parse(buffer.subarray(0, bytesRead).toString('utf8'));
-    const codex = state?.apps?.codex;
-    // CCSwitch v4 keeps the direct selection in SQLite while proxy switches
-    // update this separate live route. Never read or retain its contract key.
-    if (state?.version !== 1 || codex?.mode !== 'proxy' || codex.attached !== true) return null;
-    const id = codex.proxy_route;
-    return typeof id === 'string' && id.length > 0 && id.length <= 160 && !/[\u0000-\u0020\u007f]/.test(id)
-      ? id
-      : null;
+    if (bytesRead > maxBytes) return null;
+    return JSON.parse(buffer.subarray(0, bytesRead).toString('utf8'));
   } finally {
     if (descriptor !== undefined) fs.closeSync(descriptor);
   }
+}
+
+function validProviderId(id) {
+  return typeof id === 'string' && id.length > 0 && id.length <= 160 && !/[\u0000-\u0020\u007f]/.test(id)
+    ? id
+    : null;
+}
+
+function readLiveProviderId(filename) {
+  const state = readBoundedJson(filename, MAX_LIVE_STATE_BYTES);
+  const codex = state?.apps?.codex;
+  if (state?.version !== 1 || codex?.mode !== 'proxy' || codex.attached !== true) return null;
+  return validProviderId(codex.proxy_route);
+}
+
+function readDeviceProviderId(filename) {
+  return validProviderId(readBoundedJson(filename, MAX_SETTINGS_BYTES)?.currentProviderCodex);
+}
+
+function samePath(left, right) {
+  const normalize = value => {
+    const absolute = path.resolve(value);
+    return process.platform === 'win32' ? absolute.toLowerCase() : absolute;
+  };
+  return normalize(left) === normalize(right);
+}
+
+function ccswitchFilePaths(requestedDatabase, env) {
+  const defaultDatabase = getDefaultDatabasePath(env);
+  const deviceDirectory = path.dirname(defaultDatabase);
+  const home = getHomeDir(env);
+  const appData = process.platform === 'win32' ? (env.APPDATA || (home && path.join(home, 'AppData', 'Roaming')))
+    : process.platform === 'darwin' ? (home && path.join(home, 'Library', 'Application Support'))
+      : (env.XDG_DATA_HOME || (home && path.join(home, '.local', 'share')));
+  let configuredDatabase = defaultDatabase;
+  if (appData && path.isAbsolute(appData)) {
+    try {
+      const storePath = path.join(appData, 'com.ccswitch.desktop', 'app_paths.json');
+      const value = readBoundedJson(storePath, MAX_LIVE_STATE_BYTES)?.app_config_dir_override;
+      if (typeof value === 'string' && value.length <= 4_096) {
+        const raw = value.trim();
+        const dir = home && raw === '~' ? home
+          : home && (raw.startsWith('~/') || (process.platform === 'win32' && raw.startsWith('~\\')))
+            ? path.join(home, raw.slice(2))
+            : raw;
+        if (path.isAbsolute(dir) && fs.statSync(dir).isDirectory()) {
+          configuredDatabase = path.join(dir, 'cc-switch.db');
+        }
+      }
+    } catch {}
+  }
+  if (!requestedDatabase || samePath(requestedDatabase, defaultDatabase)) {
+    return { databasePath: configuredDatabase, deviceDirectory };
+  }
+  return {
+    databasePath: requestedDatabase,
+    deviceDirectory: samePath(requestedDatabase, configuredDatabase) ? deviceDirectory : path.dirname(requestedDatabase),
+  };
 }
 
 function fileIdentity(stats) {
@@ -203,10 +254,13 @@ export function parseRequestLogRow(row) {
 }
 
 export class ProviderRepository {
-  constructor(databasePath = getDefaultDatabasePath(), options = {}) {
-    this.databasePath = databasePath;
-    this.liveStatePath = path.join(path.dirname(databasePath), 'live-state.json');
-    const codexHome = options.codexHome ?? getCodexHomeDir();
+  constructor(databasePath, options = {}) {
+    const env = options.env ?? process.env;
+    const files = ccswitchFilePaths(databasePath, env);
+    this.databasePath = files.databasePath;
+    this.liveStatePath = path.join(files.deviceDirectory, 'live-state.json');
+    this.settingsPath = path.join(files.deviceDirectory, 'settings.json');
+    const codexHome = options.codexHome ?? getCodexHomeDir(env);
     this.codexAuthPath = codexHome ? path.join(codexHome, 'auth.json') : '';
     this.codexAuthSnapshot = null;
     this.unavailableCodexAuth = { auth: {} };
@@ -224,6 +278,7 @@ export class ProviderRepository {
     this.credentialAppTypesStatement = null;
     this.currentCache = null;
     this.liveStateCache = null;
+    this.deviceSelectionCache = null;
     this.byNameCache = new Map();
     this.byIdCache = new Map();
     this.allCache = null;
@@ -240,8 +295,8 @@ export class ProviderRepository {
         LIMIT 1
       `);
     }
-    const liveRow = this.getLiveCurrentRow(db);
-    const row = liveRow ? withLiveCurrentProvider(liveRow, liveRow) : this.currentStatement.get();
+    const selection = this.#currentSelection(db);
+    const row = selection ? withCurrentProvider(selection.row, selection) : this.currentStatement.get();
     const signature = providerRowSignature(row);
     const authSnapshot = this.#authSnapshot(row);
     if (this.currentCache?.signature === signature && this.currentCache.authSnapshot === authSnapshot) return this.currentCache.value;
@@ -260,7 +315,7 @@ export class ProviderRepository {
         LIMIT 1
       `);
     }
-    const row = withLiveCurrentProvider(this.byNameStatement.get(name), this.getLiveCurrentRow(db));
+    const row = withCurrentProvider(this.byNameStatement.get(name), this.#currentSelection(db));
     const signature = providerRowSignature(row);
     const authSnapshot = this.#authSnapshot(row);
     const cached = this.byNameCache.get(name);
@@ -274,7 +329,7 @@ export class ProviderRepository {
     const db = this.ensureDatabase();
     this.ensureByIdStatement(db);
     const key = String(id);
-    const row = withLiveCurrentProvider(this.byIdStatement.get(key), this.getLiveCurrentRow(db));
+    const row = withCurrentProvider(this.byIdStatement.get(key), this.#currentSelection(db));
     const signature = providerRowSignature(row);
     const authSnapshot = this.#authSnapshot(row);
     const cached = this.byIdCache.get(key);
@@ -295,25 +350,35 @@ export class ProviderRepository {
     }
   }
 
-  getLiveCurrentRow(db) {
-    const changeToken = fileChangeIdentity(this.liveStatePath, this.statSync);
-    if (this.liveStateCache?.changeToken !== changeToken) {
+  #readSelection(filename, cacheKey, readId) {
+    const changeToken = fileChangeIdentity(filename, this.statSync);
+    if (this[cacheKey]?.changeToken !== changeToken) {
       if (changeToken === 'missing') {
-        this.liveStateCache = { changeToken, id: null };
+        this[cacheKey] = { changeToken, id: null };
         return null;
       }
       try {
-        this.liveStateCache = { changeToken, id: readLiveProviderId(this.liveStatePath) };
+        this[cacheKey] = { changeToken, id: readId(filename) };
       } catch {
-        // Retry a transient read failure rather than caching an invalid route.
-        this.liveStateCache = null;
+        this[cacheKey] = null;
         return null;
       }
     }
-    const id = this.liveStateCache?.id;
-    if (!id) return null;
+    return this[cacheKey]?.id || null;
+  }
+
+  #currentSelection(db) {
+    const liveId = this.#readSelection(this.liveStatePath, 'liveStateCache', readLiveProviderId);
+    if (liveId) {
+      this.ensureByIdStatement(db);
+      const live = this.byIdStatement.get(liveId);
+      if (live) return { row: live, isProxyRoute: true };
+    }
+    const deviceId = this.#readSelection(this.settingsPath, 'deviceSelectionCache', readDeviceProviderId);
+    if (!deviceId) return null;
     this.ensureByIdStatement(db);
-    return this.byIdStatement.get(id) || null;
+    const direct = this.byIdStatement.get(deviceId);
+    return direct ? { row: direct, isProxyRoute: false } : null;
   }
 
   getAll() {
@@ -331,8 +396,8 @@ export class ProviderRepository {
     if (rows.length > MAX_CODEX_PROVIDERS) {
       throw new Error(`CCSwitch Codex 供应商数量超过安全上限 ${MAX_CODEX_PROVIDERS}`);
     }
-    const liveRow = this.getLiveCurrentRow(db);
-    const currentRows = liveRow ? rows.map(row => withLiveCurrentProvider(row, liveRow)) : rows;
+    const selection = this.#currentSelection(db);
+    const currentRows = selection ? rows.map(row => withCurrentProvider(row, selection)) : rows;
     const signature = JSON.stringify(currentRows.map(providerRowSignature));
     const authSnapshot = this.#authSnapshot(currentRows.find(currentOfficialRow));
     if (this.allCache?.signature === signature && this.allCache.authSnapshot === authSnapshot) return this.allCache.value;
@@ -422,7 +487,7 @@ export class ProviderRepository {
   }
 
   getChangeToken() {
-    return [this.databasePath, `${this.databasePath}-wal`, `${this.databasePath}-shm`, this.liveStatePath, this.codexAuthPath].filter(Boolean)
+    return [this.databasePath, `${this.databasePath}-wal`, `${this.databasePath}-shm`, this.liveStatePath, this.settingsPath, this.codexAuthPath].filter(Boolean)
       .map(filename => fileChangeIdentity(filename, this.statSync))
       .join('|');
   }
@@ -455,6 +520,7 @@ export class ProviderRepository {
     this.credentialAppTypesStatement = null;
     this.currentCache = null;
     this.liveStateCache = null;
+    this.deviceSelectionCache = null;
     this.codexAuthSnapshot = null;
     this.byNameCache.clear();
     this.byIdCache.clear();
