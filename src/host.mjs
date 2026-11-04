@@ -379,9 +379,10 @@ function syncRecentRequests(providerOverride = undefined, options = {}) {
       && providerId === recentRequestProviderId
       && REMOTE_RECENT_REQUEST_SOURCES.has(recentRequestsSource)
     ) return false;
-    const nextRequests = providerId ? repository.getRecentRequests(providerId, RECENT_REQUEST_LIMIT) : [];
+    const followsCodexLogin = provider?.followsCodexLogin === true;
+    const nextRequests = providerId && !followsCodexLogin ? repository.getRecentRequests(providerId, RECENT_REQUEST_LIMIT) : [];
     return updateRecentRequestsState(provider, nextRequests, {
-      source: 'ccswitch_local',
+      source: followsCodexLogin ? 'openai_codex_session' : 'ccswitch_local',
       preciseCost: false,
       costExact: false,
       costSource: 'ccswitch_local',
@@ -471,6 +472,11 @@ async function refreshRecentRequests() {
     const result = await hubService.queryRequestUsage(provider.id, { limit: RECENT_REQUEST_LIMIT, signal: controller.signal });
     const currentProvider = repository.getCurrent();
     if (!currentProvider || String(currentProvider.id) !== String(provider.id)) return;
+    if (provider.followsCodexLogin && (
+      !currentProvider.followsCodexLogin
+      || currentProvider.isProxyRoute !== provider.isProxyRoute
+      || currentProvider.auth?.tokens?.account_id !== provider.auth?.tokens?.account_id
+    )) return;
     updateRecentRequestsState(provider, result?.items, {
       source: String(result?.source || 'ccswitch_local'),
       preciseCost: result?.preciseCostAvailable === true,
@@ -480,6 +486,13 @@ async function refreshRecentRequests() {
     });
   } catch (error) {
     if (controller.signal.aborted) return;
+    if (provider.followsCodexLogin) {
+      updateRecentRequestsState(provider, [], {
+        source: 'openai_codex_session',
+        message: `无法读取 Codex 官方会话：${safeMessage(error)}`,
+      });
+      return;
+    }
     try {
       const fallbackRows = repository.getRecentRequests(provider.id, RECENT_REQUEST_LIMIT);
       updateRecentRequestsState(provider, fallbackRows, {

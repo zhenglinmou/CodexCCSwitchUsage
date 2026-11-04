@@ -593,6 +593,51 @@ test('Hub probes the built-in OpenAI official session Token template', async () 
   assert.equal(Object.hasOwn(requestCalls[0], 'requestUsageTemplateId'), false);
 });
 
+test('official route attaches measured timings only to uniquely matching Codex requests', async () => {
+  const item = { ...provider('official', 'OpenAI Official', true), followsCodexLogin: true, isProxyRoute: true };
+  const base = {
+    model: 'gpt-6.1-sol', inputTokens: 100, outputTokens: 20, cacheReadTokens: 80,
+    totalCost: null, costUnit: 'subscription', latencyMs: null, firstTokenMs: null,
+    createdAt: '2026-11-04T08:21:10.207Z',
+  };
+  const proxyRow = {
+    ...base, statusCode: 200, latencyMs: 5169, firstTokenMs: 2837, totalCostUsd: 0.15,
+    createdAt: '2026-11-04T08:21:01.000Z',
+  };
+  const rows = [proxyRow, { ...proxyRow, inputTokens: 200 }, {
+    ...proxyRow, inputTokens: 200, createdAt: '2026-11-04T08:21:10.000Z',
+  }, { ...proxyRow, inputTokens: 300, cacheReadTokens: 79 }, {
+    ...proxyRow, inputTokens: 400, createdAt: '2026-11-04T08:20:50.000Z',
+  }];
+  const service = new HubService({
+    getAll: () => [item],
+    getRecentRequests(providerId, limit, options) {
+      assert.equal(providerId, item.id);
+      assert.equal(limit, 50);
+      assert.equal(options.proxyOnly, true);
+      return rows;
+    },
+  }, {}, {
+    requestUsageEngine: {
+      async query() {
+        return {
+          success: true, source: 'openai_codex_session', billing: { exact: false, available: false },
+          items: [base, { ...base, inputTokens: 200 }, { ...base, inputTokens: 300 }, { ...base, inputTokens: 400 }],
+        };
+      },
+    },
+  });
+  const result = await service.queryRequestUsage(item.id);
+  assert.deepEqual(result.items.map(x => [x.latencyMs, x.firstTokenMs, x.totalCost, x.costUnit]), [
+    [5169, 2837, null, 'subscription'],
+    [null, null, null, 'subscription'],
+    [null, null, null, 'subscription'],
+    [null, null, null, 'subscription'],
+  ]);
+  assert.equal(result.preciseCostAvailable, false);
+  assert.equal(Object.hasOwn(result.items[0], 'totalCostUsd'), false);
+});
+
 test('Hub overlaps slow template probes while preserving recommendation priority', async () => {
   const item = {
     ...provider('parallel-probe', '并行识别中转'),

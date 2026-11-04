@@ -218,6 +218,44 @@ function ccswitchRequestItem(row) {
   };
 }
 
+function addOfficialProxyTimings(items, rows) {
+  // Session events can arrive several seconds after the proxy records a
+  // completion. Allow bounded lag, then require a unique match in both directions.
+  const completionToleranceMs = 15_000;
+  const candidates = items.map(item => {
+    const time = Date.parse(item.createdAt);
+    if (!Number.isFinite(time) || !item.model || !(item.inputTokens > 0)) return [];
+    return rows.flatMap((row, index) => (
+      row.statusCode >= 200 && row.statusCode < 300
+      && Math.abs(time - Date.parse(row.createdAt)) <= completionToleranceMs
+      && row.model === item.model
+      && row.inputTokens === item.inputTokens
+      && row.outputTokens === item.outputTokens
+      && row.cacheReadTokens === item.cacheReadTokens
+        ? [index] : []
+    ));
+  });
+  const counts = new Map();
+  for (const matches of candidates) {
+    for (const index of matches) counts.set(index, (counts.get(index) || 0) + 1);
+  }
+  return items.map((item, i) => {
+    const matches = candidates[i];
+    if (matches.length !== 1 || counts.get(matches[0]) !== 1) return item;
+    const row = rows[matches[0]];
+    const latencyMs = row.latencyMs > 0 ? localRequestInteger(row.latencyMs) : null;
+    const firstTokenMs = row.firstTokenMs > 0 && (latencyMs == null || row.firstTokenMs <= latencyMs)
+      ? localRequestInteger(row.firstTokenMs) : null;
+    if (latencyMs == null && firstTokenMs == null) return item;
+    return {
+      ...item,
+      latencyMs,
+      firstTokenMs,
+      durationSeconds: latencyMs == null ? 0 : latencyMs / 1_000,
+    };
+  });
+}
+
 function ccswitchRequestUsageFallback(provider, rows, remoteResult, limit, now) {
   const fallbackReason = safeMessage(remoteResult?.message || '第三方真实逐请求扣费接口不可用');
   const warning = 'CCSwitch 本地费用按其模型价格和倍率计算；第三方倍率不同时可能与账户实际扣费不一致';
@@ -294,6 +332,7 @@ export function providerConfigurationFingerprint(provider, templateSelection = n
     provider.baseUrl,
     provider.auth,
   ];
+  if (provider.followsCodexLogin === true) fields.push('codex-login');
   if (templateSelection) {
     fields.push(
       String(templateSelection.balanceTemplateId || ''),
@@ -426,6 +465,13 @@ function sameAccountBinding(left, right) {
 function safeUsage(payload, secrets = []) {
   if (!payload || payload.status !== 'ok') return null;
   const numberOrNull = value => value == null || value === '' || !Number.isFinite(Number(value)) ? null : Number(value);
+  const windows = Array.isArray(payload.subscriptionQuota?.windows)
+    ? payload.subscriptionQuota.windows.slice(0, 2).map(window => ({
+      label: sanitizedCredentialText(window?.label, secrets, 20),
+      remaining: numberOrNull(window?.remaining),
+    })).filter(window => window.label && window.remaining != null && window.remaining >= 0 && window.remaining <= 100)
+    : [];
+  const credits = numberOrNull(payload.subscriptionQuota?.credits);
   return {
     providerName: sanitizedCredentialText(payload.providerName, secrets, 160),
     accountBrowser: sanitizedCredentialText(payload.accountBrowser, secrets, 64).replace(/\s+/g, ' ').trim(),
@@ -439,6 +485,7 @@ function safeUsage(payload, secrets = []) {
     unit: sanitizedCredentialText(payload.unit, secrets, 32),
     updatedAt: String(payload.updatedAt || new Date().toISOString()).slice(0, 64),
     queryError: payload.queryError ? safeMessage(payload.queryError, secrets) : '',
+    ...(windows.length ? { subscriptionQuota: { windows, credits: credits != null && credits >= 0 ? credits : null } } : {}),
   };
 }
 
@@ -521,6 +568,7 @@ export function hubItemToUsagePayload(provider, item) {
       total: usage.total,
       unit: usage.unit,
       updatedAt: usage.updatedAt,
+      ...(usage.subscriptionQuota ? { subscriptionQuota: usage.subscriptionQuota } : {}),
       ...(queryError ? { queryError } : {}),
     };
   }
@@ -867,8 +915,7 @@ export class HubService {
       const queryMethod = describeProviderQuery(provider, balanceOption);
       const requestMethod = describeProviderRequestUsage(provider, requestOption);
       for (const value of [
-        loginConfig?.baseUrl,
-        loginConfig?.loginUrl,
+        ...(queryMethod.followsCodexLogin ? [] : [loginConfig?.baseUrl, loginConfig?.loginUrl]),
         ...(queryMethod?.requiresBrowser === true || queryMethod?.waf === true ? [queryMethod?.requestUrl] : []),
         ...(requestMethod?.requiresBrowser === true
           ? [requestMethod?.requestUrl, requestMethod?.configurationUrl]
@@ -1193,8 +1240,19 @@ export class HubService {
       }
     }
     if (remoteResult?.success === true) {
+      let items = remoteResult.items;
+      if (requestProvider.followsCodexLogin && requestProvider.isProxyRoute
+        && remoteResult.source === 'openai_codex_session' && Array.isArray(items) && items.length) {
+        try {
+          const proxyRows = this.repository.getRecentRequests(requestProvider.id, 50, { proxyOnly: true });
+          if (Array.isArray(proxyRows)) items = addOfficialProxyTimings(items, proxyRows);
+        } catch {
+          // A missing or older proxy log must not hide official Token records.
+        }
+      }
       return {
         ...remoteResult,
+        ...(items !== undefined ? { items } : {}),
         message: remoteResult.message ? safeMessage(remoteResult.message, secrets) : '',
         appType: 'codex',
         credentialSharedAcrossApps: sharedAcrossApps,
@@ -1207,6 +1265,7 @@ export class HubService {
       message: remoteResult?.message ? safeMessage(remoteResult.message, secrets) : '',
     };
     throwIfAborted(options.signal);
+    if (provider.followsCodexLogin) return remoteResult;
     if (typeof this.repository?.getRecentRequests !== 'function') return remoteResult;
     try {
       const rows = getLocalRequestRows ? getLocalRequestRows(limit) : this.repository.getRecentRequests(provider.id, limit);

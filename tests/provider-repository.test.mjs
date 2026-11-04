@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
+import { ProviderQueryEngine, describeProviderQuery } from '../src/hub-provider-adapters.mjs';
 import { parseProviderRow, ProviderRepository } from '../src/provider-repository.mjs';
 
 function liveStateRepository(t) {
@@ -13,7 +14,7 @@ function liveStateRepository(t) {
   database.exec(`
     CREATE TABLE providers (
       id TEXT, app_type TEXT, name TEXT, website_url TEXT, is_current INTEGER,
-      sort_index INTEGER, settings_config TEXT DEFAULT '{}', meta TEXT DEFAULT '{}',
+      sort_index INTEGER, category TEXT, settings_config TEXT DEFAULT '{}', meta TEXT DEFAULT '{}',
       PRIMARY KEY (id, app_type)
     );
     INSERT INTO providers (id, app_type, name, is_current, sort_index) VALUES
@@ -21,7 +22,7 @@ function liveStateRepository(t) {
       ('zlm', 'codex', '允熙官方-zlm-外网', 0, 1),
       ('claude-only', 'claude', 'Claude', 1, 0);
   `);
-  const repository = new ProviderRepository(databasePath);
+  const repository = new ProviderRepository(databasePath, { codexHome: directory });
   t.after(() => {
     repository.close();
     database.close();
@@ -39,6 +40,76 @@ function liveStateRepository(t) {
 function proxyLiveState(id, overrides = {}) {
   return { version: 1, apps: { codex: { mode: 'proxy', attached: true, proxy_route: id, ...overrides } } };
 }
+
+test('the active unbound official route reads the live Codex login without asking a browser', async t => {
+  const { repository, database, writeState } = liveStateRepository(t);
+  const stored = { tokens: { account_id: 'stale-account', access_token: 'stale-token' } };
+  database.prepare("UPDATE providers SET category = 'official', settings_config = ? WHERE id = 'zlm'")
+    .run(JSON.stringify({ auth: stored, config: '' }));
+  writeState(proxyLiveState('zlm'));
+  const writeLogin = (account, token, timestamp) => {
+    fs.writeFileSync(repository.codexAuthPath, JSON.stringify({
+      auth_mode: 'chatgpt',
+      tokens: { account_id: account, access_token: token, refresh_token: 'not-needed' },
+    }));
+    fs.utimesSync(repository.codexAuthPath, timestamp, timestamp);
+  };
+  writeLogin('live-account', 'live-token', new Date(1_700_000_000_000));
+  const changeToken = repository.getChangeToken();
+  const snapshot = repository.getAll();
+  const provider = repository.getCurrent();
+  assert.deepEqual(snapshot.find(item => item.isCurrent), provider);
+  assert.deepEqual(repository.getById(provider.id), provider);
+  assert.deepEqual(repository.getByName(provider.name), provider);
+  assert.deepEqual(provider.auth, { tokens: { account_id: 'live-account', access_token: 'live-token' } });
+  assert.equal(describeProviderQuery(provider).followsCodexLogin, true);
+  assert.equal(describeProviderQuery(provider).waf, false);
+
+  let browserCalls = 0;
+  const fetched = [];
+  const engine = new ProviderQueryEngine(repository, {
+    isConnected: () => true,
+    hasSession: () => true,
+    async queryJson() { browserCalls += 1; throw new Error('unexpected browser request'); },
+  }, {
+    async fetchImpl(url, { headers }) {
+      fetched.push([url, headers.Authorization, headers['ChatGPT-Account-Id']]);
+      return new Response(JSON.stringify({
+        plan_type: 'plus', rate_limit: { primary_window: { used_percent: 25, limit_window_seconds: 18_000 } },
+      }));
+    },
+  });
+  const result = await engine.query(provider);
+  assert.equal(result.usage.remaining, 75);
+  assert.equal(result.source, 'openai_codex_login');
+  assert.deepEqual(result.usage.subscriptionQuota, { windows: [{ label: '5小时', remaining: 75 }], credits: null });
+  assert.doesNotMatch(JSON.stringify(result), /live-token|live-account/);
+  writeLogin('new-account', 'new-token', new Date(1_700_000_001_000));
+  assert.notEqual(repository.getChangeToken(), changeToken);
+  assert.notEqual(repository.getAll(), snapshot);
+  await engine.query(repository.getCurrent());
+  assert.deepEqual(fetched, [
+    ['https://chatgpt.com/backend-api/wham/usage', 'Bearer live-token', 'live-account'],
+    ['https://chatgpt.com/backend-api/wham/usage', 'Bearer new-token', 'new-account'],
+  ]);
+
+  fs.unlinkSync(repository.codexAuthPath);
+  const noLogin = await engine.query(repository.getCurrent());
+  assert.equal(noLogin.loginRequired, true);
+  assert.match(noLogin.message, /在 Codex 中登录/);
+  assert.equal(browserCalls, 0);
+  assert.equal(fetched.length, 2);
+
+  writeLogin('new-account', 'new-token', new Date(1_700_000_002_000));
+  writeState(proxyLiveState('tyz'));
+  assert.deepEqual(repository.getById(provider.id).auth, stored, 'inactive cards do not use a different live account');
+  writeState(proxyLiveState('zlm'));
+  database.prepare("UPDATE providers SET meta = ? WHERE id = 'zlm'").run(JSON.stringify({
+    authBinding: { source: 'managed_account', authProvider: 'codex_oauth', accountId: 'managed-id' },
+  }));
+  assert.equal(repository.getCurrent().followsCodexLogin, undefined);
+  assert.deepEqual(repository.getCurrent().auth, stored, 'an explicitly bound account must not use another live login');
+});
 
 test('CCSwitch proxy live route overrides the stale SQLite selection across repository views', t => {
   const { repository, database, writeState } = liveStateRepository(t);

@@ -712,6 +712,7 @@ function paidMirrorFamily(provider) {
 export function providerKind(provider) {
   const name = String(provider?.name || '').toLowerCase().replace(/\s+/g, '');
   const hasOpenAiCredentials = Boolean(provider?.auth?.tokens?.account_id && provider?.auth?.tokens?.access_token);
+  if (provider?.followsCodexLogin === true) return 'openai';
   if (hasProviderApiDomain(provider, 'agentrouter.org')) return 'agentrouter';
   if (hasProviderApiDomain(provider, 'anyrouter.top') || configuredProviderApiHostname(provider) === 'a-ocnfniawgw.cn-shanghai.fcapp.run') return 'anyrouter';
   if (hasProviderDomain(provider, 'chatgpt.com') || (name.includes('openai') && hasOpenAiCredentials)) return 'openai';
@@ -860,15 +861,19 @@ export function describeProviderQuery(provider, templateId = '') {
     };
   }
   if (selected === 'openai-wham') {
+    const followsCodexLogin = provider?.followsCodexLogin === true;
     return {
       ...common,
       type: 'openai-account',
       label: 'OpenAI 账户额度查询',
       requestUrl: WHAM_URL,
-      authentication: '本机 OpenAI 账户 Token + ChatGPT-Account-Id',
-      executor: 'Node 官方接口；网络/WAF 失败时使用已配对的现有浏览器',
-      waf: true,
-      notes: ['Token 只在本机内存和已配对浏览器任务中使用，不进入 Hub 页面'],
+      authentication: followsCodexLogin ? 'Codex 当前登录（本机 auth.json）' : 'OpenAI 账户 Token + ChatGPT-Account-Id',
+      executor: followsCodexLogin ? '直接查询 OpenAI 额度接口，无需浏览器' : 'Node 官方接口；网络/WAF 失败时使用已配对的现有浏览器',
+      followsCodexLogin,
+      waf: !followsCodexLogin,
+      notes: followsCodexLogin
+        ? ['额度随 Codex 当前登录账号；仅只读访问登录文件']
+        : ['Token 只在本机内存和已配对浏览器任务中使用，不进入 Hub 页面'],
     };
   }
   if (selected === 'cpa-local') {
@@ -1972,7 +1977,7 @@ export class ProviderQueryEngine {
     };
   }
 
-  async #queryWham(accessToken, accountId, signal) {
+  async #queryWham(accessToken, accountId, signal, directOnly = false) {
     const accountBackoffKey = crypto.createHash('sha256')
       .update(String(accountId))
       .digest('base64url');
@@ -1980,12 +1985,13 @@ export class ProviderQueryEngine {
       .update(String(accountId))
       .update('\0')
       .update(String(accessToken))
+      .update(directOnly ? '\0codex-login' : '')
       .digest('base64url');
     const cached = this.whamRecent.get(cacheKey);
     if (cached && this.now() - cached.createdAt < this.whamResultCacheMs) return cached.result;
     if (this.whamInFlight.has(cacheKey)) return this.whamInFlight.get(cacheKey);
 
-    const operation = this.#queryWhamUncached(accessToken, accountId, accountBackoffKey, signal);
+    const operation = this.#queryWhamUncached(accessToken, accountId, accountBackoffKey, signal, directOnly);
     this.whamInFlight.set(cacheKey, operation);
     try {
       const result = await operation;
@@ -2006,14 +2012,14 @@ export class ProviderQueryEngine {
     }
   }
 
-  async #queryWhamUncached(accessToken, accountId, accountBackoffKey, signal) {
+  async #queryWhamUncached(accessToken, accountId, accountBackoffKey, signal, directOnly) {
     const headers = {
       Authorization: `Bearer ${accessToken}`,
       'ChatGPT-Account-Id': accountId,
       Accept: 'application/json',
       'User-Agent': 'codex-ccswitch-usage/2',
     };
-    const browserAvailable = typeof this.browserBroker?.queryJson === 'function'
+    const browserAvailable = !directOnly && typeof this.browserBroker?.queryJson === 'function'
       && (typeof this.browserBroker.isConnected !== 'function' || this.browserBroker.isConnected());
     const directRetryAt = this.whamDirectRetryAt.get(accountBackoffKey) || 0;
     const directReady = !browserAvailable || this.now() >= directRetryAt;
@@ -2124,6 +2130,32 @@ export class ProviderQueryEngine {
     const tokens = provider.auth?.tokens || {};
     const accountId = String(tokens.account_id || '');
     let accessToken = String(tokens.access_token || '');
+    if (provider.followsCodexLogin === true) {
+      const source = 'openai_codex_login';
+      if (!accessToken || !accountId) {
+        return { source, loginRequired: true, message: '没有找到 Codex 本机 ChatGPT 登录，请在 Codex 中登录后刷新' };
+      }
+      let result;
+      try {
+        result = await this.#queryWham(accessToken, accountId, signal, true);
+      } catch (error) {
+        if (signal?.aborted) throw signal.reason || error;
+        return { source, loginRequired: false, message: '无法连接 OpenAI 额度接口，请检查网络后重试' };
+      }
+      if (result.status === 200 && isWhamUsagePayload(result.payload)) {
+        return this.#openAiUsage(provider, result.payload, source, { extra: '额度来自 Codex 当前登录' });
+      }
+      if (result.status === 401 || authenticationFailure(result.status, result.payload, result)) {
+        return { source, loginRequired: true, message: 'Codex 当前登录已失效，请在 Codex 中重新登录后刷新' };
+      }
+      return {
+        source,
+        loginRequired: false,
+        message: result.status === 200
+          ? 'OpenAI 用量响应缺少有效额度窗口'
+          : `OpenAI 额度查询失败（HTTP ${result.status}），请检查网络或账号权限后重试`,
+      };
+    }
     const replacement = this.#findCpaToken(accountId);
     if (replacement?.access_token) accessToken = String(replacement.access_token);
     const missingCredentials = !accessToken || !accountId;
@@ -2212,16 +2244,21 @@ export class ProviderQueryEngine {
     });
     if (summary.creditBalance != null) details.push(`Credits ${summary.creditBalance}`);
     if (options.extra) details.push(String(options.extra));
+    const usage = usageResult(provider, {
+      planName: `OpenAI ${summary.plan}`,
+      remaining: summary.remaining,
+      used: summary.used,
+      total: 100,
+      unit: '%',
+      extra: details.join('；'),
+      accountBrowser: options.accountBrowser,
+    });
+    usage.subscriptionQuota = {
+      windows: summary.limits.map(({ label, remaining }) => ({ label, remaining })),
+      credits: finiteOrNull(summary.creditBalance),
+    };
     return {
-      usage: usageResult(provider, {
-        planName: `OpenAI ${summary.plan}`,
-        remaining: summary.remaining,
-        used: summary.used,
-        total: 100,
-        unit: '%',
-        extra: details.join('；'),
-        accountBrowser: options.accountBrowser,
-      }),
+      usage,
       source,
       loginRequired: false,
     };

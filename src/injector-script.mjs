@@ -272,7 +272,7 @@ export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = glob
 }
 
 export { PAGE_ACTION_SENTINEL };
-export const INJECTOR_VERSION = 96;
+export const INJECTOR_VERSION = 97;
 
 function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, formatRequestTime, calculatePopoverPlacement, selectResponsiveUsageMode, calculateResponsiveMeasurements, calculateExpandedNativeTriggerMaxWidth, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, findComposerSurface, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, enqueuePageActionTitle, pageActionSentinel, version) {
   const VERSION = version;
@@ -390,6 +390,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     payload?.unit,
     payload?.updatedAt,
     payload?.queryError,
+    payload?.subscriptionQuota,
   ]);
 
   function footerParts(footer) {
@@ -575,6 +576,8 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
         .popover-refresh[data-loading="true"] svg{animation:popover-refresh-spin .9s linear infinite}
         .popover-grid{display:grid;flex:1 1 auto;min-height:0;gap:6px;margin:8px 8px 0;overflow-y:auto;overscroll-behavior:contain}
         .popover[data-mode="requests"] .popover-grid{display:none}
+        .request-quota{display:none;flex:0 0 auto;margin:5px 8px 0;padding:4px 8px;border-radius:8px;background:var(--color-background-button-tertiary,rgba(127,127,127,.06));color:var(--color-token-text-primary,currentColor);font-size:12px;line-height:18px;overflow-wrap:anywhere}
+        .popover[data-mode="requests"] .request-quota:not([hidden]){display:block}
         .popover-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;min-height:30px;padding:6px 9px;border-radius:8px;background:var(--color-background-button-tertiary,rgba(127,127,127,.04))}
         .popover-label{flex:0 0 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-token-text-tertiary,currentColor)}
         .popover-value{flex:1 1 auto;min-width:0;max-width:100%;overflow-wrap:anywhere;text-align:right;color:var(--color-token-text-primary,currentColor);font:inherit}
@@ -603,7 +606,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
         @media (prefers-reduced-motion:reduce){.popover-refresh[data-loading="true"] svg{animation:none}}
       </style><div id="popover" class="popover" data-mode="balance" role="dialog" aria-labelledby="popover-title" aria-hidden="true" tabindex="-1">
         <div class="popover-head"><span id="popover-title" class="popover-head-title">额度</span><button id="popover-refresh" class="popover-refresh" type="button" aria-label="刷新 CCSwitch 用量"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 0 0-15.22-6.49L3 8"></path><path d="M3 3v5h5"></path><path d="M3 12a9 9 0 0 0 15.22 6.49L21 16"></path><path d="M16 16h5v5"></path></svg></button></div>
-        <div id="popover-grid" class="popover-grid"></div><div id="recent-requests" class="request-list" role="list"></div><button id="open-hub" class="hub-open" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1.25"></rect><rect x="14" y="4" width="6" height="6" rx="1.25"></rect><rect x="4" y="14" width="6" height="6" rx="1.25"></rect><rect x="14" y="14" width="6" height="6" rx="1.25"></rect></svg><span>打开 All API Hub</span><svg class="external-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6"></path><path d="M20 4 11 13"></path><path d="M20 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h6"></path></svg></button>
+        <div id="popover-grid" class="popover-grid"></div><div id="request-quota" class="request-quota" hidden></div><div id="recent-requests" class="request-list" role="list"></div><button id="open-hub" class="hub-open" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1.25"></rect><rect x="14" y="4" width="6" height="6" rx="1.25"></rect><rect x="4" y="14" width="6" height="6" rx="1.25"></rect><rect x="14" y="14" width="6" height="6" rx="1.25"></rect></svg><span>打开 All API Hub</span><svg class="external-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6"></path><path d="M20 4 11 13"></path><path d="M20 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h6"></path></svg></button>
       </div><div id="tooltip" class="tooltip" role="tooltip"></div>`;
       shadow.getElementById('open-hub').addEventListener('click', () => openHub());
       shadow.getElementById('popover-refresh').addEventListener('click', event => {
@@ -1125,7 +1128,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       empty.className = 'request-empty';
       empty.textContent = state.requestLoading || payload.recentRequestsLoading
         ? '正在读取最新 10 条调用记录…'
-        : '当前供应商还没有 Codex 请求记录';
+        : payload.recentRequestsMessage || '当前供应商还没有 Codex 请求记录';
       list.replaceChildren(empty);
       state.recentRequestsPayload = payload;
       state.recentRequestsAgeMinute = ageMinute;
@@ -1146,7 +1149,10 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       }
       const timing = document.createElement('span');
       timing.className = 'request-timing';
-      timing.textContent = `${formatRequestTime(item.latencyMs)}/${formatRequestTime(item.firstTokenMs)}`;
+      const totalTime = formatRequestTime(item.latencyMs);
+      const firstTokenTime = formatRequestTime(item.firstTokenMs);
+      timing.textContent = totalTime === '--' && firstTokenTime === '--' ? '未记录' : `${totalTime}/${firstTokenTime}`;
+      timing.title = `总耗时：${totalTime === '--' ? '未记录' : totalTime}；首字耗时：${firstTokenTime === '--' ? '未记录' : firstTokenTime}`;
       const age = document.createElement('span');
       age.className = 'request-age';
       age.textContent = formatUsageAge(item.createdAt);
@@ -1169,8 +1175,9 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       }
       const cost = document.createElement('span');
       cost.className = 'request-cost';
-      cost.textContent = formatRequestCost(item.totalCost ?? item.totalCostUsd, item.costUnit || 'USD');
-      cost.title = item.costExact === true
+      const subscription = item.costUnit === 'subscription';
+      cost.textContent = subscription ? '订阅' : formatRequestCost(item.totalCost ?? item.totalCostUsd, item.costUnit || 'USD');
+      cost.title = subscription ? 'ChatGPT 订阅未提供本次扣费金额' : item.costExact === true
         ? '第三方实际扣费'
         : item.costSource === 'ccswitch_local' ? 'CCSwitch 本地估算' : '第三方未返回可换算费用';
       metadata.appendChild(cost);
@@ -1180,6 +1187,17 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     list.replaceChildren(...rows);
     state.recentRequestsPayload = payload;
     state.recentRequestsAgeMinute = ageMinute;
+  }
+
+  function renderRequestQuota(portal, payload) {
+    const summary = portal.getElementById('request-quota');
+    const quota = payload.status === 'ok' ? payload.subscriptionQuota : null;
+    const parts = quota?.windows?.map(window => `${window.label}剩余 ${formatNumber(window.remaining)}%`) || [];
+    if (quota?.credits != null) parts.push(`Credits ${formatNumber(quota.credits)}`);
+    const text = parts.join(' · ');
+    if (summary.textContent !== text) summary.textContent = text;
+    updateElementAttribute(summary, 'hidden', text ? null : '');
+    updateElementAttribute(summary, 'title', text && payload.queryError ? '最近刷新失败，显示上次查到的额度' : null);
   }
 
   function render(footers = null, shouldScheduleLayout = true) {
@@ -1228,6 +1246,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
       updateElementAttribute(popoverRefreshButton, 'aria-busy', popoverLoading ? 'true' : null);
       updateElementAttribute(popoverRefreshButton, 'aria-label', popoverMode === 'requests' ? '刷新最近 10 条 Codex 调用' : '刷新 CCSwitch 用量');
       renderPopoverRows(portal, payload);
+      renderRequestQuota(portal, payload);
       renderRecentRequests(portal, payload);
     }
     if (shouldScheduleLayout) scheduleLayout();

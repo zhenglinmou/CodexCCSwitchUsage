@@ -1,18 +1,20 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { getDefaultDatabasePath } from './platform.mjs';
+import { getCodexHomeDir, getDefaultDatabasePath } from './platform.mjs';
 
 const MAX_CODEX_PROVIDERS = 512;
 const MAX_PROVIDER_CONFIG_CHARS = 65_536;
 const MAX_CREDENTIAL_MATCH_ROWS = 64;
 const MAX_LIVE_STATE_BYTES = 65_536;
+const MAX_CODEX_AUTH_BYTES = 65_536;
 const PROVIDER_SELECT_COLUMNS = `
   substr(id, 1, 160) AS id,
   substr(name, 1, 160) AS name,
   substr(website_url, 1, 2048) AS website_url,
   is_current,
   sort_index,
+  category,
   CASE WHEN settings_config IS NULL OR length(settings_config) <= ${MAX_PROVIDER_CONFIG_CHARS} THEN settings_config ELSE '{}' END AS settings_config,
   CASE WHEN meta IS NULL OR length(meta) <= ${MAX_PROVIDER_CONFIG_CHARS} THEN meta ELSE '{}' END AS meta
 `;
@@ -50,13 +52,23 @@ export function findBaseUrl(configText = '') {
   return matches.at(-1)?.[1]?.replace(/\/+$/, '') ?? '';
 }
 
-export function parseProviderRow(row) {
+function currentOfficialRow(row) {
+  return Boolean(row?.is_current && row.category === 'official');
+}
+
+export function parseProviderRow(row, codexAuthSnapshot = null) {
   if (!row) return null;
   const settings = parseJson(row.settings_config, {});
   const meta = parseJson(row.meta, {});
   const usage = meta?.usage_script;
-  const auth = settings?.auth && typeof settings.auth === 'object' ? settings.auth : {};
+  const storedAuth = settings?.auth && typeof settings.auth === 'object' ? settings.auth : {};
   const apiBaseUrl = findBaseUrl(settings?.config || '').trim().slice(0, 2_048);
+  const apiKey = String(storedAuth.OPENAI_API_KEY || storedAuth.openai_api_key || '').slice(0, 16_384);
+  // An unbound official card follows the active Codex login. Legacy auth
+  // snapshots in the card do not authenticate the active official route.
+  const followsCodexLogin = Boolean(codexAuthSnapshot && currentOfficialRow(row)
+    && !apiKey && (!apiBaseUrl || /^https:\/\/chatgpt\.com(?:\/|$)/i.test(apiBaseUrl))
+    && meta?.authBinding?.source !== 'managed_account');
 
   const id = String(row.id || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 160);
   if (!id) return null;
@@ -67,8 +79,10 @@ export function parseProviderRow(row) {
     isCurrent: Boolean(row.is_current),
     sortIndex: row.sort_index != null && Number.isFinite(Number(row.sort_index)) ? Number(row.sort_index) : null,
     usage: usage && typeof usage === 'object' ? usage : null,
-    auth,
-    apiKey: String(auth.OPENAI_API_KEY || auth.openai_api_key || '').slice(0, 16_384),
+    auth: followsCodexLogin ? codexAuthSnapshot.auth : storedAuth,
+    apiKey,
+    ...(followsCodexLogin ? { followsCodexLogin: true } : {}),
+    ...(row.is_proxy_route ? { isProxyRoute: true } : {}),
     apiBaseUrl,
     baseUrl: String(usage?.baseUrl || apiBaseUrl).trim().slice(0, 2_048).replace(/\/+$/, ''),
   };
@@ -81,14 +95,18 @@ function providerRowSignature(row) {
     row.name,
     row.website_url,
     row.is_current,
+    row.is_proxy_route,
     row.sort_index,
+    row.category,
     row.settings_config,
     row.meta,
   ]);
 }
 
 function withLiveCurrentProvider(row, liveRow) {
-  return row && liveRow ? { ...row, is_current: Number(row.id === liveRow.id) } : row;
+  if (!row || !liveRow) return row;
+  const current = Number(row.id === liveRow.id);
+  return { ...row, is_current: current, is_proxy_route: current || undefined };
 }
 
 function readLiveProviderId(filename) {
@@ -124,6 +142,25 @@ function fileChangeIdentity(filename, statSync) {
     return `${stats.dev || 0}:${stats.ino || 0}:${stats.size || 0}:${stats.mtimeMs || 0}`;
   } catch {
     return 'missing';
+  }
+}
+
+function readCodexChatGptAuth(filename) {
+  const descriptor = fs.openSync(filename, 'r');
+  try {
+    const stats = fs.fstatSync(descriptor);
+    if (!stats.isFile() || stats.size <= 0 || stats.size > MAX_CODEX_AUTH_BYTES) return {};
+    const buffer = Buffer.alloc(MAX_CODEX_AUTH_BYTES + 1);
+    const size = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
+    if (size > MAX_CODEX_AUTH_BYTES) return {};
+    const auth = JSON.parse(buffer.subarray(0, size).toString('utf8'));
+    if (auth?.auth_mode != null && auth.auth_mode !== 'chatgpt') return {};
+    const { account_id, access_token } = auth?.tokens || {};
+    if (typeof account_id !== 'string' || !/^[\x21-\x7e]{1,160}$/.test(account_id)
+      || typeof access_token !== 'string' || !/^[\x21-\x7e]{1,16384}$/.test(access_token)) return {};
+    return { tokens: { account_id, access_token } };
+  } finally {
+    fs.closeSync(descriptor);
   }
 }
 
@@ -169,6 +206,10 @@ export class ProviderRepository {
   constructor(databasePath = getDefaultDatabasePath(), options = {}) {
     this.databasePath = databasePath;
     this.liveStatePath = path.join(path.dirname(databasePath), 'live-state.json');
+    const codexHome = options.codexHome ?? getCodexHomeDir();
+    this.codexAuthPath = codexHome ? path.join(codexHome, 'auth.json') : '';
+    this.codexAuthSnapshot = null;
+    this.unavailableCodexAuth = { auth: {} };
     this.databaseFactory = options.databaseFactory || (filename => new DatabaseSync(filename, { readOnly: true }));
     this.statSync = options.statSync || fs.statSync;
     this.database = null;
@@ -179,6 +220,7 @@ export class ProviderRepository {
     this.allStatement = null;
     this.localUsageStatement = null;
     this.recentRequestsStatement = null;
+    this.recentProxyRequestsStatement = null;
     this.credentialAppTypesStatement = null;
     this.currentCache = null;
     this.liveStateCache = null;
@@ -201,9 +243,10 @@ export class ProviderRepository {
     const liveRow = this.getLiveCurrentRow(db);
     const row = liveRow ? withLiveCurrentProvider(liveRow, liveRow) : this.currentStatement.get();
     const signature = providerRowSignature(row);
-    if (this.currentCache?.signature === signature) return this.currentCache.value;
-    const value = parseProviderRow(row);
-    this.currentCache = { signature, value };
+    const authSnapshot = this.#authSnapshot(row);
+    if (this.currentCache?.signature === signature && this.currentCache.authSnapshot === authSnapshot) return this.currentCache.value;
+    const value = parseProviderRow(row, authSnapshot);
+    this.currentCache = { signature, authSnapshot, value };
     return value;
   }
 
@@ -219,10 +262,11 @@ export class ProviderRepository {
     }
     const row = withLiveCurrentProvider(this.byNameStatement.get(name), this.getLiveCurrentRow(db));
     const signature = providerRowSignature(row);
+    const authSnapshot = this.#authSnapshot(row);
     const cached = this.byNameCache.get(name);
-    if (cached?.signature === signature) return cached.value;
-    const value = parseProviderRow(row);
-    this.byNameCache.set(name, { signature, value });
+    if (cached?.signature === signature && cached.authSnapshot === authSnapshot) return cached.value;
+    const value = parseProviderRow(row, authSnapshot);
+    this.byNameCache.set(name, { signature, authSnapshot, value });
     return value;
   }
 
@@ -232,10 +276,11 @@ export class ProviderRepository {
     const key = String(id);
     const row = withLiveCurrentProvider(this.byIdStatement.get(key), this.getLiveCurrentRow(db));
     const signature = providerRowSignature(row);
+    const authSnapshot = this.#authSnapshot(row);
     const cached = this.byIdCache.get(key);
-    if (cached?.signature === signature) return cached.value;
-    const value = parseProviderRow(row);
-    this.byIdCache.set(key, { signature, value });
+    if (cached?.signature === signature && cached.authSnapshot === authSnapshot) return cached.value;
+    const value = parseProviderRow(row, authSnapshot);
+    this.byIdCache.set(key, { signature, authSnapshot, value });
     return value;
   }
 
@@ -289,10 +334,28 @@ export class ProviderRepository {
     const liveRow = this.getLiveCurrentRow(db);
     const currentRows = liveRow ? rows.map(row => withLiveCurrentProvider(row, liveRow)) : rows;
     const signature = JSON.stringify(currentRows.map(providerRowSignature));
-    if (this.allCache?.signature === signature) return this.allCache.value;
-    const value = currentRows.map(parseProviderRow).filter(Boolean);
-    this.allCache = { signature, value };
+    const authSnapshot = this.#authSnapshot(currentRows.find(currentOfficialRow));
+    if (this.allCache?.signature === signature && this.allCache.authSnapshot === authSnapshot) return this.allCache.value;
+    const value = currentRows.map(row => parseProviderRow(row, authSnapshot)).filter(Boolean);
+    this.allCache = { signature, authSnapshot, value };
     return value;
+  }
+
+  #authSnapshot(row) {
+    if (!currentOfficialRow(row)) return null;
+    const signature = this.codexAuthPath ? fileChangeIdentity(this.codexAuthPath, this.statSync) : 'missing';
+    if (signature === 'missing') {
+      this.codexAuthSnapshot = null;
+      return this.unavailableCodexAuth;
+    }
+    if (this.codexAuthSnapshot?.signature === signature) return this.codexAuthSnapshot;
+    try {
+      this.codexAuthSnapshot = { signature, auth: readCodexChatGptAuth(this.codexAuthPath) };
+      return this.codexAuthSnapshot;
+    } catch {
+      this.codexAuthSnapshot = null;
+      return this.unavailableCodexAuth;
+    }
   }
 
   getLocalUsage(providerId) {
@@ -312,21 +375,23 @@ export class ProviderRepository {
     };
   }
 
-  getRecentRequests(providerId, limit = 10) {
+  getRecentRequests(providerId, limit = 10, { proxyOnly = false } = {}) {
     const db = this.ensureDatabase();
-    if (!this.recentRequestsStatement) {
-      this.recentRequestsStatement = db.prepare(`
+    const statement = proxyOnly ? 'recentProxyRequestsStatement' : 'recentRequestsStatement';
+    if (!this[statement]) {
+      this[statement] = db.prepare(`
         SELECT model, request_model, input_tokens, output_tokens,
                cache_read_tokens, cache_creation_tokens, total_cost_usd,
                latency_ms, first_token_ms, status_code, created_at
         FROM proxy_request_logs
         WHERE app_type = 'codex' AND provider_id = ?
+          ${proxyOnly ? "AND data_source = 'proxy'" : ''}
         ORDER BY created_at DESC, request_id DESC
         LIMIT ?
       `);
     }
     const boundedLimit = Math.max(1, Math.min(50, Math.trunc(Number(limit) || 10)));
-    return this.recentRequestsStatement
+    return this[statement]
       .all(String(providerId), boundedLimit)
       .map(parseRequestLogRow)
       .filter(Boolean);
@@ -357,7 +422,7 @@ export class ProviderRepository {
   }
 
   getChangeToken() {
-    return [this.databasePath, `${this.databasePath}-wal`, `${this.databasePath}-shm`, this.liveStatePath]
+    return [this.databasePath, `${this.databasePath}-wal`, `${this.databasePath}-shm`, this.liveStatePath, this.codexAuthPath].filter(Boolean)
       .map(filename => fileChangeIdentity(filename, this.statSync))
       .join('|');
   }
@@ -386,9 +451,11 @@ export class ProviderRepository {
     this.allStatement = null;
     this.localUsageStatement = null;
     this.recentRequestsStatement = null;
+    this.recentProxyRequestsStatement = null;
     this.credentialAppTypesStatement = null;
     this.currentCache = null;
     this.liveStateCache = null;
+    this.codexAuthSnapshot = null;
     this.byNameCache.clear();
     this.byIdCache.clear();
     this.allCache = null;

@@ -112,6 +112,19 @@ test('browser tasks prioritize binding, synchronization, and website authenticat
   assert.equal(browserTaskKind({ status: 'ok', loginSupported: true }), '');
 });
 
+test('a missing or expired Codex login is not a browser authentication task', () => {
+  const item = {
+    queryMethod: { followsCodexLogin: true },
+    loginUrl: 'https://chatgpt.com/auth/login',
+    loginSupported: true,
+    status: 'login-required',
+  };
+  assert.equal(browserTaskKind(item), '');
+  assert.deepEqual(hubLoginLink(item), {
+    href: 'https://chatgpt.com/auth/login', label: 'ChatGPT 官网', primary: false,
+  });
+});
+
 test('Hub exposes every connected browser and routes authentication to the selected companion', () => {
   const page = buildHubPage({ apiBase: '/api/test-token', nonce: 'test-nonce' });
 
