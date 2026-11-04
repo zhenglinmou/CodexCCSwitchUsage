@@ -55,6 +55,43 @@ test('OpenAI Official rejects an entire session file containing an oversized JSO
   assert.equal(result.officialSessionCount, 0);
 });
 
+test('OpenAI Official skips a large tool output and keeps reading usage from the same session', async t => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-official-large-tool-output-'));
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  writeCodexAuth(codexHome, 'active-account');
+  const filename = path.join(codexHome, 'sessions', 'ongoing.jsonl');
+  const tokenEvent = (time, total) => ({
+    timestamp: `2026-07-09T08:36:${time}.000Z`, type: 'event_msg', payload: {
+      type: 'token_count', info: {
+        total_token_usage: { total_tokens: total },
+        last_token_usage: { input_tokens: total - 3, output_tokens: 3, total_tokens: total },
+      },
+    },
+  });
+  writeJsonLines(filename, [
+    { timestamp: '2026-07-09T08:35:17.000Z', type: 'session_meta', payload: { id: 'active-session', model_provider: 'openai' } },
+    { timestamp: '2026-07-09T08:35:19.000Z', type: 'turn_context', payload: { model: 'gpt-5.5' } },
+    tokenEvent('16', 13),
+  ]);
+
+  const reader = new CodexSessionUsageReader({ codexHome });
+  const provider = { auth: { tokens: { account_id: 'active-account' } } };
+  assert.equal((await reader.query(provider)).items.length, 1);
+  const output = {
+    timestamp: '2026-07-09T08:36:17.000Z',
+    ordinal: 42,
+    type: 'response_item',
+    payload: { type: 'custom_tool_call_output', output: '私有工具输出'.repeat(100_000) },
+  };
+  fs.appendFileSync(filename, `${JSON.stringify(output)}\n${JSON.stringify(tokenEvent('18', 21))}\n`, 'utf8');
+  const result = await reader.query(provider);
+  assert.deepEqual(result.items.map(item => [item.model, item.totalTokens]), [['gpt-5.5', 21], ['gpt-5.5', 13]]);
+  assert.equal(result.officialSessionCount, 1);
+
+  const cold = await new CodexSessionUsageReader({ codexHome }).query(provider);
+  assert.deepEqual(cold.items, result.items);
+});
+
 function statusPayload(overrides = {}) {
   return {
     success: true,

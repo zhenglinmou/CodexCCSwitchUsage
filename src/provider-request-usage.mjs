@@ -308,30 +308,46 @@ function accountScopeError(message) {
   return error;
 }
 
+function isCodexResponseItemPrefix(prefix) {
+  // Only discard a known top-level response item. Account and usage events,
+  // or lines whose type cannot be identified from the envelope, fail closed.
+  return /^\s*\{\s*(?:"timestamp"\s*:\s*"[^"\\]*"\s*,\s*)?(?:"ordinal"\s*:\s*\d+\s*,\s*)?"type"\s*:\s*"response_item"\s*,/.test(prefix);
+}
+
 async function* boundedUtf8Lines(input, maximumBytes = CODEX_SESSION_MAX_LINE_BYTES) {
   let line = '';
   let lineBytes = 0;
+  let discardingResponse = false;
   for await (const chunk of input) {
     let start = 0;
     while (start < chunk.length) {
       const newline = chunk.indexOf('\n', start);
       const end = newline < 0 ? chunk.length : newline;
-      const part = chunk.slice(start, end);
-      lineBytes += Buffer.byteLength(part, 'utf8');
-      if (lineBytes > maximumBytes) {
-        const error = new Error('Codex 会话记录单行过大');
-        error.code = 'CODEX_SESSION_LINE_TOO_LARGE';
-        throw error;
+      if (!discardingResponse) {
+        const part = chunk.slice(start, end);
+        lineBytes += Buffer.byteLength(part, 'utf8');
+        if (lineBytes > maximumBytes) {
+          const prefix = line.slice(0, 512) + part.slice(0, Math.max(0, 512 - line.length));
+          if (!isCodexResponseItemPrefix(prefix)) {
+            const error = new Error('Codex 会话记录单行过大');
+            error.code = 'CODEX_SESSION_LINE_TOO_LARGE';
+            throw error;
+          }
+          line = '';
+          discardingResponse = true;
+        } else {
+          line += part;
+        }
       }
-      line += part;
       if (newline < 0) break;
-      yield line.endsWith('\r') ? line.slice(0, -1) : line;
+      if (!discardingResponse) yield line.endsWith('\r') ? line.slice(0, -1) : line;
       line = '';
       lineBytes = 0;
+      discardingResponse = false;
       start = newline + 1;
     }
   }
-  if (line) yield line.endsWith('\r') ? line.slice(0, -1) : line;
+  if (line && !discardingResponse) yield line.endsWith('\r') ? line.slice(0, -1) : line;
 }
 
 export async function listCodexSessionFiles(root, output, maximum, signal = null) {
@@ -630,6 +646,7 @@ export class CodexSessionUsageReader {
         if (official !== true && line.includes('"type":"session_meta"')) {
           try {
             const event = JSON.parse(line);
+            if (event?.type !== 'session_meta') continue;
             sessionId = cleanText(event?.payload?.id || sessionId, 128) || sessionId;
             official = String(event?.payload?.model_provider || '') === 'openai';
             const eventAt = Date.parse(String(event?.timestamp || ''));
@@ -644,11 +661,13 @@ export class CodexSessionUsageReader {
         if (line.includes('"type":"turn_context"')) {
           try {
             const event = JSON.parse(line);
-            model = cleanText(event?.payload?.model, 160);
-            const eventAt = Date.parse(String(event?.timestamp || ''));
-            if (!Number.isFinite(eventAt) || eventAt < this.accountBoundaryMs) scopeEligible = false;
+            if (event?.type === 'turn_context') {
+              model = cleanText(event?.payload?.model, 160);
+              const eventAt = Date.parse(String(event?.timestamp || ''));
+              if (!Number.isFinite(eventAt) || eventAt < this.accountBoundaryMs) scopeEligible = false;
+              continue;
+            }
           } catch {}
-          continue;
         }
         if (!line.includes('"type":"event_msg"') || !line.includes('"type":"token_count"')) continue;
         let event;
@@ -657,7 +676,7 @@ export class CodexSessionUsageReader {
         } catch {
           continue;
         }
-        if (event?.payload?.type !== 'token_count' || !event?.payload?.info) continue;
+        if (event?.type !== 'event_msg' || event?.payload?.type !== 'token_count' || !event?.payload?.info) continue;
         const eventAt = Date.parse(String(event?.timestamp || ''));
         if (!Number.isFinite(eventAt) || eventAt < this.accountBoundaryMs) scopeEligible = false;
         const cumulativeTokens = codexSessionInteger(event.payload.info?.total_token_usage?.total_tokens);
