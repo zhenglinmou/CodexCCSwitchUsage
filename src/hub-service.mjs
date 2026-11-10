@@ -20,6 +20,7 @@ import {
   PROVIDER_TEMPLATE_REGISTRY_VERSION,
 } from './provider-templates.mjs';
 import { secureAtomicWriteFileSync } from './secure-files.mjs';
+import { usesLocalHttpUsage } from './http-allowlist.mjs';
 
 const MAX_SAFE_MESSAGE_CHARS = 8_192;
 const MAX_HUB_CACHE_BYTES = 8_000_000;
@@ -277,7 +278,9 @@ function ccswitchRequestUsageFallback(provider, rows, remoteResult, limit, now) 
     fallback: true,
     degraded: true,
     fallbackReason,
-    message: `未能取得第三方真实逐请求扣费，已回退 CCSwitch 本地估算：${fallbackReason}`,
+    message: usesLocalHttpUsage(provider)
+      ? (items.length ? 'HTTP 供应商使用 CCSwitch 本地请求记录' : 'HTTP 供应商暂无 CCSwitch 本地请求记录')
+      : `未能取得第三方真实逐请求扣费，已回退 CCSwitch 本地估算：${fallbackReason}`,
     requestCount: items.length,
     totalLocalRecords: items.length,
     billing: {
@@ -864,7 +867,7 @@ export class HubService {
       : [];
     const balanceCandidates = requestedBalance
       ? [requestedBalance]
-      : currentBalance?.selectable !== true
+      : usesLocalHttpUsage(provider) || currentBalance?.selectable !== true
         ? [selection.balanceTemplateId]
         : [...new Set([
             ...preferredBalance,
@@ -873,7 +876,7 @@ export class HubService {
     const currentRequestUsage = getRequestUsageTemplate(selection.requestUsageTemplateId);
     const requestCandidates = requestedRequestUsage
       ? [requestedRequestUsage]
-      : currentRequestUsage?.selectable !== true
+      : usesLocalHttpUsage(provider) || currentRequestUsage?.selectable !== true
         ? [selection.requestUsageTemplateId]
         : ['new-api-token-log'];
     const controller = new AbortController();
@@ -1172,7 +1175,9 @@ export class HubService {
         message: `Unknown provider: ${String(providerSelector || '')}`,
       };
     }
-    const requestProvider = canonicalAnyRouterRequestProvider(provider, this.providers.values());
+    const requestProvider = usesLocalHttpUsage(provider)
+      ? provider
+      : canonicalAnyRouterRequestProvider(provider, this.providers.values());
     const limit = normalizeRequestUsageLimit(options.limit);
     const templateSelection = this.items.get(requestProvider.id)?.templateSelection
       || templateSelectionFor(requestProvider, this.templateStore);
@@ -1547,6 +1552,7 @@ export class HubService {
       }), options.signal);
       const source = String(result?.source || '');
       const localFallback = result?.degraded === true
+        || source === 'ccswitch_local'
         || source === 'muyuan_local_usage'
         || source === 'api_health_and_local_usage';
       const usage = safeProbeUsage(result?.usage, source, secrets);

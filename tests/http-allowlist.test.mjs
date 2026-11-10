@@ -126,12 +126,19 @@ test('remote HTTP opt-in is pinned to one provider id and exact origin', async t
     { url: 'http://company.example.test:28080/api/status', authorization: '' },
   ]);
 
-  await assert.rejects(engine.query({ ...provider, id: 'other-provider' }, {
-    balanceTemplateId: 'new-api-key-quota',
-  }), /非本地供应商接口必须使用 HTTPS/);
-  await assert.rejects(engine.query({
-    ...provider,
-    apiBaseUrl: 'http://company.example.test:28081/v1',
-    baseUrl: 'http://company.example.test:28081/v1',
-  }, { balanceTemplateId: 'new-api-key-quota' }), /非本地供应商接口必须使用 HTTPS/);
+  for (const denied of [
+    { ...provider, id: 'other-provider' },
+    { ...provider, apiBaseUrl: 'http://company.example.test:28081/v1', baseUrl: 'http://company.example.test:28081/v1' },
+  ]) {
+    const fallback = await engine.query(denied, { balanceTemplateId: 'new-api-key-quota' });
+    assert.equal(fallback.source, 'ccswitch_local');
+    assert.equal(fallback.usage.remaining, null);
+    assert.match(fallback.usage.extra, /暂无本地请求记录/);
+    const requestFallback = await requestEngine.query(denied, { requestUsageTemplateId: 'new-api-token-log' });
+    assert.equal(requestFallback.supported, false);
+    assert.equal(requestFallback.interface.templateId, 'ccswitch-local');
+    assert.equal(requestFallback.interface.requestUrl, '');
+  }
+  assert.equal(calls.length, 2);
+  assert.equal(requestBrowserCalls, 0);
 });

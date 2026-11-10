@@ -272,7 +272,7 @@ export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = glob
 }
 
 export { PAGE_ACTION_SENTINEL };
-export const INJECTOR_VERSION = 97;
+export const INJECTOR_VERSION = 98;
 
 function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, formatRequestTime, calculatePopoverPlacement, selectResponsiveUsageMode, calculateResponsiveMeasurements, calculateExpandedNativeTriggerMaxWidth, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, findComposerSurface, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, enqueuePageActionTitle, pageActionSentinel, version) {
   const VERSION = version;
@@ -367,6 +367,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
   const responsiveModes = ['full', 'compact', 'no-extra', 'no-used', 'no-meter', 'no-dot', 'icon'];
 
   const formatNumber = value => {
+    if (value == null || value === '') return '';
     const number = Number(value);
     if (!Number.isFinite(number)) return '';
     return numberFormatter.format(number);
@@ -1047,7 +1048,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     const unit = String(payload.unit || '');
     const periodLabel = String(payload.periodLabel || '');
     const percent = payload.total > 0 && payload.used != null ? Math.max(0, Math.min(100, payload.used / payload.total * 100)) : 0;
-    if (used) elements.push(dynamicElement('span', 'metric used', `${periodLabel ? `${periodLabel}已用 ` : '已用 '}${used}`));
+    if (used) elements.push(dynamicElement('span', 'metric used', `${periodLabel ? `${periodLabel}已用 ` : '已用 '}${used}${!remaining && unit ? ` ${unit}` : ''}`));
     if (payload.total > 0 && payload.used != null) {
       const meter = dynamicElement('span', 'meter');
       meter.setAttribute('role', 'progressbar');

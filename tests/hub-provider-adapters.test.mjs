@@ -588,7 +588,7 @@ test('provider API keys are never sent to remote HTTP endpoints', async t => {
     fs.rmSync(directory, { recursive: true, force: true });
   });
   const calls = [];
-  const engine = new ProviderQueryEngine({}, {}, {
+  const engine = new ProviderQueryEngine({ getLocalUsage: () => ({ requestCount: 3, totalCost: 1.25 }) }, {}, {
     fetchImpl: async (url, options) => {
       calls.push({ url: String(url), authorization: options.headers.Authorization });
       return new Response(JSON.stringify({
@@ -598,10 +598,18 @@ test('provider API keys are never sent to remote HTTP endpoints', async t => {
     },
   });
 
-  await assert.rejects(engine.query({
+  const remote = await engine.query({
     id: 'remote-http', name: 'DeepSeek', websiteUrl: '', usage: null, auth: {},
     apiKey: 'private-key', apiBaseUrl: 'http://remote.example', baseUrl: '',
-  }), /非本地供应商接口必须使用 HTTPS/);
+  });
+  assert.equal(remote.source, 'ccswitch_local');
+  assert.equal(remote.usage.used, 1.25);
+  assert.equal(remote.usage.remaining, null);
+  assert.equal(remote.usage.total, null);
+  assert.equal(remote.usage.periodLabel, '');
+  assert.doesNotMatch(remote.usage.extra, /本地估算/);
+  assert.match(remote.usage.extra, /请求次数：3/);
+  assert.equal(remote.loginRequired, false);
   assert.deepEqual(calls, []);
 
   const local = await engine.query({
@@ -613,6 +621,45 @@ test('provider API keys are never sent to remote HTTP endpoints', async t => {
     url: 'http://127.0.0.1:18080/user/balance',
     authorization: 'Bearer local-key',
   }]);
+});
+
+test('HTTP local totals stay provider-scoped and refresh without API keys or remote template probes', async () => {
+  const totals = new Map([
+    ['one', { requestCount: 2, totalCost: 0.5 }],
+    ['two', { requestCount: 5, totalCost: 2 }],
+  ]);
+  const calls = [];
+  const engine = new ProviderQueryEngine({ getLocalUsage: id => totals.get(id) }, {
+    queryJson() { calls.push('browser'); throw new Error('unexpected browser request'); },
+  }, {
+    fetchImpl: async () => { calls.push('network'); throw new Error('unexpected HTTP request'); },
+  });
+  const first = { id: 'one', name: 'HTTP 中转', apiBaseUrl: 'http://relay.example/v1', apiKey: '' };
+  const second = { ...first, id: 'two', name: 'HTTP 镜像', apiBaseUrl: 'http://other.example/v1' };
+  assert.equal((await engine.query(first)).usage.used, 0.5);
+  assert.equal((await engine.query(second)).usage.used, 2);
+  totals.set('one', { requestCount: 3, totalCost: 0.75 });
+  for (const balanceTemplateId of ['api-health-local', 'new-api-browser-account', 'new-api-key-quota', 'openai-wham', 'cpa-local', 'deepseek-balance', 'packy-balance', 'window-balance']) {
+    const result = await engine.query(first, { balanceTemplateId });
+    assert.equal(result.usage.used, 0.75);
+    assert.equal(result.usage.providerName, first.name);
+    const description = describeProviderQuery(first, balanceTemplateId);
+    assert.equal(description.type, 'local-usage');
+    assert.equal(description.method, 'LOCAL');
+    assert.equal(description.requestUrl, '');
+    assert.equal(description.requiresBrowser, false);
+    assert.equal(loginConfiguration(first, balanceTemplateId), null);
+  }
+  const empty = await engine.query({ ...first, id: 'empty' });
+  assert.equal(empty.usage.used, 0);
+  assert.match(empty.usage.extra, /暂无本地请求记录/);
+  assert.equal(empty.usage.remaining, null);
+  assert.deepEqual(calls, []);
+});
+
+test('HTTP local database errors remain visible instead of reporting an empty history', async () => {
+  const engine = new ProviderQueryEngine({ getLocalUsage() { throw new Error('local database unavailable'); } }, {});
+  await assert.rejects(engine.query({ id: 'http', apiBaseUrl: 'http://relay.example/v1' }), /local database unavailable/);
 });
 
 test('direct Packy API key balances are marked as not requiring website login', async () => {

@@ -58,6 +58,30 @@ test('footer hides provider details while tooltip and popover retain them', () =
   assert.match(popover, /if \(payload\.extra\)/);
 });
 
+test('footer renders used-only costs with currency and preserves real zero balances', () => {
+  const script = buildInjectorScript();
+  const format = sourceSection(script, 'const formatNumber = value => {', 'const balancePayloadSignature =');
+  const renderer = sourceSection(script, 'function dynamicElement(', 'function renderInstance(');
+  const document = {
+    createElement: () => ({
+      dataset: {}, style: {}, children: [], textContent: '',
+      appendChild(child) { this.children.push(child); },
+      setAttribute(name, value) { this[name] = value; },
+    }),
+    createTextNode: text => ({ textContent: text }),
+  };
+  const render = new Function('document', 'numberFormatter', `${format}\n${renderer}\nreturn buildUsageElements;`)(
+    document, new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }),
+  );
+  const text = element => element.textContent + (element.children || []).map(text).join('');
+  const payload = { status: 'ok', used: 12.5, remaining: null, total: null, unit: 'USD' };
+  const usedOnly = render(payload, 'normal');
+  assert.deepEqual(usedOnly.map(element => element.className), ['metric used']);
+  assert.deepEqual(usedOnly.map(text), ['已用 12.5 USD']);
+  assert.deepEqual(render({ ...payload, used: 0, remaining: 0 }, 'normal').map(text), ['已用 0', '剩余 0 USD']);
+  assert.deepEqual(render({ ...payload, used: null, remaining: 12.5 }, 'normal').map(text), ['剩余 12.5 USD']);
+});
+
 test('popover placement stays inside the viewport above or below a top-edge trigger', () => {
   const below = calculatePopoverPlacement({ top: 4, bottom: 28 }, 600, 240);
   assert.deepEqual(below, { placement: 'below', maxHeight: 560, top: 32, bottom: null });

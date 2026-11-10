@@ -4,7 +4,7 @@
 
 This document is the operational guide for developing, testing, running, packaging, upgrading, and rolling back CodexCCSwitchUsage on this computer.
 
-The current v3 source metadata is application version `3.0.7`, injector version `97`, and browser-companion version `0.1.28`. Read `package.json` and `browser-companion\manifest.json` when starting a later release; the values below describe the current checkout and are not a substitute for those files.
+The current v3 source metadata is application version `3.0.8`, injector version `98`, and browser-companion version `0.1.28`. Read `package.json` and `browser-companion\manifest.json` when starting a later release; the values below describe the current checkout and are not a substitute for those files.
 
 ## 1. Source of truth and generated copies
 
@@ -80,7 +80,7 @@ The v3 host is the only balance-query center. The Codex footer, Hub page, and lo
 
 The stable gateway listens on `127.0.0.1:17891` and exposes cache-only `/v1/balance/{provider}`, `/v1/balances`, and legacy-compatible `/usage/{provider}` reads, plus `/v1/providers` and `/v1/health`. Explicit external refreshes use the token-protected Hub POST route. CCSwitch remains read-only and its existing scripts are not rewritten during v3 development.
 
-Provider requests require HTTPS by default. Only the conventional CPA loopback endpoint on port `8317` is implicitly allowed over HTTP; every other loopback or intranet HTTP origin must be explicitly allowlisted for the exact provider ID and origin. This prevents a provider record from turning the host into a reader for Balance Hub, CDP, or unrelated local services.
+Provider requests require HTTPS by default. A configured HTTP provider without a matching exception reads only CCSwitch local totals and recent request records and leaves remote balance unknown; it never probes the model API or browser. The footer keeps its ordinary used-amount label, while details identify CCSwitch local records as the source. Local totals are read afresh for that exact provider id rather than entering the shared remote-query cache. Only the conventional CPA loopback endpoint on port `8317` is implicitly allowed over HTTP; every other loopback or intranet HTTP origin must be explicitly allowlisted for the exact provider ID and origin before remote queries are permitted. This prevents a provider record from turning the host into a reader for Balance Hub, CDP, or unrelated local services.
 
 The installer and source installer protect the complete target tree with a non-inherited Windows DACL owned by the current user and grant access only to that user, SYSTEM, and Administrators. Development launches reapply the same policy to `runtime` before the host reads or writes either local token. ACL hardening rejects reparse-point roots and fails closed. On macOS/Linux, runtime directories use mode `0700` and state/token files use mode `0600`, including atomic replacements.
 

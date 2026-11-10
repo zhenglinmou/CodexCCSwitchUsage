@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fetchJson, parseBrowserJson, providerKind } from './hub-provider-adapters.mjs';
 import { getRequestUsageTemplate } from './provider-templates.mjs';
-import { isTrustedHttpUrl } from './http-allowlist.mjs';
+import { isTrustedHttpUrl, usesLocalHttpUsage } from './http-allowlist.mjs';
 import { getCodexHomeDir } from './platform.mjs';
 import { secureAtomicWriteFile } from './secure-files.mjs';
 
@@ -126,6 +126,7 @@ function redactedMessage(value, secrets = []) {
 }
 
 export function defaultRequestUsageTemplateId(provider) {
+  if (usesLocalHttpUsage(provider)) return 'ccswitch-local';
   const kind = providerKind(provider);
   if (kind === 'openai') return OPENAI_CODEX_SESSION_TEMPLATE_ID;
   if (kind === 'deepseek') return 'response-usage-only';
@@ -139,7 +140,9 @@ export function defaultRequestUsageTemplateId(provider) {
 
 function providerBackend(provider, templateId = '') {
   const requestedTemplateId = String(templateId || '');
-  const selectedTemplateId = requestedTemplateId || defaultRequestUsageTemplateId(provider);
+  const selectedTemplateId = usesLocalHttpUsage(provider)
+    ? 'ccswitch-local'
+    : requestedTemplateId || defaultRequestUsageTemplateId(provider);
   const template = getRequestUsageTemplate(selectedTemplateId);
   if (!template) {
     return {

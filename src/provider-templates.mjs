@@ -76,7 +76,7 @@ const BALANCE_TEMPLATES = Object.freeze([
   Object.freeze({
     id: 'api-health-local',
     label: '模型 API 检查 + 本地统计',
-    description: '检查 /models，并显示 CCSwitch 本地累计费用。',
+    description: 'HTTPS 检查 /models；未放行远端查询的 HTTP 直接显示 CCSwitch 本地累计费用。',
     selectable: true,
     autoDetect: false,
     fallback: true,

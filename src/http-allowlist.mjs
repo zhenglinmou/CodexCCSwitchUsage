@@ -83,6 +83,15 @@ export function isTrustedHttpUrl(value, provider = null) {
   return Boolean(providerId && readConfiguredOrigins().get(providerId)?.has(url.origin));
 }
 
+export function usesLocalHttpUsage(provider) {
+  try {
+    const url = new URL(String(provider?.apiBaseUrl || provider?.baseUrl || '').trim());
+    return url.protocol === 'http:' && !isTrustedHttpUrl(url, provider);
+  } catch {
+    return false;
+  }
+}
+
 export function resetHttpAllowlistCache() {
   cachedOrigins = null;
   cachedAt = 0;

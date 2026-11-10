@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { PROVIDER_QUERY_TIMEOUT_MS } from '../browser-companion/protocol.js';
 import { normalizeUsage, readResponseTextLimited } from './usage-normalization.mjs';
 import { getBalanceTemplate, normalizeProviderTemplateOrigin } from './provider-templates.mjs';
-import { isTrustedHttpUrl } from './http-allowlist.mjs';
+import { isTrustedHttpUrl, usesLocalHttpUsage } from './http-allowlist.mjs';
 import { getHomeDir } from './platform.mjs';
 
 const WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage';
@@ -730,6 +730,7 @@ export function providerKind(provider) {
 }
 
 export function defaultBalanceTemplateId(provider) {
+  if (usesLocalHttpUsage(provider)) return 'api-health-local';
   switch (providerKind(provider)) {
     case 'anyrouter':
     case 'agentrouter':
@@ -756,6 +757,7 @@ export function defaultBalanceTemplateId(provider) {
 }
 
 function resolvedBalanceTemplateId(provider, templateId = '') {
+  if (usesLocalHttpUsage(provider)) return 'api-health-local';
   const requested = String(templateId || '');
   return getBalanceTemplate(requested) ? requested : defaultBalanceTemplateId(provider);
 }
@@ -816,6 +818,18 @@ export function describeProviderQuery(provider, templateId = '') {
   const apiBaseUrl = providerApiBase(provider);
   const origin = normalizeProviderTemplateOrigin(provider);
   const common = { templateId: selected, method: 'GET', waf: false, requiresBrowser: false, notes: [] };
+  if (usesLocalHttpUsage(provider)) {
+    return {
+      ...common,
+      type: 'local-usage',
+      method: 'LOCAL',
+      label: 'CCSwitch 本地请求记录',
+      requestUrl: '',
+      authentication: '无需远端认证',
+      executor: 'Balance Hub 只读 CCSwitch 本地累计费用',
+      notes: ['HTTP 供应商直接使用 CCSwitch 本地记录；剩余额度未知'],
+    };
+  }
   if (selected === 'new-api-browser-account') {
     const config = loginConfiguration(provider, selected);
     return {
@@ -1066,6 +1080,7 @@ export class ProviderQueryEngine {
   }
 
   #sharedQueryKey(provider, balanceTemplateId, accountBinding = null, allowSoleSessionFallback = true) {
+    if (usesLocalHttpUsage(provider)) return '';
     const kind = providerKind(provider);
     if (['openai-wham', 'cpa-local'].includes(balanceTemplateId)) return '';
     if (balanceTemplateId === 'new-api-browser-account') {
@@ -1101,6 +1116,7 @@ export class ProviderQueryEngine {
   }
 
   async #queryUncached(provider, balanceTemplateId, signal, accountBinding = null, allowSoleSessionFallback = true, requestCache = null) {
+    if (usesLocalHttpUsage(provider)) return this.#queryLocalUsage(provider);
     if (balanceTemplateId === 'new-api-browser-account') {
       return this.#queryWebProvider(provider, balanceTemplateId, signal, accountBinding, allowSoleSessionFallback);
     }
@@ -2341,6 +2357,31 @@ export class ProviderQueryEngine {
       usage: usageResult(provider, { planName: `CLIProxyAPI（${selected.length} 个可用账号）`, remaining, used, total: 100, unit: '%', extra }),
       source: 'cpa_auth_files',
       loginRequired: false,
+    };
+  }
+
+  #queryLocalUsage(provider) {
+    const local = this.repository?.getLocalUsage?.(provider.id) || {};
+    const count = Number(local.requestCount);
+    const cost = Number(local.totalCost);
+    const requestCount = Number.isFinite(count) ? Math.max(0, Math.trunc(count)) : 0;
+    const totalCost = Number.isFinite(cost) ? Math.max(0, cost) : 0;
+    const records = requestCount > 0 || totalCost > 0
+      ? `请求次数：${requestCount}`
+      : '暂无本地请求记录；请求次数：0';
+    return {
+      usage: usageResult(provider, {
+        planName: provider.name,
+        providerScopedName: true,
+        used: totalCost,
+        remaining: null,
+        total: null,
+        unit: 'USD',
+        extra: `HTTP 供应商使用 CCSwitch 本地记录；${records}；剩余额度未知`,
+      }),
+      source: 'ccswitch_local',
+      loginRequired: false,
+      degraded: false,
     };
   }
 

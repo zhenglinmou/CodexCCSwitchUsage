@@ -12,6 +12,7 @@ import {
 } from '../src/hub-service.mjs';
 import { ProviderQueryEngine } from '../src/hub-provider-adapters.mjs';
 import { ProviderTemplateStore } from '../src/provider-templates.mjs';
+import { ProviderRequestUsageEngine } from '../src/provider-request-usage.mjs';
 
 function provider(id, name, current = false) {
   const normalized = String(name || '').toLowerCase();
@@ -337,6 +338,54 @@ test('AnyRouter domestic mirrors reuse the same-key canonical provider request l
   assert.equal(result.providerId, domestic.id);
   assert.equal(result.providerName, domestic.name);
   assert.equal(result.items.length, 1);
+});
+
+test('HTTP providers show local totals and their own request history without querying a same-key HTTPS mirror', async () => {
+  const item = { ...provider('http-local', 'HTTP 中转', true), apiKey: 'same-key', apiBaseUrl: 'http://anyrouter.top/v1' };
+  const mirror = { ...provider('https-mirror', 'anyrouter'), apiKey: 'same-key', apiBaseUrl: 'https://anyrouter.top/v1' };
+  let records = [{ model: 'gpt-5.6-sol', inputTokens: 120, outputTokens: 8, totalCostUsd: 0.25, statusCode: 200, createdAt: '2026-07-25T01:02:03.000Z' }];
+  const lookups = [];
+  const repository = {
+    getAll: () => [item, mirror],
+    getLocalUsage: id => {
+      assert.equal(id, item.id);
+      return { requestCount: records.length, totalCost: records.length ? 0.25 : 0 };
+    },
+    getRecentRequests: id => { lookups.push(id); return records; },
+  };
+  let networkCalls = 0;
+  const fetchImpl = async () => { networkCalls += 1; throw new Error('HTTP local records must not query a provider'); };
+  const service = new HubService(repository, new ProviderQueryEngine(repository, {}, { fetchImpl }), {
+    requestUsageEngine: new ProviderRequestUsageEngine({ fetchImpl }),
+  });
+  const refreshed = await service.refreshProvider(item.id);
+  assert.equal(refreshed.status, 'ok');
+  assert.equal(refreshed.source, 'ccswitch_local');
+  const payload = hubItemToUsagePayload(item, refreshed);
+  assert.equal(payload.status, 'ok');
+  assert.equal(payload.used, 0.25);
+  assert.equal(payload.remaining, null);
+  assert.equal(payload.periodLabel, '');
+  assert.equal(payload.queryError, undefined);
+  assert.equal(service.getState().providers.find(p => p.id === item.id).queryMethod.type, 'local-usage');
+
+  const history = await service.queryRequestUsage(item.id);
+  assert.equal(history.success, true);
+  assert.equal(history.source, 'ccswitch_local');
+  assert.equal(history.interface.templateId, 'ccswitch-local');
+  assert.equal(history.items[0].totalCost, 0.25);
+  assert.equal(history.items[0].costExact, false);
+  assert.match(history.message, /HTTP 供应商使用 CCSwitch 本地请求记录/);
+  assert.doesNotMatch(history.message, /本地估算/);
+  assert.deepEqual(lookups, [item.id]);
+  records = [];
+  const empty = await service.queryRequestUsage(item.id);
+  assert.deepEqual(empty.items, []);
+  assert.match(empty.message, /暂无.*本地请求记录/);
+  const templates = await service.probeTemplates(item.id);
+  assert.equal(templates.balance.recommendedTemplateId, 'api-health-local');
+  assert.equal(templates.requestUsage.recommendedTemplateId, 'ccswitch-local');
+  assert.equal(networkCalls, 0);
 });
 
 test('request usage falls back to marked CCSwitch estimates when provider logs are unavailable', async () => {
