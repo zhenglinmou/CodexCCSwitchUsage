@@ -468,13 +468,21 @@ function sameAccountBinding(left, right) {
 function safeUsage(payload, secrets = []) {
   if (!payload || payload.status !== 'ok') return null;
   const numberOrNull = value => value == null || value === '' || !Number.isFinite(Number(value)) ? null : Number(value);
+  const dateOrNull = value => typeof value === 'string' && value.length <= 64 && Number.isFinite(Date.parse(value))
+    ? new Date(value).toISOString() : null;
   const windows = Array.isArray(payload.subscriptionQuota?.windows)
     ? payload.subscriptionQuota.windows.slice(0, 2).map(window => ({
       label: sanitizedCredentialText(window?.label, secrets, 20),
       remaining: numberOrNull(window?.remaining),
+      resetAt: dateOrNull(window?.resetAt),
     })).filter(window => window.label && window.remaining != null && window.remaining >= 0 && window.remaining <= 100)
     : [];
   const credits = numberOrNull(payload.subscriptionQuota?.credits);
+  const rawCards = payload.subscriptionQuota?.resetCards;
+  const cardCount = numberOrNull(rawCards?.count);
+  const nextExpiresAt = cardCount > 0 ? dateOrNull(rawCards?.nextExpiresAt) : null;
+  const resetCards = Number.isSafeInteger(cardCount) && cardCount >= 0 && cardCount <= 100_000
+    ? { count: cardCount, nextExpiresAt, expiryUnavailable: cardCount > 0 && (rawCards.expiryUnavailable === true || !nextExpiresAt) } : null;
   return {
     providerName: sanitizedCredentialText(payload.providerName, secrets, 160),
     accountBrowser: sanitizedCredentialText(payload.accountBrowser, secrets, 64).replace(/\s+/g, ' ').trim(),
@@ -488,7 +496,10 @@ function safeUsage(payload, secrets = []) {
     unit: sanitizedCredentialText(payload.unit, secrets, 32),
     updatedAt: String(payload.updatedAt || new Date().toISOString()).slice(0, 64),
     queryError: payload.queryError ? safeMessage(payload.queryError, secrets) : '',
-    ...(windows.length ? { subscriptionQuota: { windows, credits: credits != null && credits >= 0 ? credits : null } } : {}),
+    ...(windows.length ? { subscriptionQuota: {
+      windows, credits: credits != null && credits >= 0 ? credits : null,
+      ...(resetCards ? { resetCards } : {}),
+    } } : {}),
   };
 }
 

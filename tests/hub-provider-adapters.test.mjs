@@ -22,6 +22,7 @@ import {
   ProviderQueryEngine,
   providerAliases,
   providerKind,
+  summarizeOpenAiResetCards,
   summarizeWham,
 } from '../src/hub-provider-adapters.mjs';
 import { resetHttpAllowlistCache } from '../src/http-allowlist.mjs';
@@ -551,6 +552,112 @@ test('OpenAI wham payload is normalized into primary and secondary quota windows
     },
   });
   assert.equal(mixed.limits.length, 1);
+});
+
+test('OpenAI reset deadlines prefer absolute timestamps and anchor relative durations once', () => {
+  const now = Date.parse('2026-11-19T00:00:00Z');
+  const reset = fields => summarizeWham({
+    rate_limit: { primary_window: { used_percent: 19, limit_window_seconds: 604_800, ...fields } },
+  }, now).limits[0].resetAt;
+
+  assert.equal(reset({ reset_at: (now + 183_600_000) / 1_000, reset_after_seconds: 60 }), '2026-11-21T03:00:00.000Z');
+  assert.equal(reset({ reset_at: '2026-11-21T03:00:00Z' }), '2026-11-21T03:00:00.000Z');
+  assert.equal(reset({ reset_after_seconds: 183_600 }), '2026-11-21T03:00:00.000Z');
+  assert.equal(reset({ reset_at: 'invalid', reset_after_seconds: 3_600 }), '2026-11-19T01:00:00.000Z');
+  assert.equal(reset({ reset_after_seconds: 0 }), '2026-11-19T00:00:00.000Z');
+  for (const fields of [{}, { reset_after_seconds: -1 }, { reset_at: 'invalid' }, { reset_at: 1e30 }]) {
+    assert.equal(reset(fields), null);
+  }
+});
+
+test('OpenAI reset cards use owned count and the earliest available unexpired card', () => {
+  const now = Date.parse('2026-11-19T00:00:00Z');
+  const cards = [
+    { status: 'available', expires_at: '2026-12-12T22:42:57Z' },
+    { status: 'redeemed', expires_at: '2026-11-20T00:00:00Z' },
+    { status: 'available', expires_at: '2026-11-30T20:16:56.321615Z', id: 'private-card-id' },
+    { status: 'expired', expires_at: '2026-11-18T00:00:00Z' },
+    { status: 'available', expires_at: '2026-12-01T22:47:05Z' },
+  ];
+  assert.deepEqual(summarizeOpenAiResetCards({ available_count: 3, applicable_available_count: 0, credits: cards }, 0, now), {
+    count: 3, nextExpiresAt: '2026-11-30T20:16:56.321Z', expiryUnavailable: false,
+  });
+  assert.deepEqual(summarizeOpenAiResetCards({ available_count: 0, credits: [] }, 3, now), {
+    count: 0, nextExpiresAt: null, expiryUnavailable: false,
+  });
+  for (const payload of [null, { credits: [] }, { credits: [{ status: 'available', expires_at: 'invalid' }] },
+    { credits: Array.from({ length: 513 }, () => cards[0]) }]) {
+    assert.deepEqual(summarizeOpenAiResetCards(payload, 3, now), { count: 3, nextExpiresAt: null, expiryUnavailable: true });
+  }
+  assert.equal(summarizeOpenAiResetCards({ available_count: 1, credits: [cards[0]] }, 0, Date.parse('2027-01-01')).expiryUnavailable, true);
+});
+
+test('official reset-card reads preserve quota on failure and never redeem cards', async t => {
+  for (const scenario of ['three', 'zero', 'unavailable']) {
+    await t.test(scenario, async () => {
+      const calls = [];
+      const engine = new ProviderQueryEngine({}, null, {
+        now: () => Date.parse('2026-11-19T00:00:00Z'),
+        fetchImpl: async (url, options) => {
+          calls.push({ path: new URL(url).pathname, method: options.method || 'GET', account: options.headers['ChatGPT-Account-Id'], authorization: options.headers.Authorization });
+          if (String(url).endsWith('/wham/usage')) return Response.json({
+            plan_type: 'pro', rate_limit: { primary_window: { used_percent: 19, limit_window_seconds: 604_800 } },
+            rate_limit_reset_credits: { available_count: scenario === 'zero' ? 0 : 3, applicable_available_count: 0 },
+          });
+          if (scenario === 'unavailable') return Response.json({ error: 'temporarily unavailable' }, { status: 503 });
+          return Response.json({ available_count: 3, credits: [
+            { status: 'available', expires_at: '2026-12-12T22:42:57Z', id: 'private-card-id' },
+            { status: 'available', expires_at: '2026-11-30T20:16:56.321615Z' },
+            { status: 'available', expires_at: '2026-12-01T22:47:05Z' },
+          ] });
+        },
+      });
+      const result = await engine.query({ id: scenario, name: 'OpenAI Official', followsCodexLogin: true,
+        auth: { tokens: { account_id: 'owned-account', access_token: 'private-access-token' } },
+      });
+      assert.equal(result.source, 'openai_codex_login');
+      assert.equal(result.usage.remaining, 81);
+      assert.deepEqual(result.usage.subscriptionQuota.resetCards, {
+        count: scenario === 'zero' ? 0 : 3,
+        nextExpiresAt: scenario === 'three' ? '2026-11-30T20:16:56.321Z' : null,
+        expiryUnavailable: scenario === 'unavailable',
+      });
+      assert.equal(calls.length, scenario === 'zero' ? 1 : 2);
+      assert.ok(calls.every(call => call.method === 'GET' && call.account === 'owned-account' && call.authorization === 'Bearer private-access-token'));
+      assert.doesNotMatch(JSON.stringify(result), /private-card-id|private-access-token|owned-account/);
+    });
+  }
+});
+
+test('OpenAI browser fallback reads card expiration through the same authenticated transport', async () => {
+  const paths = [];
+  let directCalls = 0;
+  const engine = new ProviderQueryEngine({}, {
+    isConnected: () => true,
+    async queryJson(request) {
+      paths.push(request.requestPath);
+      assert.equal(request.headers['ChatGPT-Account-Id'], 'browser-account');
+      assert.equal(request.headers.Authorization, 'Bearer browser-private-token');
+      assert.equal(request.navigateRequest, false);
+      const payload = request.requestPath.endsWith('/usage') ? {
+        rate_limit: { primary_window: { used_percent: 19, limit_window_seconds: 604_800 } },
+        rate_limit_reset_credits: { available_count: 1, applicable_available_count: 0 },
+      } : { available_count: 1, credits: [{ status: 'available', expires_at: '2026-12-01T00:00:00Z' }] };
+      return { status: 200, text: JSON.stringify(payload) };
+    },
+  }, {
+    homeDir: path.join(os.tmpdir(), `ccswitch-card-home-${process.pid}-${Date.now()}`),
+    now: () => Date.parse('2026-11-19T00:00:00Z'),
+    whamBrowserRaceDelayMs: 1,
+    fetchImpl: async () => { directCalls += 1; throw new Error('direct unavailable'); },
+  });
+  const result = await engine.query({ id: 'browser-cards', name: 'OpenAI Official',
+    auth: { tokens: { account_id: 'browser-account', access_token: 'browser-private-token' } },
+  });
+  assert.equal(result.source, 'openai_wham_browser');
+  assert.deepEqual(result.usage.subscriptionQuota.resetCards, { count: 1, nextExpiresAt: '2026-12-01T00:00:00.000Z', expiryUnavailable: false });
+  assert.deepEqual(paths, ['/backend-api/wham/usage', '/backend-api/wham/rate-limit-reset-credits']);
+  assert.equal(directCalls, 1, 'card details reuse the successful browser transport');
 });
 
 test('browser-only providers never probe the model API when the companion is disconnected', async () => {
@@ -1989,7 +2096,7 @@ test('a fast OpenAI direct response wins without starting a browser callback', a
     whamBrowserRaceDelayMs: 20,
     fetchImpl: async () => new Response(JSON.stringify({
       plan_type: 'plus',
-      rate_limit: { primary_window: { used_percent: 5, limit_window_seconds: 18_000 } },
+      rate_limit: { primary_window: { used_percent: 5, limit_window_seconds: 18_000, reset_at: 1_795_050_000 } },
     }), { status: 200 }),
   });
 
@@ -2000,6 +2107,9 @@ test('a fast OpenAI direct response wins without starting a browser callback', a
 
   assert.equal(browserCalls, 0);
   assert.equal(result.source, 'openai_wham');
+  assert.deepEqual(result.usage.subscriptionQuota.windows, [{
+    label: '5小时', remaining: 95, resetAt: new Date(1_795_050_000_000).toISOString(),
+  }]);
 });
 
 test('an early invalid browser response does not cancel a later valid OpenAI direct result', async () => {

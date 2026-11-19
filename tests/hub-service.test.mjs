@@ -26,6 +26,47 @@ function provider(id, name, current = false) {
   return { id, name, websiteUrl: 'https://example.com', isCurrent: current, usage: null, auth: {}, apiKey: '', apiBaseUrl, baseUrl: apiBaseUrl };
 }
 
+test('Hub retains sanitized quota deadlines through its cache and footer payload', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-reset-cache-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const cachePath = path.join(directory, 'hub-cache.json');
+  const current = provider('official', 'OpenAI Official', true);
+  const usage = {
+    status: 'ok', providerName: 'OpenAI pro', used: 19, remaining: 81, total: 100, unit: '%',
+    updatedAt: '2026-11-19T00:00:00.000Z',
+    subscriptionQuota: {
+      windows: [{ label: '7天', remaining: 81, resetAt: '2026-11-21T03:00:00+00:00' }], credits: 0,
+      resetCards: { count: 3, nextExpiresAt: '2026-11-30T20:16:56+00:00', expiryUnavailable: false, id: 'private-card-id' },
+    },
+  };
+  const query = { async query() { return { source: 'openai_wham', usage }; } };
+  const service = new HubService({ getAll: () => [current] }, query, { cachePath });
+  await service.refreshAll();
+  const restored = new HubService({ getAll: () => [current] }, query, { cachePath });
+  const item = restored.getState().providers[0];
+  const payload = hubItemToUsagePayload(current, item);
+  assert.deepEqual(payload.subscriptionQuota, {
+    windows: [{ label: '7天', remaining: 81, resetAt: '2026-11-21T03:00:00.000Z' }], credits: 0,
+    resetCards: { count: 3, nextExpiresAt: '2026-11-30T20:16:56.000Z', expiryUnavailable: false },
+  });
+  for (const resetAt of ['invalid', 'secret'.repeat(100), 1_795_050_000, null]) {
+    assert.equal(sanitizeHubUsage({
+      ...usage, subscriptionQuota: { windows: [{ label: '7天', remaining: 81, resetAt }] },
+    }).subscriptionQuota.windows[0].resetAt, null);
+  }
+});
+
+test('Hub rejects invalid reset-card counts and omits card identities from its cache', () => {
+  const usage = { status: 'ok', subscriptionQuota: { windows: [{ label: '7天', remaining: 81 }] } };
+  for (const count of [null, -1, 1.5, 100_001, Infinity]) {
+    assert.equal(sanitizeHubUsage({ ...usage, subscriptionQuota: { ...usage.subscriptionQuota, resetCards: { count } } }).subscriptionQuota.resetCards, undefined);
+  }
+  const sanitized = sanitizeHubUsage({ ...usage, subscriptionQuota: { ...usage.subscriptionQuota,
+    resetCards: { count: 3, nextExpiresAt: '2026-11-30T20:16:56Z', id: 'private-card-id' },
+  } });
+  assert.doesNotMatch(JSON.stringify(sanitized), /private-card-id/);
+});
+
 test('provider fingerprints include built-in balance and request template selections', () => {
   const item = provider('one', '未识别中转');
   const baseline = {

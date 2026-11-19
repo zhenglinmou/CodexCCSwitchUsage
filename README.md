@@ -25,7 +25,7 @@
 
 | 版本 | 分支 | 适用场景 | 用量来源 | All API Hub | 浏览器伴侣 |
 |---|---|---|---|---|---|
-| [v3.0.8](./docs/V3.md) | `v3` | 统一查看和管理全部 Codex / GPT 供应商 | v3 内置适配器与统一 Balance Hub | 支持 | 支持 |
+| [v3.0.9](./docs/V3.md) | `v3` | 统一查看和管理全部 Codex / GPT 供应商 | v3 内置适配器与统一 Balance Hub | 支持 | 支持 |
 
 - 使用 v3：阅读 [v3 用户文档](./docs/V3.md)；开发与热更新流程见 [v3 开发文档](./DEVELOPMENT.md)。
 - 旧版基本弃用，仅保留历史兼容；资料见 [旧版文档](./docs/V1.md)。
@@ -36,7 +36,7 @@
 - `v3`：当前 Balance Hub 版本的发布与维护分支。
 - `main`：仓库默认分支，保留上一稳定版本内容。
 
-源码模式支持 Windows 和 macOS；正式 Release 提供 Authenticode 签名的 Windows 安装包，以及 Developer ID 签名并经 Apple 公证的 Apple Silicon / Intel `.app` 压缩包。项目保持 CCSwitch 数据库只读，不修改 Codex 的 `app.asar`、MSIX 文件或 Codex 配置。
+源码模式支持 Windows 和 macOS；Release 提供 Windows 安装包及 Apple Silicon / Intel `.app` 压缩包。具体版本的签名、公证状态和 SHA-256 校验值以对应 Release 说明为准。项目保持 CCSwitch 数据库只读，不修改 Codex 的 `app.asar`、MSIX 文件或 Codex 配置。
 
 ## macOS 源码运行
 

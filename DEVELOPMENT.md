@@ -4,7 +4,7 @@
 
 This document is the operational guide for developing, testing, running, packaging, upgrading, and rolling back CodexCCSwitchUsage on this computer.
 
-The current v3 source metadata is application version `3.0.8`, injector version `98`, and browser-companion version `0.1.28`. Read `package.json` and `browser-companion\manifest.json` when starting a later release; the values below describe the current checkout and are not a substitute for those files.
+The current v3 source metadata is application version `3.0.9`, injector version `100`, and browser-companion version `0.1.28`. Read `package.json` and `browser-companion\manifest.json` when starting a later release; the values below describe the current checkout and are not a substitute for those files.
 
 ## 1. Source of truth and generated copies
 
@@ -138,7 +138,7 @@ $root = (Get-Location).Path
 
 `stop-host.ps1` does not close Codex. When Codex is already running with any safe loopback CDP port, `launch.ps1` discovers and reuses that Codex process and starts only the workspace host.
 
-If only an ordinary Codex process without a safe loopback CDP port is running, workspace development mode stops and reports that hot update is unavailable; it does not ask Codex to close. A user-facing installed shortcut passes the explicit `-AllowCodexRestart` authority. With that authority, `launch.ps1` asks Codex to close normally and restarts it on a random loopback port; if Codex has not exited after 10 seconds, it still asks before force-terminating because that can interrupt active work or unsent input.
+If only an ordinary Codex process without a safe loopback CDP port is running, workspace development mode stops and reports that hot update is unavailable; it does not ask Codex to close. A user-facing installed shortcut passes the explicit `-AllowCodexRestart` authority. With that authority, `launch.ps1` asks Codex to close normally and restarts it on a random loopback port; if Codex has not exited after 25 seconds, it still asks before force-terminating because that can interrupt active work or unsent input. This restart confirmation explains that closing a window may leave Codex in the system tray. Windows application-activation errors are held until the CDP readiness check finishes: a canonical main page that becomes ready is accepted even when activation reported a timeout.
 
 While the workspace host is active, do not click “Codex + CCSwitch 用量” on the desktop or Start menu. Those shortcuts intentionally point to the stable EXE installation.
 
@@ -196,6 +196,8 @@ Hub full refresh keeps its existing total concurrency bound while reserving a se
 OpenAI WHAM queries keep the direct Node transport as the fast path. When the browser companion is connected, the browser path starts only if the direct probe has not completed after 400 ms; the first usable result wins and cancels the losing transport. The direct probe remains bounded by 5,000 ms, and a successful browser result suppresses repeated direct probes for 300,000 ms only for that hashed account id, so one blocked account cannot force unrelated accounts through the browser path. A failed browser fallback does not open that backoff, and companion-offline queries retain the direct retry policy. All ordinary provider HTTP retries share one 40,000 ms total budget instead of resetting it for every attempt, and a complete provider query has a 45,000 ms global deadline. Concurrent and 30,000 ms recent successful WHAM results are shared by the SHA-256 hash of account id plus access token, allowing overlapping OpenAI and CPA providers to avoid duplicate requests without caching credential text; failures are never cached.
 
 ### Balance positioning invariant
+
+Only OpenAI Official quota summaries include banked reset cards. The owned count comes from `rate_limit_reset_credits.available_count`, never the currently redeemable `applicable_available_count`. Positive counts enable one bounded read-only GET of `/backend-api/wham/rate-limit-reset-credits` to select the earliest available card expiration; zero counts skip that request. A failed card-detail read preserves the official quota and owned count while marking expiration unavailable. Only count and normalized expiration metadata reach the cache/footer, without card IDs, titles, profile images, or redemption actions. The request popover displays reset countdowns in days/hours and updates them locally once per minute only while open.
 
 The injected balance content is centered in the currently available free lane, not in the whole composer and not relative to its own maximum width:
 

@@ -272,7 +272,7 @@ export function resolveNativeFlowPlacement(right, root, toolbar, getStyle = glob
 }
 
 export { PAGE_ACTION_SENTINEL };
-export const INJECTOR_VERSION = 98;
+export const INJECTOR_VERSION = 100;
 
 function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBoundaryCrossing, getUsageFreshness, formatUsageAge, formatRequestTime, calculatePopoverPlacement, selectResponsiveUsageMode, calculateResponsiveMeasurements, calculateExpandedNativeTriggerMaxWidth, stabilizeResponsiveUsageMode, findMutationObserverTarget, classifyComposerMutations, createInjectorEventController, updateElementAttribute, findComposerSurface, isComposerFooterCandidate, isNativeFlowCacheValid, resolveNativeFlowPlacement, enqueuePageActionTitle, pageActionSentinel, version) {
   const VERSION = version;
@@ -301,6 +301,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     if (existing.tooltipTimer) clearTimeout(existing.tooltipTimer);
     if (existing.refreshLoadingTimer) clearTimeout(existing.refreshLoadingTimer);
     if (existing.requestLoadingTimer) clearTimeout(existing.requestLoadingTimer);
+    if (existing.quotaResetTimer) clearTimeout(existing.quotaResetTimer);
     if (existing.mountTimer) clearTimeout(existing.mountTimer);
     if (existing.resizeSettleTimer) clearTimeout(existing.resizeSettleTimer);
     if (existing.nativeTriggerSettleTimer) clearTimeout(existing.nativeTriggerSettleTimer);
@@ -339,6 +340,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     requestRefreshToken: 0,
     requestLoading: false,
     requestLoadingTimer: 0,
+    quotaResetTimer: 0,
     popoverRoot: null,
     popoverShadow: null,
     layoutTimers: [],
@@ -577,7 +579,7 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
         .popover-refresh[data-loading="true"] svg{animation:popover-refresh-spin .9s linear infinite}
         .popover-grid{display:grid;flex:1 1 auto;min-height:0;gap:6px;margin:8px 8px 0;overflow-y:auto;overscroll-behavior:contain}
         .popover[data-mode="requests"] .popover-grid{display:none}
-        .request-quota{display:none;flex:0 0 auto;margin:5px 8px 0;padding:4px 8px;border-radius:8px;background:var(--color-background-button-tertiary,rgba(127,127,127,.06));color:var(--color-token-text-primary,currentColor);font-size:12px;line-height:18px;overflow-wrap:anywhere}
+        .request-quota{display:none;flex:0 0 auto;margin:5px 8px 0;padding:4px 8px;border-radius:8px;background:var(--color-background-button-tertiary,rgba(127,127,127,.06));color:var(--color-token-text-primary,currentColor);font-size:12px;line-height:18px;white-space:pre-line;overflow-wrap:anywhere}
         .popover[data-mode="requests"] .request-quota:not([hidden]){display:block}
         .popover-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;min-height:30px;padding:6px 9px;border-radius:8px;background:var(--color-background-button-tertiary,rgba(127,127,127,.04))}
         .popover-label{flex:0 0 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-token-text-tertiary,currentColor)}
@@ -858,6 +860,8 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     const trigger = state.popoverTrigger;
     const closingRequests = state.popoverOpen && state.popoverMode === 'requests';
     cancelPopoverPositionBurst();
+    if (state.quotaResetTimer) clearTimeout(state.quotaResetTimer);
+    state.quotaResetTimer = 0;
     state.popoverOpen = false;
     state.popoverMode = '';
     state.popoverTrigger = null;
@@ -1190,15 +1194,54 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
     state.recentRequestsAgeMinute = ageMinute;
   }
 
+  function formatQuotaReset(resetAt, now = Date.now()) {
+    const timestamp = typeof resetAt === 'string' ? Date.parse(resetAt) : NaN;
+    if (!Number.isFinite(timestamp)) return '';
+    const remaining = timestamp - now;
+    if (remaining <= 0) return '等待重置';
+    if (remaining < 3_600_000) return '不足1小时后重置';
+    const totalHours = Math.floor(remaining / 3_600_000);
+    const days = Math.floor(totalHours / 24);
+    const hours = totalHours % 24;
+    return `${days ? `${days}天` : ''}${hours}小时后重置`;
+  }
+
   function renderRequestQuota(portal, payload) {
+    if (state.quotaResetTimer) clearTimeout(state.quotaResetTimer);
+    state.quotaResetTimer = 0;
     const summary = portal.getElementById('request-quota');
     const quota = payload.status === 'ok' ? payload.subscriptionQuota : null;
-    const parts = quota?.windows?.map(window => `${window.label}剩余 ${formatNumber(window.remaining)}%`) || [];
+    const parts = quota?.windows?.map(window => {
+      const reset = formatQuotaReset(window.resetAt);
+      return `${window.label}剩余 ${formatNumber(window.remaining)}%${reset ? `（${reset}）` : ''}`;
+    }) || [];
     if (quota?.credits != null) parts.push(`Credits ${formatNumber(quota.credits)}`);
-    const text = parts.join(' · ');
+    let text = parts.join(' · ');
+    const cards = quota?.resetCards;
+    if (cards) {
+      let cardText = `重置卡 ${formatNumber(cards.count)} 张`;
+      if (cards.count > 0) {
+        const expiry = formatQuotaReset(cards.nextExpiresAt);
+        if (expiry && cards.expiryUnavailable !== true) {
+          const date = new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(cards.nextExpiresAt));
+          const duration = expiry === '等待重置' ? '已到期' : expiry.replace('后重置', '后到期');
+          cardText += ` · 最近1张${duration}（${date}）`;
+        } else cardText += ' · 最近到期时间暂不可用';
+      }
+      text += `${text ? '\n' : ''}${cardText}`;
+    }
     if (summary.textContent !== text) summary.textContent = text;
     updateElementAttribute(summary, 'hidden', text ? null : '');
     updateElementAttribute(summary, 'title', text && payload.queryError ? '最近刷新失败，显示上次查到的额度' : null);
+    if (state.popoverOpen && state.popoverMode === 'requests'
+      && (quota?.windows?.some(window => Date.parse(window.resetAt) > Date.now()) || Date.parse(cards?.nextExpiresAt) > Date.now())) {
+      state.quotaResetTimer = setTimeout(() => {
+        state.quotaResetTimer = 0;
+        if (state.popoverOpen && state.popoverMode === 'requests' && state.popoverShadow) {
+          renderRequestQuota(state.popoverShadow, state.payload || {});
+        }
+      }, 60_000);
+    }
   }
 
   function render(footers = null, shouldScheduleLayout = true) {
@@ -1624,6 +1667,8 @@ function installCodexUsageExtension(findUsageTooltipTarget, isUsageTooltipBounda
   function resetTransientUiForMissingComposer() {
     hideUsageTooltip();
     cancelPopoverPositionBurst();
+    if (state.quotaResetTimer) clearTimeout(state.quotaResetTimer);
+    state.quotaResetTimer = 0;
     state.popoverOpen = false;
     state.popoverMode = '';
     state.popoverTrigger = null;

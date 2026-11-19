@@ -47,6 +47,68 @@ test('injector script carries an exported version for hot replacement', () => {
   assert.match(buildInjectorScript(), new RegExp(`,${INJECTOR_VERSION}\\)$`));
 });
 
+test('official request quota shows day/hour countdowns with safe boundary labels', () => {
+  const script = buildInjectorScript();
+  const format = sourceSection(script, 'function formatQuotaReset(', 'function renderRequestQuota(');
+  const formatReset = new Function(`${format}\nreturn formatQuotaReset;`)();
+  const now = Date.parse('2026-11-19T00:00:00Z');
+  assert.equal(formatReset('2026-11-21T03:00:00Z', now), '2天3小时后重置');
+  assert.equal(formatReset('2026-11-20T00:00:00Z', now), '1天0小时后重置');
+  assert.equal(formatReset('2026-11-19T03:30:00Z', now), '3小时后重置');
+  assert.equal(formatReset('2026-11-19T00:30:00Z', now), '不足1小时后重置');
+  assert.equal(formatReset('2026-11-19T00:00:00Z', now), '等待重置');
+  assert.equal(formatReset('2026-11-18T00:00:00Z', now), '等待重置');
+  assert.equal(formatReset(null, now), '');
+  assert.equal(formatReset('invalid', now), '');
+});
+
+test('official quota countdown updates locally only while its request popover is open', () => {
+  const script = buildInjectorScript();
+  const renderer = sourceSection(script, 'function formatQuotaReset(', 'function render(footers');
+  const summary = { textContent: '', attributes: {}, setAttribute(k, v) { this.attributes[k] = v; }, removeAttribute(k) { delete this.attributes[k]; }, getAttribute(k) { return this.attributes[k]; } };
+  const portal = { getElementById: () => summary };
+  let tick;
+  let schedules = 0;
+  const timers = [];
+  const state = {
+    popoverOpen: true, popoverMode: 'requests', popoverShadow: portal, quotaResetTimer: 0,
+    payload: { status: 'ok', subscriptionQuota: { windows: [
+      { label: '7天', remaining: 81, resetAt: new Date(Date.now() + 185_400_000).toISOString() },
+    ], credits: 0 } },
+  };
+  const render = new Function('state', 'formatNumber', 'updateElementAttribute', 'setTimeout', 'clearTimeout', `${renderer}\nreturn renderRequestQuota;`)(
+    state, String, updateElementAttribute,
+    (callback, delay) => { tick = callback; schedules += 1; assert.equal(delay, 60_000); return schedules; },
+    timer => timers.push(timer),
+  );
+  render(portal, state.payload);
+  assert.equal(summary.textContent, '7天剩余 81%（2天3小时后重置） · Credits 0');
+  assert.equal(schedules, 1);
+  tick();
+  assert.equal(schedules, 2);
+  state.popoverOpen = false;
+  tick();
+  assert.equal(schedules, 2);
+  render(portal, { status: 'ok', subscriptionQuota: { windows: [{ label: '7天', remaining: 81 }], credits: 0 } });
+  assert.equal(summary.textContent, '7天剩余 81% · Credits 0');
+  render(portal, { status: 'ok', subscriptionQuota: { windows: [{ label: '7天', remaining: 81 }], resetCards: { count: 0, nextExpiresAt: null } } });
+  assert.equal(summary.textContent, '7天剩余 81%\n重置卡 0 张');
+  state.popoverOpen = true;
+  render(portal, { status: 'ok', subscriptionQuota: { windows: [{ label: '7天', remaining: 81 }], resetCards: {
+    count: 3, nextExpiresAt: new Date(Date.now() + 185_400_000).toISOString(),
+  } } });
+  assert.match(summary.textContent, /重置卡 3 张 · 最近1张2天3小时后到期（.+）$/);
+  assert.ok(state.quotaResetTimer);
+  state.popoverOpen = false;
+  render(portal, { status: 'ok', subscriptionQuota: { windows: [{ label: '7天', remaining: 81 }], resetCards: {
+    count: 3, nextExpiresAt: null, expiryUnavailable: true,
+  } } });
+  assert.match(summary.textContent, /重置卡 3 张 · 最近到期时间暂不可用$/);
+  render(portal, { status: 'ok', remaining: 5, unit: 'USD' });
+  assert.equal(summary.textContent, '');
+  assert.equal(summary.attributes.hidden, '');
+});
+
 test('footer hides provider details while tooltip and popover retain them', () => {
   const script = buildInjectorScript();
   const title = sourceSection(script, 'function usageTitle(payload) {', 'function popoverRows(payload) {');

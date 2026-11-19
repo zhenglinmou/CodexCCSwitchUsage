@@ -75,14 +75,17 @@ test('the active unbound official route reads the live Codex login without askin
     async fetchImpl(url, { headers }) {
       fetched.push([url, headers.Authorization, headers['ChatGPT-Account-Id']]);
       return new Response(JSON.stringify({
-        plan_type: 'plus', rate_limit: { primary_window: { used_percent: 25, limit_window_seconds: 18_000 } },
+        plan_type: 'plus', rate_limit: { primary_window: { used_percent: 25, limit_window_seconds: 18_000, reset_at: 1_795_050_000 } },
       }));
     },
   });
   const result = await engine.query(provider);
   assert.equal(result.usage.remaining, 75);
   assert.equal(result.source, 'openai_codex_login');
-  assert.deepEqual(result.usage.subscriptionQuota, { windows: [{ label: '5小时', remaining: 75 }], credits: null });
+  assert.deepEqual(result.usage.subscriptionQuota, {
+    windows: [{ label: '5小时', remaining: 75, resetAt: new Date(1_795_050_000_000).toISOString() }], credits: null,
+    resetCards: { count: 0, nextExpiresAt: null, expiryUnavailable: false },
+  });
   assert.doesNotMatch(JSON.stringify(result), /live-token|live-account/);
   writeLogin('new-account', 'new-token', new Date(1_700_000_001_000));
   assert.notEqual(repository.getChangeToken(), changeToken);

@@ -8,6 +8,7 @@ import { isTrustedHttpUrl, usesLocalHttpUsage } from './http-allowlist.mjs';
 import { getHomeDir } from './platform.mjs';
 
 const WHAM_URL = 'https://chatgpt.com/backend-api/wham/usage';
+const WHAM_RESET_CREDITS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits';
 const QUOTA_PER_USD = 500_000;
 const WHAM_BROWSER_PROBE_TIMEOUT_MS = 5_000;
 const WHAM_BROWSER_RACE_DELAY_MS = 400;
@@ -625,7 +626,7 @@ function isWhamWindow(value) {
     && windowSeconds > 0;
 }
 
-export function summarizeWham(payload) {
+export function summarizeWham(payload, now = Date.now()) {
   if (!isWhamUsagePayload(payload)) throw new Error('OpenAI 用量响应缺少有效额度窗口');
   const rateLimit = payload?.rate_limit || {};
   const limits = [];
@@ -634,6 +635,14 @@ export function summarizeWham(payload) {
     if (!isWhamWindow(window)) continue;
     const used = Math.max(0, Math.min(100, Number(window.used_percent) || 0));
     const seconds = Math.max(0, Number(window.limit_window_seconds) || 0);
+    const resetAfterSeconds = finiteOrNull(window.reset_after_seconds);
+    const resetEpoch = finiteOrNull(window.reset_at);
+    let resetTimestamp = resetEpoch != null ? (resetEpoch > 0 ? resetEpoch * 1_000 : NaN)
+      : typeof window.reset_at === 'string' && window.reset_at.trim() ? Date.parse(window.reset_at) : NaN;
+    if (!Number.isFinite(resetTimestamp) && resetAfterSeconds != null && resetAfterSeconds >= 0) {
+      resetTimestamp = now + resetAfterSeconds * 1_000;
+    }
+    const resetDate = new Date(resetTimestamp);
     limits.push({
       id,
       label: windowLabel(seconds, fallback),
@@ -641,8 +650,8 @@ export function summarizeWham(payload) {
       remaining: Math.max(0, 100 - used),
       total: 100,
       unit: '%',
-      resetAfterSeconds: Math.max(0, Number(window.reset_after_seconds) || 0),
-      resetAt: window.reset_at || null,
+      resetAfterSeconds: Math.max(0, resetAfterSeconds || 0),
+      resetAt: Number.isFinite(resetDate.getTime()) ? resetDate.toISOString() : null,
     });
   }
   const primary = limits[0] || { used: 0, remaining: 100 };
@@ -654,6 +663,21 @@ export function summarizeWham(payload) {
     creditBalance: payload?.credits?.balance ?? null,
     limitReached: Boolean(rateLimit.limit_reached),
   };
+}
+
+export function summarizeOpenAiResetCards(payload, fallbackCount = 0, now = Date.now()) {
+  const safeCount = value => {
+    const number = finiteOrNull(value);
+    return Number.isSafeInteger(number) && number >= 0 && number <= 100_000 ? number : null;
+  };
+  const count = safeCount(payload?.available_count) ?? safeCount(fallbackCount) ?? 0;
+  const summary = { count, nextExpiresAt: null, expiryUnavailable: count > 0 };
+  if (!count || !Array.isArray(payload?.credits) || payload.credits.length > 512) return summary;
+  const available = payload.credits.filter(card => card?.status === 'available');
+  const deadlines = available.map(card => typeof card.expires_at === 'string' && card.expires_at.length <= 64
+    ? Date.parse(card.expires_at) : NaN);
+  if (available.length !== count || deadlines.some(deadline => !Number.isFinite(deadline) || deadline <= now)) return summary;
+  return { count, nextExpiresAt: new Date(Math.min(...deadlines)).toISOString(), expiryUnavailable: false };
 }
 
 export function isWhamUsagePayload(payload) {
@@ -2159,7 +2183,8 @@ export class ProviderQueryEngine {
         return { source, loginRequired: false, message: '无法连接 OpenAI 额度接口，请检查网络后重试' };
       }
       if (result.status === 200 && isWhamUsagePayload(result.payload)) {
-        return this.#openAiUsage(provider, result.payload, source, { extra: '额度来自 Codex 当前登录' });
+        const resetCards = await this.#queryOpenAiResetCards(result, accessToken, accountId, signal);
+        return this.#openAiUsage(provider, result.payload, source, { extra: '额度来自 Codex 当前登录', resetCards });
       }
       if (result.status === 401 || authenticationFailure(result.status, result.payload, result)) {
         return { source, loginRequired: true, message: 'Codex 当前登录已失效，请在 Codex 中重新登录后刷新' };
@@ -2186,7 +2211,31 @@ export class ProviderQueryEngine {
       if (signal?.aborted) throw signal.reason || browserError || new Error('OpenAI 用量查询已取消');
       return openAiWhamFailure(result, browserError, missingCredentials);
     }
-    return this.#openAiUsage(provider, result.payload, result.transport === 'edge' ? 'openai_wham_browser' : 'openai_wham');
+    const resetCards = await this.#queryOpenAiResetCards(result, accessToken, accountId, signal);
+    return this.#openAiUsage(provider, result.payload, result.transport === 'edge' ? 'openai_wham_browser' : 'openai_wham', { resetCards });
+  }
+
+  async #queryOpenAiResetCards(result, accessToken, accountId, signal) {
+    const summary = summarizeOpenAiResetCards(null, result.payload?.rate_limit_reset_credits?.available_count, this.now());
+    if (!summary.count) return summary;
+    const headers = { Authorization: `Bearer ${accessToken}`, 'ChatGPT-Account-Id': accountId, Accept: 'application/json' };
+    try {
+      let response;
+      if (result.transport === 'edge' && typeof this.browserBroker?.queryJson === 'function') {
+        const raw = await this.browserBroker.queryJson({
+          baseUrl: 'https://chatgpt.com', requestPath: '/backend-api/wham/rate-limit-reset-credits',
+          headers, navigateRequest: false,
+        }, { signal: combinedSignal(signal, AbortSignal.timeout(5_000)) });
+        response = { status: Number(raw?.status) || 0, payload: parseBrowserJson(raw?.text) };
+      } else {
+        response = await fetchJson(this.fetchImpl, WHAM_RESET_CREDITS_URL, headers, 5_000, 1, signal);
+      }
+      return response.status === 200
+        ? summarizeOpenAiResetCards(response.payload, summary.count, this.now()) : summary;
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason || error;
+      return summary;
+    }
   }
 
   async #queryOpenAiBrowser(provider, signal) {
@@ -2249,6 +2298,7 @@ export class ProviderQueryEngine {
     return this.#openAiUsage(provider, result.payload, 'browser_session', {
       accountBrowser,
       extra: accountBrowser ? `已通过 ${accountBrowser} 匹配 OpenAI 账号` : '',
+      resetCards: await this.#queryOpenAiResetCards(result, accessToken, accountId, signal),
     });
   }
 
@@ -2270,8 +2320,9 @@ export class ProviderQueryEngine {
       accountBrowser: options.accountBrowser,
     });
     usage.subscriptionQuota = {
-      windows: summary.limits.map(({ label, remaining }) => ({ label, remaining })),
+      windows: summary.limits.map(({ label, remaining, resetAt }) => ({ label, remaining, resetAt })),
       credits: finiteOrNull(summary.creditBalance),
+      resetCards: options.resetCards || summarizeOpenAiResetCards(null),
     };
     return {
       usage,

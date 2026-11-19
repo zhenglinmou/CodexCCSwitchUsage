@@ -167,6 +167,54 @@ function Get-CodexRoots {
     })
 }
 
+function Wait-CodexRootExit {
+    param([object[]]$Roots, [int]$TimeoutSeconds = 25)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $remaining = @($Roots | Where-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue })
+        if ($remaining.Count -eq 0) { return @() }
+        if ([DateTime]::UtcNow -ge $deadline) { return $remaining }
+        Start-Sleep -Milliseconds 200
+    } while ($true)
+}
+
+function Wait-CodexDebugReady {
+    param([int]$DebugPort, [int]$TimeoutSeconds = 25)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        foreach ($debugUrl in @("http://127.0.0.1:$DebugPort/json/list", "http://[::1]:$DebugPort/json/list")) {
+            try {
+                $targets = Invoke-RestMethod -Uri $debugUrl -TimeoutSec 1
+                if (@($targets | Where-Object { $_.type -eq 'page' -and $_.url -ceq 'app://-/index.html' }).Count -gt 0) {
+                    return $true
+                }
+            } catch {}
+        }
+        if ([DateTime]::UtcNow -ge $deadline) { return $false }
+        Start-Sleep -Milliseconds 300
+    } while ($true)
+}
+
+function Start-CodexDebugSession {
+    param([string]$AppUserModelId, [int]$DebugPort)
+    $activationError = $null
+    try {
+        [void](Start-CodexApplication -AppUserModelId $AppUserModelId -Arguments @(
+            "--remote-debugging-port=$DebugPort",
+            '--remote-debugging-address=127.0.0.1',
+            "--remote-allow-origins=http://127.0.0.1:$DebugPort",
+            '--no-first-run'
+        ))
+    } catch {
+        # Windows activation can time out even though the application is starting.
+        # Only the actual debug endpoint determines whether startup succeeded.
+        $activationError = $_
+    }
+    if (Wait-CodexDebugReady -DebugPort $DebugPort) { return }
+    if ($activationError) { throw $activationError }
+    throw 'Codex 已启动，但本地调试接口未就绪。'
+}
+
 function Get-CodexDebugPort {
     param([string]$CommandLine)
     $match = [regex]::Match([string]$CommandLine, '(?:^|\s)--remote-debugging-port(?:=|\s+)(?<port>\d+)(?=\s|$)')
@@ -233,17 +281,13 @@ if (-not $codexRoot -and ($ordinaryRoots.Count -gt 0 -or $unsafeDebugRoots.Count
         $process = Get-Process -Id $rootProcess.ProcessId -ErrorAction SilentlyContinue
         if ($process) { [void]$process.CloseMainWindow() }
     }
-    $closeDeadline = [DateTime]::UtcNow.AddSeconds(10)
-    do {
-        Start-Sleep -Milliseconds 200
-        $remainingRoots = @(Get-CodexRoots | Where-Object { $_.ProcessId -in $restartRoots.ProcessId })
-    } while ($remainingRoots.Count -gt 0 -and [DateTime]::UtcNow -lt $closeDeadline)
+    $remainingRoots = @(Wait-CodexRootExit -Roots $restartRoots)
 
     if ($remainingRoots.Count -gt 0) {
         $forceAnswer = Show-RestartPrompt `
-            -Title 'Codex 未能正常退出' `
-            -Icon 16 `
-            -Message "Codex 在 10 秒内没有正常退出。`n`n是否强制结束进程并启用额度扩展？"
+            -Title '启用额度扩展需要重启 Codex' `
+            -Icon 48 `
+            -Message "已等待 Codex 退出 25 秒，但它仍在后台运行（关闭窗口后可能驻留系统托盘）。`n`n请确认当前工作已保存。是否结束剩余 Codex 进程并启用额度扩展？"
         if ($forceAnswer -ne 6) {
             [void](Show-CodexWindow -CodexProcessId $remainingRoots[0].ProcessId)
             [pscustomobject]@{ launched = $false; forceRestartDeclined = $true; processId = $remainingRoots[0].ProcessId } | ConvertTo-Json -Compress
@@ -259,34 +303,10 @@ if (-not $codexRoot -and ($ordinaryRoots.Count -gt 0 -or $unsafeDebugRoots.Count
 [IO.File]::WriteAllText((Join-Path $runtime 'cdp-port'), [string]$Port, [Text.Encoding]::ASCII)
 
 if (-not $codexRoot) {
-    [void](Start-CodexApplication -AppUserModelId $codexApplication.AppUserModelId -Arguments @(
-        "--remote-debugging-port=$Port",
-        '--remote-debugging-address=127.0.0.1',
-        "--remote-allow-origins=http://127.0.0.1:$Port",
-        '--no-first-run'
-    ))
+    Start-CodexDebugSession -AppUserModelId $codexApplication.AppUserModelId -DebugPort $Port
+} elseif (-not (Wait-CodexDebugReady -DebugPort $Port)) {
+    throw 'Codex 已启动，但本地调试接口未就绪。'
 }
-
-$deadline = [DateTime]::UtcNow.AddSeconds(25)
-$debugUrls = @(
-    "http://127.0.0.1:$Port/json/list",
-    "http://[::1]:$Port/json/list"
-)
-$ready = $false
-while ([DateTime]::UtcNow -lt $deadline) {
-    foreach ($debugUrl in $debugUrls) {
-        try {
-            $targets = Invoke-RestMethod -Uri $debugUrl -TimeoutSec 1
-            if (@($targets | Where-Object { $_.type -eq 'page' -and $_.url -like 'app://*' }).Count -gt 0) {
-                $ready = $true
-                break
-            }
-        } catch {}
-    }
-    if ($ready) { break }
-    Start-Sleep -Milliseconds 300
-}
-if (-not $ready) { throw 'Codex 已启动，但本地调试接口未就绪。' }
 
 if ($codexRoot) {
     $liveCodexRoot = Get-Process -Id $codexRoot.ProcessId -ErrorAction SilentlyContinue

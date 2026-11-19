@@ -1,6 +1,57 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+
+test('Windows activation timeouts recover only when the canonical CDP page becomes ready', { skip: process.platform !== 'win32' }, t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-launch-recovery-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const fixture = path.join(directory, 'recovery.ps1');
+  const launchPath = fileURLToPath(new URL('../scripts/launch.ps1', import.meta.url)).replaceAll("'", "''");
+  fs.writeFileSync(fixture, `
+$ErrorActionPreference = 'Stop'
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('${launchPath}', [ref]$null, [ref]$null)
+foreach ($name in @('Wait-CodexDebugReady', 'Start-CodexDebugSession', 'Wait-CodexRootExit')) {
+    $definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
+    Invoke-Expression $definition.Extent.Text
+}
+function Start-Sleep { param($Milliseconds) }
+function Start-CodexApplication { throw 'activation timeout' }
+$script:queries = 0
+function Invoke-RestMethod {
+    param($Uri, $TimeoutSec)
+    $script:queries++
+    if ($script:queries -eq 1) { throw 'still starting' }
+    if ($script:queries -eq 2) { return @([pscustomobject]@{type='page'; url='app://-/index.html?initialRoute=guest'}) }
+    return @([pscustomobject]@{type='page'; url='app://-/index.html'})
+}
+Start-CodexDebugSession -AppUserModelId 'fixture' -DebugPort 12345
+$recoveredQueries = $script:queries
+function Invoke-RestMethod { return @([pscustomobject]@{type='iframe'; url='app://-/index.html'}) }
+$guestReady = Wait-CodexDebugReady -DebugPort 12345 -TimeoutSeconds 0
+function Wait-CodexDebugReady { return $false }
+$failure = ''
+try { Start-CodexDebugSession -AppUserModelId 'fixture' -DebugPort 12345 } catch { $failure = $_.Exception.Message }
+$script:checks = 0
+function Get-Process {
+    param($Id)
+    $script:checks++
+    if ($script:checks -lt 3) { return [pscustomobject]@{Id=$Id} }
+}
+$gone = @(Wait-CodexRootExit -Roots @([pscustomobject]@{ProcessId=123}))
+function Get-Process { param($Id) return [pscustomobject]@{Id=$Id} }
+$stillRunning = @(Wait-CodexRootExit -Roots @([pscustomobject]@{ProcessId=123}) -TimeoutSeconds 0)
+[pscustomobject]@{ recoveredQueries=$recoveredQueries; guestReady=$guestReady; failure=$failure; exited=$gone.Count; remaining=$stillRunning.Count } | ConvertTo-Json -Compress
+`, 'utf8');
+  const powershell = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const result = execFileSync(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fixture], { encoding: 'utf8', timeout: 15_000, windowsHide: true });
+  assert.deepEqual(JSON.parse(result.trim()), {
+    recoveredQueries: 3, guestReady: false, failure: 'activation timeout', exited: 0, remaining: 1,
+  });
+});
 
 test('launcher automatically restarts an ordinary Codex before enabling the extension', () => {
   const source = fs.readFileSync(new URL('../scripts/launch.ps1', import.meta.url), 'utf8');
